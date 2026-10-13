@@ -64,13 +64,61 @@ static class LauncherLogicTests
             Expect(!valid && ex.InnerException is FormatException, "display rejects " + input);
         }
     }
-    static ChildSessionLifecycle Connected(FakeSessionApi api)
+    static ChildSessionLifecycle Connected(FakeSessionApi api, ISignOutIntentStore store = null)
     {
-        var lifecycle = new ChildSessionLifecycle(api, 1);
+        var lifecycle = new ChildSessionLifecycle(api, 1, store);
         Expect(lifecycle.TryBeginConnection() && lifecycle.State == ChildLifecycleState.Connecting, "initial connect");
         api.Child = new ChildSessionIdentity(7, 100);
         Expect(lifecycle.ObserveConnected() && lifecycle.State == ChildLifecycleState.Connected, "child established");
         return lifecycle;
+    }
+    sealed class ThrowingIntent : ISignOutIntentStore
+    {
+        public bool HasUnresolvedIntent(uint parent) { return false; }
+        public void RecordIntent(uint parent, ChildSessionIdentity child) { throw new IOException("Cannot persist intent"); }
+        public void ResolveIntent(uint parent) { }
+    }
+    static void SignOutGuardTests()
+    {
+        string dir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "session-guard-tests");
+        Directory.CreateDirectory(dir);
+        string path = Path.Combine(dir, "signout-1.intent");
+        if (File.Exists(path)) File.Delete(path);
+        var store = new FileSignOutIntentStore(dir);
+        var api = new FakeSessionApi { Child = new ChildSessionIdentity(7, 100) };
+        var newProcess = new ChildSessionLifecycle(api, 1, store);
+        Expect(!newProcess.TryBeginConnection() && newProcess.State == ChildLifecycleState.Error,
+            "new process refuses an existing parent-associated child");
+        api.Child = null;
+        var connected = Connected(api, store); api.FailLogoff = true;
+        Expect(connected.SignOut() == SignOutResult.OutcomeUnknown && store.HasUnresolvedIntent(1),
+            "ambiguous signout persists intent");
+        api.Child = null;
+        newProcess = new ChildSessionLifecycle(api, 1, new FileSignOutIntentStore(dir));
+        Expect(!newProcess.TryBeginConnection() && newProcess.State == ChildLifecycleState.Error,
+            "restart refuses unresolved signout despite absent child");
+        Expect(store.ReconcileAbsentChild(api, 1) && !store.HasUnresolvedIntent(1),
+            "explicit absence reconciliation clears only intent");
+        Expect(new ChildSessionLifecycle(api, 1, store).TryBeginConnection(), "fresh connection after explicit reconciliation");
+        api.FailLogoff = false;
+        connected = Connected(api, store);
+        Expect(connected.SignOut() == SignOutResult.Complete && !store.HasUnresolvedIntent(1),
+            "verified successful signout clears intent");
+        api = new FakeSessionApi(); connected = Connected(api, new ThrowingIntent());
+        Expect(connected.SignOut() == SignOutResult.PersistenceFailed && api.LogoffCalls == 0,
+            "intent persistence failure prevents logoff");
+        Expect(!connected.TryBeginConnection() && connected.State == ChildLifecycleState.Error,
+            "persistence failure leaves connection blocked");
+        File.WriteAllBytes(path, new byte[] { 0, 1 });
+        Expect(!new ChildSessionLifecycle(new FakeSessionApi(), 1, store).TryBeginConnection(),
+            "malformed persistent intent fails closed");
+        File.Delete(path);
+        api = new FakeSessionApi();
+        var racing = new ChildSessionLifecycle(api, 1);
+        Expect(racing.TryBeginConnection(), "initial check sees no child");
+        api.Child = new ChildSessionIdentity(8, 200);
+        Expect(!racing.CheckConnectionPreflight() && racing.State == ChildLifecycleState.Error,
+            "child appearing before ActiveX Connect blocks connection");
     }
     static void LifecycleTests()
     {
@@ -189,7 +237,7 @@ static class LauncherLogicTests
         Expect(!new ChildSessionIdentity(uint.MaxValue, 100).Equals(new ChildSessionIdentity(7, 100)), "invalid sentinel differs");
         Display("1920x1080", true); Display("2800x1272x225", true); Display("-1x1080", false);
         Display("1920x0", false); Display("1920x1080x0", false); Display("1920x1080x225x9", false);
-        LifecycleTests(); CredentialTests();
+        LifecycleTests(); SignOutGuardTests(); CredentialTests();
         Console.WriteLine(cases + " offline launcher logic cases passed");
         return 0;
     }

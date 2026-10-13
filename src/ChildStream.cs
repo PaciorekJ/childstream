@@ -89,6 +89,14 @@ static class Program
 
     static string baseDir = AppDomain.CurrentDomain.BaseDirectory;
     static string logPath = Path.Combine(baseDir, "launcher.log");
+    static string intentDir = GetIntentDirectory();
+
+    static string GetIntentDirectory()
+    {
+        string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (!Path.IsPathRooted(local)) throw new InvalidOperationException("Local application data path is unavailable.");
+        return Path.Combine(local, "ChildStream", "session-intents");
+    }
 
     static void Log(string msg)
     {
@@ -148,6 +156,15 @@ static class Program
             return en2 ? 0 : 1;
         }
         if (args.Length > 0 && args[0] == "-resetpass") return RemoveLegacyPasswordExplicitly();
+        if (args.Length > 0 && args[0] == "-reconcile-session")
+        {
+            try
+            {
+                uint parent = (uint)Process.GetCurrentProcess().SessionId;
+                return new FileSignOutIntentStore(intentDir).ReconcileAbsentChild(new WindowsChildSessionApi(), parent) ? 0 : 4;
+            }
+            catch (Exception ex) { Log("session reconciliation failed: " + ex.Message); return 4; }
+        }
 
         bool en;
         if (!WTSIsChildSessionsEnabled(out en))
@@ -167,7 +184,13 @@ static class Program
         // Microsoft documents automatic child-session logon from an existing parent
         // session. Do not set UserName or ClearTextPassword on the RDP control.
         uint parentSessionId = (uint)Process.GetCurrentProcess().SessionId;
-        var lifecycle = new ChildSessionLifecycle(new WindowsChildSessionApi(), parentSessionId);
+        var instanceMutex = new System.Threading.Mutex(false, @"Local\ChildStream.ParentSession." + parentSessionId);
+        bool ownsInstance;
+        try { ownsInstance = instanceMutex.WaitOne(0); }
+        catch (System.Threading.AbandonedMutexException) { ownsInstance = true; }
+        if (!ownsInstance) { instanceMutex.Dispose(); Log("another launcher owns this parent session"); return 5; }
+        var lifecycle = new ChildSessionLifecycle(new WindowsChildSessionApi(), parentSessionId,
+            new FileSignOutIntentStore(intentDir));
         var f = new Form { Text = "Child Session", Width = 1360, Height = 820 };
         Icon appIcon = SystemIcons.Application;
         try { appIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
@@ -206,6 +229,8 @@ static class Program
                 signOutItem.Enabled = false;
                 MessageBox.Show(result == SignOutResult.OutcomeUnknown
                     ? "Sign-out outcome is unknown. Automatic and manual reconnect are blocked. Inspect the child session before restarting the launcher."
+                    : result == SignOutResult.PersistenceFailed
+                    ? "Sign-out intent could not be saved. No sign-out was attempted. Reconnect is blocked.\n" + lifecycle.FailureReason
                     : "Child identity changed or could not be verified. No sign-out was attempted. Reconnect is blocked.\n" + lifecycle.FailureReason,
                     "ChildStream", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
@@ -273,6 +298,8 @@ static class Program
                 object v = true;
                 var ext = (IMsRdpExtendedSettings)rdp.Ocx;
                 ext.put_Property("ConnectToChildSession", ref v);
+                if (!lifecycle.CheckConnectionPreflight())
+                    throw new InvalidOperationException("Connection preflight failed: " + lifecycle.FailureReason);
                 Log("connecting child session from parent " + parentSessionId + "...");
                 ocx.Connect();
             }
@@ -360,6 +387,8 @@ static class Program
         f.FormClosing += (s, e) => { timer.Stop(); tray.Visible = false; };
         connect();
         Application.Run(f);
+        instanceMutex.ReleaseMutex();
+        instanceMutex.Dispose();
         return 0;
     }
 }
