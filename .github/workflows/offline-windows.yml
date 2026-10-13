@@ -1,0 +1,20 @@
+name: Windows offline checks
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  launcher:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Compile launcher and run pure offline tests
+        shell: pwsh
+        run: .\tests\offline.ps1
