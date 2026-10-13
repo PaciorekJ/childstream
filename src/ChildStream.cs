@@ -2,8 +2,8 @@ using System;
 using System.Drawing;
 using System.IO;
 using System.Runtime.InteropServices;
-using System.Security.Cryptography;
-using System.Text;
+using System.Diagnostics;
+using System.Globalization;
 using System.Windows.Forms;
 
 [ComImport, Guid("302D8188-0052-4807-806A-362B628F9AC5"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -22,47 +22,53 @@ public class RdpBox : AxHost
 
 static class Program
 {
-    [DllImport("wtsapi32.dll", SetLastError = true)]
-    static extern bool WTSEnableChildSessions(bool enable);
     [DllImport("wtsapi32.dll")]
     static extern bool WTSIsChildSessionsEnabled(out bool enabled);
+    [DllImport("wtsapi32.dll", SetLastError = true)]
+    static extern bool WTSGetChildSessionId(out uint sessionId);
+    [DllImport("wtsapi32.dll", SetLastError = true)]
+    static extern bool WTSLogoffSession(IntPtr server, uint sessionId, bool wait);
 
     static string baseDir = AppDomain.CurrentDomain.BaseDirectory;
     static string logPath = Path.Combine(baseDir, "launcher.log");
-    static string credPath = Path.Combine(baseDir, "cred.bin");
+    static string credPath = Path.Combine(baseDir, "cred.bin"); // Legacy version only.
 
     static void Log(string msg)
     {
         try { File.AppendAllText(logPath, DateTime.Now.ToString("HH:mm:ss.fff") + " " + msg + Environment.NewLine); } catch { }
     }
 
-    static string LoadPassword()
+    static bool TryGetChildSession(out uint sessionId)
     {
-        try
-        {
-            if (File.Exists(credPath))
-                return Encoding.UTF8.GetString(ProtectedData.Unprotect(File.ReadAllBytes(credPath), null, DataProtectionScope.CurrentUser));
-        }
-        catch (Exception ex) { Log("cred load failed: " + ex.Message); }
-        return null;
+        sessionId = uint.MaxValue;
+        if (!WTSGetChildSessionId(out sessionId))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "WTSGetChildSessionId failed");
+        return sessionId != uint.MaxValue;
     }
 
-    static void SavePassword(string pw)
+    static bool IsOwnedChild(uint candidate, uint connectedChild, uint parent)
     {
-        try { File.WriteAllBytes(credPath, ProtectedData.Protect(Encoding.UTF8.GetBytes(pw), null, DataProtectionScope.CurrentUser)); }
-        catch (Exception ex) { Log("cred save failed: " + ex.Message); }
+        return candidate != uint.MaxValue && candidate != parent && candidate == connectedChild;
     }
 
-    static string PromptPassword(string account)
+    static int[] ParseDisplayConfig(string value)
     {
-        var d = new Form { Text = "Child Session - one-time setup", Width = 440, Height = 190, FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterScreen, MaximizeBox = false, MinimizeBox = false };
-        var lbl = new Label { Text = "Enter the Windows password for " + account + "\n(stored DPAPI-encrypted, used to auto-login the child session):", Left = 12, Top = 12, Width = 400, Height = 36 };
-        var tb = new TextBox { Left = 12, Top = 56, Width = 398, UseSystemPasswordChar = true };
-        var ok = new Button { Text = "Save", Left = 246, Top = 92, Width = 80, DialogResult = DialogResult.OK };
-        var cancel = new Button { Text = "Cancel", Left = 332, Top = 92, Width = 80, DialogResult = DialogResult.Cancel };
-        d.Controls.AddRange(new Control[] { lbl, tb, ok, cancel });
-        d.AcceptButton = ok; d.CancelButton = cancel;
-        return d.ShowDialog() == DialogResult.OK && tb.Text.Length > 0 ? tb.Text : null;
+        string[] parts = value.Trim().Split('x');
+        if (parts.Length != 2 && parts.Length != 3)
+            throw new FormatException("Expected WIDTHxHEIGHT or WIDTHxHEIGHTxSCALE.");
+        int width, height, scale = 0;
+        if (!int.TryParse(parts[0], NumberStyles.None, CultureInfo.InvariantCulture, out width) || width < 640 || width > 7680 ||
+            !int.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out height) || height < 480 || height > 4320 ||
+            (parts.Length == 3 && (!int.TryParse(parts[2], NumberStyles.None, CultureInfo.InvariantCulture, out scale) || scale < 100 || scale > 500)))
+            throw new FormatException("Display dimensions or scale are outside supported bounds.");
+        return new int[] { width, height, scale };
+    }
+
+    static bool RemoveLegacyPassword()
+    {
+        try { if (File.Exists(credPath)) File.Delete(credPath); return true; }
+        catch (IOException ex) { Log("legacy credential removal failed: " + ex.Message); return false; }
+        catch (UnauthorizedAccessException ex) { Log("legacy credential removal failed: " + ex.Message); return false; }
     }
 
     [STAThread]
@@ -70,41 +76,39 @@ static class Program
     {
         if (args.Length > 0 && args[0] == "-enable")
         {
-            bool ok = WTSEnableChildSessions(true);
-            int err = Marshal.GetLastWin32Error();
-            bool en1;
-            WTSIsChildSessionsEnabled(out en1);
-            Log("WTSEnableChildSessions(true) => " + ok + " (gle=" + err + "), enabled now = " + en1);
-            return en1 ? 0 : 1;
+            MessageBox.Show("Child-session enablement requires the future transactional installer. No change was made.", "ChildStream");
+            return 3;
         }
         if (args.Length > 0 && args[0] == "-check")
         {
             bool en2;
-            WTSIsChildSessionsEnabled(out en2);
+            if (!WTSIsChildSessionsEnabled(out en2)) return 2;
             Log("child sessions enabled = " + en2);
             return en2 ? 0 : 1;
         }
-        if (args.Length > 0 && args[0] == "-resetpass") { try { File.Delete(credPath); } catch { } return 0; }
+        if (args.Length > 0 && args[0] == "-resetpass") return RemoveLegacyPassword() ? 0 : 1;
 
         bool en;
-        WTSIsChildSessionsEnabled(out en);
+        if (!WTSIsChildSessionsEnabled(out en))
+        {
+            MessageBox.Show("Cannot query child-session support. Check Windows edition and system logs.", "ChildStream");
+            return 2;
+        }
         Log("startup: child sessions enabled = " + en);
         if (!en)
         {
-            MessageBox.Show("Child sessions are not enabled.\nRun once from an elevated prompt:  ChildStream.exe -enable", "ChildStream");
+            MessageBox.Show("Child sessions are not enabled. Installation is blocked until the transactional installer is validated.", "ChildStream");
             return 1;
         }
 
         Application.EnableVisualStyles();
 
-        string account = Environment.MachineName + @"\" + Environment.UserName;
-        string pw = LoadPassword();
-        if (pw == null)
-        {
-            pw = PromptPassword(account);
-            if (pw == null) return 1;
-            SavePassword(pw);
-        }
+        // Microsoft documents automatic child-session logon from an existing parent
+        // session. Do not set UserName or ClearTextPassword on the RDP control.
+        if (!RemoveLegacyPassword())
+            MessageBox.Show("Could not remove legacy cred.bin. Use -resetpass after fixing file permissions.", "ChildStream");
+        uint parentSessionId = (uint)Process.GetCurrentProcess().SessionId;
+        uint connectedChildId = uint.MaxValue;
 
         bool[] endRequested = { false };
         var f = new Form { Text = "Child Session", Width = 1360, Height = 820 };
@@ -116,34 +120,26 @@ static class Program
         menu.Items.Add("Show", null, (s, e) => { f.Show(); f.WindowState = FormWindowState.Normal; f.Activate(); });
         ToolStripMenuItem reconnectItem = new ToolStripMenuItem("Reconnect now");
         menu.Items.Add(reconnectItem);
-        menu.Items.Add("Forget saved password", null, (s, e) => { try { File.Delete(credPath); } catch { } tray.ShowBalloonTip(2000, "Child Session", "Password cleared. Restart the app.", ToolTipIcon.Info); });
+        menu.Items.Add("Remove legacy saved password", null, (s, e) => {
+            bool removed = RemoveLegacyPassword();
+            tray.ShowBalloonTip(2000, "Child Session", removed ? "Legacy credential removed." : "Removal failed; check launcher.log.", removed ? ToolTipIcon.Info : ToolTipIcon.Error);
+        });
         menu.Items.Add("End session (sign out, closes games)", null, (s, e) =>
         {
             if (MessageBox.Show("Sign out the child session? All apps running in it will close.", "Child Session", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
-            endRequested[0] = true;
             try
             {
-                var psi = new System.Diagnostics.ProcessStartInfo("qwinsta") { RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true };
-                var proc = System.Diagnostics.Process.Start(psi);
-                string outp = proc.StandardOutput.ReadToEnd();
-                proc.WaitForExit();
-                foreach (var line in outp.Split('\n'))
-                {
-                    if (line.Contains(Environment.UserName) && !line.Contains("console"))
-                    {
-                        var m = System.Text.RegularExpressions.Regex.Match(line, @"\s(\d+)\s");
-                        if (m.Success)
-                        {
-                            Log("signing out session " + m.Groups[1].Value);
-                            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("logoff", m.Groups[1].Value) { UseShellExecute = false, CreateNoWindow = true });
-                        }
-                    }
-                }
+                uint currentChild;
+                if (!TryGetChildSession(out currentChild) || !IsOwnedChild(currentChild, connectedChildId, parentSessionId))
+                    throw new InvalidOperationException("The connected child session could not be verified. Reconnect before signing out.");
+                endRequested[0] = true;
+                Log("signing out verified child session " + currentChild);
+                if (!WTSLogoffSession(IntPtr.Zero, currentChild, true))
+                    throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "WTSLogoffSession failed");
             }
-            catch (Exception ex) { Log("signout: " + ex.Message); }
-            var quitTimer = new Timer { Interval = 3000 };
-            quitTimer.Tick += delegate { tray.Visible = false; Application.Exit(); };
-            quitTimer.Start();
+            catch (Exception ex) { endRequested[0] = false; Log("signout: " + ex.Message); MessageBox.Show(ex.Message, "ChildStream", MessageBoxButtons.OK, MessageBoxIcon.Error); return; }
+            tray.Visible = false;
+            Application.Exit();
         });
         menu.Items.Add("Exit", null, (s, e) => { tray.Visible = false; Application.Exit(); });
         tray.ContextMenuStrip = menu;
@@ -163,17 +159,14 @@ static class Program
             try
             {
                 ocx.Server = "localhost";
-                ocx.UserName = account;
-                ocx.AdvancedSettings2.ClearTextPassword = pw;
                 int dw = 1920, dh = 1080, scale = 0;
                 try
                 {
                     string cfg = Path.Combine(baseDir, "display.cfg");
                     if (File.Exists(cfg))
                     {
-                        var parts = File.ReadAllText(cfg).Trim().Split('x');
-                        dw = int.Parse(parts[0]); dh = int.Parse(parts[1]);
-                        if (parts.Length > 2) scale = int.Parse(parts[2]);
+                        int[] display = ParseDisplayConfig(File.ReadAllText(cfg));
+                        dw = display[0]; dh = display[1]; scale = display[2];
                     }
                 }
                 catch (Exception ex) { Log("display.cfg: " + ex.Message); }
@@ -198,13 +191,22 @@ static class Program
                 object v = true;
                 var ext = (IMsRdpExtendedSettings)rdp.Ocx;
                 ext.put_Property("ConnectToChildSession", ref v);
-                Log("connecting as " + account + "...");
+                Log("connecting child session from parent " + parentSessionId + "...");
                 ocx.Connect();
             }
-            catch (Exception ex) { Log("connect failed: " + ex.Message); }
+            catch (Exception ex)
+            {
+                wantReconnect = false;
+                Log("connect failed: " + ex.Message);
+                MessageBox.Show("Child-session connection failed: " + ex.Message + "\nCheck prerequisites, then use Reconnect now.", "ChildStream", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         };
 
-        reconnectItem.Click += (s, e) => { try { if ((int)ocx.Connected != 0) ocx.Disconnect(); } catch { } };
+        reconnectItem.Click += (s, e) =>
+        {
+            try { wantReconnect = true; if ((int)ocx.Connected != 0) ocx.Disconnect(); else connect(); }
+            catch (Exception ex) { Log("reconnect: " + ex.Message); MessageBox.Show(ex.Message, "ChildStream"); }
+        };
 
         int last = -1;
         DateTime lastAttempt = DateTime.MinValue;
@@ -214,15 +216,46 @@ static class Program
             try
             {
                 int state = (int)ocx.Connected;
-                if (state != last) { last = state; Log("state -> " + state); f.Text = state == 1 ? "Child Session - connected" : "Child Session - state " + state; }
+                if (state != last)
+                {
+                    last = state;
+                    Log("state -> " + state);
+                    f.Text = state == 1 ? "Child Session - connected" : "Child Session - state " + state;
+                    if (state == 1)
+                    {
+                        uint child;
+                        if (TryGetChildSession(out child) && child != parentSessionId)
+                        {
+                            connectedChildId = child;
+                            Log("verified child session " + child);
+                        }
+                    }
+                }
                 if (state == 0 && wantReconnect && !endRequested[0] && (DateTime.Now - lastAttempt).TotalSeconds > 5)
                 {
+                    if (connectedChildId != uint.MaxValue)
+                    {
+                        uint child;
+                        if (!TryGetChildSession(out child) || child != connectedChildId)
+                        {
+                            wantReconnect = false;
+                            Log("connected child session ended; automatic creation stopped");
+                            tray.ShowBalloonTip(3000, "Child Session", "The child session ended. Restart the launcher to create another.", ToolTipIcon.Warning);
+                            return;
+                        }
+                    }
                     lastAttempt = DateTime.Now;
                     Log("auto-reconnect");
                     connect();
                 }
             }
-            catch (Exception ex) { Log("poll: " + ex.Message); }
+            catch (Exception ex)
+            {
+                wantReconnect = false;
+                timer.Stop();
+                Log("session monitoring failed: " + ex.Message);
+                MessageBox.Show("Session monitoring failed: " + ex.Message + "\nRestart the launcher after checking the child-session state.", "ChildStream", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         };
         timer.Start();
 
