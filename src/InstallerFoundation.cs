@@ -351,13 +351,14 @@ internal sealed class InstallerEngine
 // make a killed process recoverable; power-loss durability still needs live validation.
 internal sealed class FileJournalStore : IJournalStore
 {
+    private const int MaximumJournalBytes = 32 * 1024 * 1024;
     private readonly string path;
     internal FileJournalStore(string path) { this.path = path; }
     public InstallJournal Load()
     {
         if (!File.Exists(path)) return null;
         byte[] all = File.ReadAllBytes(path);
-        if (all.Length < 36 || all.Length > 16 * 1024 * 1024) throw new InvalidDataException("Malformed journal length.");
+        if (all.Length < 36 || all.Length > MaximumJournalBytes) throw new InvalidDataException("Malformed journal length.");
         int payloadLength = all.Length - 32;
         byte[] payload = new byte[payloadLength]; Array.Copy(all, payload, payloadLength);
         using (var sha = SHA256.Create())
@@ -395,6 +396,7 @@ internal sealed class FileJournalStore : IJournalStore
             foreach (var entry in journal.Entries) { Canonical.WriteOperation(writer, entry.Operation); writer.Write((int)entry.Phase); }
             writer.Flush(); payload = stream.ToArray();
         }
+        if (payload.Length > MaximumJournalBytes - 32) throw new InvalidDataException("Journal exceeds size limit.");
         byte[] checksum;
         using (var sha = SHA256.Create()) checksum = sha.ComputeHash(payload);
         string tmp = path + ".new";
