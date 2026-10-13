@@ -15,3 +15,16 @@ if ($LASTEXITCODE -ne 0) { throw 'Offline launcher tests failed.' }
 if ($LASTEXITCODE -ne 0) { throw 'Installer test compilation failed.' }
 & (Join-Path $artifacts 'InstallerFoundationTests.exe')
 if ($LASTEXITCODE -ne 0) { throw 'Offline installer tests failed.' }
+& $csc /nologo /target:exe /main:FeasibilityProbeTests "/out:$artifacts\FeasibilityProbeTests.exe" (Join-Path $root 'src\FeasibilityProbe.cs') (Join-Path $root 'src\InstallerFoundation.cs') (Join-Path $root 'src\TransactionOwnership.cs') (Join-Path $root 'src\ChildSessionLifecycle.cs') (Join-Path $PSScriptRoot 'FeasibilityProbeTests.cs')
+if ($LASTEXITCODE -ne 0) { throw 'Feasibility probe test compilation failed.' }
+& (Join-Path $artifacts 'FeasibilityProbeTests.exe')
+if ($LASTEXITCODE -ne 0) { throw 'Offline feasibility probe tests failed.' }
+$inventorySource = Get-Content (Join-Path $root 'scripts\feasibility-inventory.ps1') -Raw
+$inventoryTokens = $null
+$inventoryErrors = $null
+[System.Management.Automation.Language.Parser]::ParseInput($inventorySource, [ref]$inventoryTokens, [ref]$inventoryErrors) | Out-Null
+if ($inventoryErrors.Count -ne 0) { throw "Read-only inventory syntax failed: $($inventoryErrors[0].Message)" }
+$nativeShim = [regex]::Match($inventorySource, "(?s)Add-Type -TypeDefinition @'\r?\n(.*?)\r?\n'@")
+if (-not $nativeShim.Success) { throw 'Read-only inventory native shim is missing.' }
+Add-Type -TypeDefinition $nativeShim.Groups[1].Value -ErrorAction Stop
+Write-Output 'Read-only inventory syntax and native shim compilation passed (host API calls not run).'
