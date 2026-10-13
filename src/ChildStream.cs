@@ -28,27 +28,71 @@ static class Program
     static extern bool WTSGetChildSessionId(out uint sessionId);
     [DllImport("wtsapi32.dll", SetLastError = true)]
     static extern bool WTSLogoffSession(IntPtr server, uint sessionId, bool wait);
+    [DllImport("wtsapi32.dll", EntryPoint = "WTSQuerySessionInformationW", SetLastError = true)]
+    static extern bool WTSQuerySessionInformation(IntPtr server, uint sessionId, int infoClass, out IntPtr buffer, out uint bytesReturned);
+    [DllImport("wtsapi32.dll")]
+    static extern void WTSFreeMemory(IntPtr buffer);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct WtsInfoExLevel1
+    {
+        public uint SessionId;
+        public int SessionState;
+        public int SessionFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 33)] public string WinStationName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 21)] public string UserName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 18)] public string DomainName;
+        public long LogonTime;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct WtsInfoEx
+    {
+        public int Level;
+        public WtsInfoExLevel1 Data;
+    }
+
+    sealed class WindowsChildSessionApi : IChildSessionApi
+    {
+        public uint CurrentSessionId { get { return (uint)Process.GetCurrentProcess().SessionId; } }
+
+        public ChildSessionIdentity? ReadAssociatedChild()
+        {
+            uint sessionId;
+            if (!WTSGetChildSessionId(out sessionId))
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "WTSGetChildSessionId failed");
+            if (sessionId == uint.MaxValue) return null;
+
+            IntPtr buffer;
+            uint bytes;
+            if (!WTSQuerySessionInformation(IntPtr.Zero, sessionId, 25, out buffer, out bytes))
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "WTSSessionInfoEx query failed");
+            try
+            {
+                if (buffer == IntPtr.Zero || bytes < Marshal.SizeOf(typeof(WtsInfoEx)))
+                    throw new InvalidOperationException("The child session information was incomplete.");
+                WtsInfoEx info = (WtsInfoEx)Marshal.PtrToStructure(buffer, typeof(WtsInfoEx));
+                if (info.Level != 1 || info.Data.SessionId != sessionId || info.Data.LogonTime <= 0)
+                    throw new InvalidOperationException("The child session generation could not be verified.");
+                return new ChildSessionIdentity(sessionId, info.Data.LogonTime);
+            }
+            finally { if (buffer != IntPtr.Zero) WTSFreeMemory(buffer); }
+        }
+
+        public bool Logoff(uint sessionId)
+        {
+            if (!WTSLogoffSession(IntPtr.Zero, sessionId, true))
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "WTSLogoffSession failed");
+            return true;
+        }
+    }
 
     static string baseDir = AppDomain.CurrentDomain.BaseDirectory;
     static string logPath = Path.Combine(baseDir, "launcher.log");
-    static string credPath = Path.Combine(baseDir, "cred.bin"); // Legacy version only.
 
     static void Log(string msg)
     {
         try { File.AppendAllText(logPath, DateTime.Now.ToString("HH:mm:ss.fff") + " " + msg + Environment.NewLine); } catch { }
-    }
-
-    static bool TryGetChildSession(out uint sessionId)
-    {
-        sessionId = uint.MaxValue;
-        if (!WTSGetChildSessionId(out sessionId))
-            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "WTSGetChildSessionId failed");
-        return sessionId != uint.MaxValue;
-    }
-
-    static bool IsOwnedChild(uint candidate, uint connectedChild, uint parent)
-    {
-        return candidate != uint.MaxValue && candidate != parent && candidate == connectedChild;
     }
 
     static int[] ParseDisplayConfig(string value)
@@ -64,11 +108,28 @@ static class Program
         return new int[] { width, height, scale };
     }
 
-    static bool RemoveLegacyPassword()
+    static int RemoveLegacyPasswordExplicitly()
     {
-        try { if (File.Exists(credPath)) File.Delete(credPath); return true; }
-        catch (IOException ex) { Log("legacy credential removal failed: " + ex.Message); return false; }
-        catch (UnauthorizedAccessException ex) { Log("legacy credential removal failed: " + ex.Message); return false; }
+        var cleanup = new LegacyCredentialCleanup(Application.ExecutablePath,
+            Path.Combine(baseDir, "cred.bin"), new WindowsLegacyFileAccess());
+        LegacyCredentialStatus status = cleanup.Inspect();
+        if (status == LegacyCredentialStatus.Present)
+        {
+            bool approved = MessageBox.Show("A file named cred.bin exists beside ChildStream.exe at:\n" +
+                cleanup.CandidatePath + "\n\nIts provenance cannot be verified. Delete it only if you recognize this as the legacy ChildStream installation. Continue?", "ChildStream",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes;
+            status = cleanup.RemoveWithApproval(approved);
+        }
+        string message = status == LegacyCredentialStatus.Absent ? "The legacy credential file is absent." :
+            status == LegacyCredentialStatus.Removed ? "The legacy credential file was removed and its absence verified." :
+            status == LegacyCredentialStatus.Cancelled ? "Credential cleanup was cancelled; no file was deleted." :
+            status == LegacyCredentialStatus.Inaccessible ? "The legacy credential file is inaccessible. Check its permissions manually." :
+            status == LegacyCredentialStatus.OutsideOwnedPath ? "The target is not a regular cred.bin beside ChildStream.exe. No file was deleted." :
+            "Credential cleanup failed or could not be verified. No success is claimed.";
+        MessageBox.Show(message, "ChildStream", MessageBoxButtons.OK,
+            status == LegacyCredentialStatus.Absent || status == LegacyCredentialStatus.Removed ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+        Log("explicit legacy credential cleanup: " + status);
+        return status == LegacyCredentialStatus.Absent || status == LegacyCredentialStatus.Removed ? 0 : 1;
     }
 
     [STAThread]
@@ -86,7 +147,7 @@ static class Program
             Log("child sessions enabled = " + en2);
             return en2 ? 0 : 1;
         }
-        if (args.Length > 0 && args[0] == "-resetpass") return RemoveLegacyPassword() ? 0 : 1;
+        if (args.Length > 0 && args[0] == "-resetpass") return RemoveLegacyPasswordExplicitly();
 
         bool en;
         if (!WTSIsChildSessionsEnabled(out en))
@@ -105,42 +166,53 @@ static class Program
 
         // Microsoft documents automatic child-session logon from an existing parent
         // session. Do not set UserName or ClearTextPassword on the RDP control.
-        if (!RemoveLegacyPassword())
-            MessageBox.Show("Could not remove legacy cred.bin. Use -resetpass after fixing file permissions.", "ChildStream");
         uint parentSessionId = (uint)Process.GetCurrentProcess().SessionId;
-        uint connectedChildId = uint.MaxValue;
-
-        bool[] endRequested = { false };
+        var lifecycle = new ChildSessionLifecycle(new WindowsChildSessionApi(), parentSessionId);
         var f = new Form { Text = "Child Session", Width = 1360, Height = 820 };
         Icon appIcon = SystemIcons.Application;
         try { appIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
         f.Icon = appIcon;
         var tray = new NotifyIcon { Icon = appIcon, Visible = true, Text = "Child Session" };
+        dynamic ocx = null;
         var menu = new ContextMenuStrip();
         menu.Items.Add("Show", null, (s, e) => { f.Show(); f.WindowState = FormWindowState.Normal; f.Activate(); });
         ToolStripMenuItem reconnectItem = new ToolStripMenuItem("Reconnect now");
         menu.Items.Add(reconnectItem);
-        menu.Items.Add("Remove legacy saved password", null, (s, e) => {
-            bool removed = RemoveLegacyPassword();
-            tray.ShowBalloonTip(2000, "Child Session", removed ? "Legacy credential removed." : "Removal failed; check launcher.log.", removed ? ToolTipIcon.Info : ToolTipIcon.Error);
-        });
-        menu.Items.Add("End session (sign out, closes games)", null, (s, e) =>
+        menu.Items.Add("Inspect/remove legacy saved password", null, (s, e) => { RemoveLegacyPasswordExplicitly(); });
+        ToolStripMenuItem signOutItem = new ToolStripMenuItem("End session (sign out, closes games)");
+        menu.Items.Add(signOutItem);
+        signOutItem.Click += (s, e) =>
         {
-            if (MessageBox.Show("Sign out the child session? All apps running in it will close.", "Child Session", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
-            try
+            int viewerState;
+            try { viewerState = (int)ocx.Connected; }
+            catch (Exception ex)
             {
-                uint currentChild;
-                if (!TryGetChildSession(out currentChild) || !IsOwnedChild(currentChild, connectedChildId, parentSessionId))
-                    throw new InvalidOperationException("The connected child session could not be verified. Reconnect before signing out.");
-                endRequested[0] = true;
-                Log("signing out verified child session " + currentChild);
-                if (!WTSLogoffSession(IntPtr.Zero, currentChild, true))
-                    throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "WTSLogoffSession failed");
+                lifecycle.UnrecoverableError();
+                Log("signout viewer-state check failed: " + ex.Message);
+                MessageBox.Show("Viewer state could not be verified. No sign-out was attempted.", "ChildStream", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
             }
-            catch (Exception ex) { endRequested[0] = false; Log("signout: " + ex.Message); MessageBox.Show(ex.Message, "ChildStream", MessageBoxButtons.OK, MessageBoxIcon.Error); return; }
+            if (lifecycle.State != ChildLifecycleState.Connected || viewerState != 1)
+            {
+                MessageBox.Show("Sign-out requires a connected, verified child session.", "ChildStream");
+                return;
+            }
+            if (MessageBox.Show("Sign out the child session? All apps running in it will close.", "Child Session", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            SignOutResult result = lifecycle.SignOut();
+            Log("signout result: " + result + "; lifecycle: " + lifecycle.State + "; reason: " + lifecycle.FailureReason);
+            if (result != SignOutResult.Complete)
+            {
+                reconnectItem.Enabled = false;
+                signOutItem.Enabled = false;
+                MessageBox.Show(result == SignOutResult.OutcomeUnknown
+                    ? "Sign-out outcome is unknown. Automatic and manual reconnect are blocked. Inspect the child session before restarting the launcher."
+                    : "Child identity changed or could not be verified. No sign-out was attempted. Reconnect is blocked.\n" + lifecycle.FailureReason,
+                    "ChildStream", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
             tray.Visible = false;
             Application.Exit();
-        });
+        };
         menu.Items.Add("Exit", null, (s, e) => { tray.Visible = false; Application.Exit(); });
         tray.ContextMenuStrip = menu;
         tray.DoubleClick += (s, e) => { f.Show(); f.WindowState = FormWindowState.Normal; f.Activate(); };
@@ -151,11 +223,21 @@ static class Program
         var rdp = new RdpBox { Dock = DockStyle.Fill };
         f.Controls.Add(rdp);
         rdp.CreateControl();
-        dynamic ocx = rdp.Ocx;
+        ocx = rdp.Ocx;
 
-        bool wantReconnect = true;
+        int last = -1;
+        DateTime lastAttempt = DateTime.MinValue;
         Action connect = () =>
         {
+            if (!lifecycle.TryBeginConnection())
+            {
+                Log("connection blocked in lifecycle state " + lifecycle.State + ": " + lifecycle.FailureReason);
+                if (lifecycle.State == ChildLifecycleState.Error)
+                    MessageBox.Show("Connection was blocked because the child identity could not be verified.\n" + lifecycle.FailureReason,
+                        "ChildStream", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            lastAttempt = DateTime.UtcNow;
             try
             {
                 ocx.Server = "localhost";
@@ -196,20 +278,27 @@ static class Program
             }
             catch (Exception ex)
             {
-                wantReconnect = false;
+                lifecycle.ConnectionAttemptFailed();
                 Log("connect failed: " + ex.Message);
-                MessageBox.Show("Child-session connection failed: " + ex.Message + "\nCheck prerequisites, then use Reconnect now.", "ChildStream", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show("Child-session connection failed: " + ex.Message + "\nThe attempt may have created a child. Inspect its state before restarting.", "ChildStream", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         };
 
         reconnectItem.Click += (s, e) =>
         {
-            try { wantReconnect = true; if ((int)ocx.Connected != 0) ocx.Disconnect(); else connect(); }
-            catch (Exception ex) { Log("reconnect: " + ex.Message); MessageBox.Show(ex.Message, "ChildStream"); }
+            try
+            {
+                if ((int)ocx.Connected != 0)
+                {
+                    MessageBox.Show("The viewer is already connected.", "ChildStream");
+                    return;
+                }
+                lifecycle.ObserveViewerDisconnected();
+                connect(); // Same identity and terminal-state checks as automatic reconnect.
+            }
+            catch (Exception ex) { lifecycle.UnrecoverableError(); Log("reconnect: " + ex.Message); MessageBox.Show(ex.Message, "ChildStream"); }
         };
 
-        int last = -1;
-        DateTime lastAttempt = DateTime.MinValue;
         var timer = new Timer { Interval = 2000 };
         timer.Tick += delegate
         {
@@ -221,37 +310,46 @@ static class Program
                     last = state;
                     Log("state -> " + state);
                     f.Text = state == 1 ? "Child Session - connected" : "Child Session - state " + state;
-                    if (state == 1)
-                    {
-                        uint child;
-                        if (TryGetChildSession(out child) && child != parentSessionId)
-                        {
-                            connectedChildId = child;
-                            Log("verified child session " + child);
-                        }
-                    }
                 }
-                if (state == 0 && wantReconnect && !endRequested[0] && (DateTime.Now - lastAttempt).TotalSeconds > 5)
+                if (state == 1 && (lifecycle.State == ChildLifecycleState.Connecting || lifecycle.State == ChildLifecycleState.Reconnecting))
                 {
-                    if (connectedChildId != uint.MaxValue)
+                    if (!lifecycle.ObserveConnected())
                     {
-                        uint child;
-                        if (!TryGetChildSession(out child) || child != connectedChildId)
-                        {
-                            wantReconnect = false;
-                            Log("connected child session ended; automatic creation stopped");
-                            tray.ShowBalloonTip(3000, "Child Session", "The child session ended. Restart the launcher to create another.", ToolTipIcon.Warning);
-                            return;
-                        }
+                        Log("connected child rejected: " + lifecycle.FailureReason);
+                        ocx.Disconnect();
                     }
-                    lastAttempt = DateTime.Now;
+                    else Log("verified child session " + lifecycle.ObservedChild.Value.SessionId);
+                }
+                else if (state == 0) lifecycle.ObserveViewerDisconnected();
+                if (state == 1 && lifecycle.State == ChildLifecycleState.Connected &&
+                    !lifecycle.CheckConnectedIdentity())
+                {
+                    Log("connected child identity lost: " + lifecycle.FailureReason);
+                    ocx.Disconnect();
+                }
+
+                if (state == 0 && lifecycle.State == ChildLifecycleState.ViewerDisconnected &&
+                    (DateTime.UtcNow - lastAttempt).TotalSeconds > 5)
+                {
                     Log("auto-reconnect");
                     connect();
+                }
+                if (state == 0 && (lifecycle.State == ChildLifecycleState.Connecting || lifecycle.State == ChildLifecycleState.Reconnecting) &&
+                    (DateTime.UtcNow - lastAttempt).TotalSeconds > 30)
+                {
+                    lifecycle.ConnectionAttemptFailed();
+                    Log("connection outcome timed out; no automatic recreation");
+                }
+                if (lifecycle.State == ChildLifecycleState.Terminated || lifecycle.State == ChildLifecycleState.Error ||
+                    lifecycle.State == ChildLifecycleState.SignOutOutcomeUnknown)
+                {
+                    reconnectItem.Enabled = false;
+                    signOutItem.Enabled = false;
                 }
             }
             catch (Exception ex)
             {
-                wantReconnect = false;
+                lifecycle.UnrecoverableError();
                 timer.Stop();
                 Log("session monitoring failed: " + ex.Message);
                 MessageBox.Show("Session monitoring failed: " + ex.Message + "\nRestart the launcher after checking the child-session state.", "ChildStream", MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -259,7 +357,7 @@ static class Program
         };
         timer.Start();
 
-        f.FormClosing += (s, e) => { wantReconnect = false; tray.Visible = false; };
+        f.FormClosing += (s, e) => { timer.Stop(); tray.Visible = false; };
         connect();
         Application.Run(f);
         return 0;

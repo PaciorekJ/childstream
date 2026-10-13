@@ -7,6 +7,7 @@ Target: Windows 11 Pro build 26200, Ryzen 7 5800X, RTX 3060, 32 GB RAM, Acer 344
 1. Record OS build, GPU driver, physical display topology/primary/refresh, active Windows sessions, native Sunshine/VDD version/config/process/ports, RDP listener and firewall state, child-session state, target registry values with types/presence, existing portable Sunshine config and hash, Startup hook, desktop shortcut, and all matching firewall rule identifiers. Export a redacted inventory without credentials or pairing secrets. Capture an appropriate system restore or equivalent recovery option.
 2. Run `powershell -NoProfile -File .\scripts\setup.ps1 -Mode Validate` only after reviewing the diagnostic fields. It is read-only. `Apply`, `Recover`, and `Uninstall` are currently blocked.
 3. Choose an isolated, approved test window and define abort criteria: physical console disruption, native Sunshine/VDD failure, unexpected RDP exposure, wrong-session process launch, or any untracked host mutation.
+4. Confirm the PR's offline Windows CI passed at the exact candidate SHA. Treat this as compile and fake-API evidence only. Inspect any legacy `cred.bin` by path and ownership; `-resetpass` is a separate, explicit deletion action and ordinary startup does not remove it.
 
 ## Architecture gate
 
@@ -24,8 +25,8 @@ Target: Windows 11 Pro build 26200, Ryzen 7 5800X, RTX 3060, 32 GB RAM, Acer 344
 | Minecraft Dungeons | Launch and play in child while local mouse/keyboard continues on parent; record Steam/account/DRM behavior |
 | Controllers | Map Bluetooth Xbox Series and USB Xbox One independently in intended client/host roles; verify inputs do not leak between desktops |
 | Audio separation | Play distinct audio on both desktops, inspect captured endpoints, verify PC and TV do not hear the other's stream unexpectedly |
-| Lifecycle | Moonlight disconnect, viewer disconnect, Sunshine stop, graceful game exit, explicit sign-out, and parent termination tested separately |
-| Precise sign-out | Observe target child ID before and after; verify unrelated console and any other RDP session survive |
+| Lifecycle | Viewer transient disconnect and manual/automatic reconnect of the same child; sign-out success, failure, and unknown outcome tested separately from Moonlight disconnect, Sunshine stop, graceful game exit, and parent termination |
+| Precise sign-out | Record parent ID, associated child ID and WTS logon time before the action; recheck immediately before logoff; verify unrelated console and any other RDP session survive; retain the query/logoff race as an explicit residual risk |
 | Rollback | Failure injection and uninstall restore every recorded registry value/type/absence, firewall identity, startup/shortcut ownership, and native Sunshine/VDD functionality |
 
 Keep a result ledger with source SHA, installer/package hashes, command, privilege context, timestamps, expected/actual states, logs with secrets removed, and pass/fail/blocked for each row. A compile or synthetic test result does not satisfy the live claims.

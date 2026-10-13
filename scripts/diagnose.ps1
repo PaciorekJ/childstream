@@ -39,6 +39,24 @@ function Read-RegistryValue([string] $Path, [string] $Name) {
     }
 }
 
+function Get-LegacyCredentialStatus([string] $Path) {
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return 'UNSAFE_TARGET' }
+        return 'PRESENT'
+    } catch [System.Management.Automation.ItemNotFoundException] {
+        return 'ABSENT'
+    } catch [System.IO.FileNotFoundException] {
+        return 'ABSENT'
+    } catch [System.UnauthorizedAccessException] {
+        return 'INACCESSIBLE'
+    } catch [System.Security.SecurityException] {
+        return 'INACCESSIBLE'
+    } catch {
+        return 'UNKNOWN'
+    }
+}
+
 $report = [ordered]@{
     Source = 'read-only ChildStream diagnostic'
     RepositoryRoot = $root
@@ -53,7 +71,7 @@ $report = [ordered]@{
     Files = [ordered]@{
         PortableSunshinePresent = Test-Path -LiteralPath $sunshineExe -PathType Leaf
         PortableSunshineConfigPresent = Test-Path -LiteralPath $sunshineConf -PathType Leaf
-        LegacyCredentialPresent = Test-Path -LiteralPath (Join-Path $root 'cred.bin') -PathType Leaf
+        LegacyCredentialStatus = Get-LegacyCredentialStatus (Join-Path $root 'cred.bin')
         AllUsersStartupHookPresent = Test-Path -LiteralPath $startupHook -PathType Leaf
         DesktopShortcutPresent = Test-Path -LiteralPath $shortcut -PathType Leaf
     }

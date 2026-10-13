@@ -12,15 +12,17 @@ From PowerShell in the repository root:
 .\tests\offline.ps1
 ```
 
-This compiles and executes pure launcher logic tests. It does not create or connect a child session. `scripts/setup.ps1 -Mode Validate` runs read-only host diagnostics when a live diagnostic read is authorized. `Apply`, `Recover`, and `Uninstall` deliberately fail before modifying the host.
+This compiles the launcher and runs deterministic logic tests using fake session and file APIs. It does not create or connect a child session. The restricted Windows pull-request workflow runs the same script. `scripts/setup.ps1 -Mode Validate` runs read-only host diagnostics when a live diagnostic read is authorized. `Apply`, `Recover`, and `Uninstall` deliberately fail before modifying the host.
 
-The launcher now uses Microsoft's documented automatic child-session authentication from the existing parent session. It does not request or persist the Windows password. It attempts to remove the previous `cred.bin`; `ChildStream.exe -resetpass` is also available after compilation. Microsoft documents exceptions for smart-card parent logon and a parent session established before child sessions were enabled. The live behavior on Windows 11 Pro build 26200 still needs verification.
+The launcher uses Microsoft's documented automatic child-session authentication from the existing parent session. It does not request or persist the Windows password. Ordinary startup does not delete `cred.bin`. `ChildStream.exe -resetpass` inspects only the regular `cred.bin` beside `ChildStream.exe`, shows its exact path, requests confirmation, and verifies removal; inaccessible, unsafe, and failed states are reported separately. Copies outside that path require manual ownership review. Microsoft documents exceptions for smart-card parent logon and a parent session established before child sessions were enabled. The live behavior on Windows 11 Pro build 26200 still needs verification.
 
-An explicit **End session** action checks the child ID associated with this parent, checks that it matches the observed connected child, and then calls `WTSLogoffSession`. Closing the viewer is a different operation and does not intentionally sign out the child. Portable Sunshine startup, game/audio/controller integration, transactional installation, and complete rollback remain future work.
+An explicit **End session** action checks the parent-associated child ID and its session logon time against the observed child immediately before `WTSLogoffSession`. Manual and automatic reconnect share the same lifecycle guard. An unknown sign-out outcome, changed child identity, or confirmed termination blocks reconnection. These checks reduce the session-ID reuse risk, but the query and logoff are not atomic; the remaining race requires live review. Closing the viewer does not intentionally sign out the child. Portable Sunshine startup, game/audio/controller integration, transactional installation, and complete rollback remain future work.
 
 ## Source
 
-- `src/ChildStream.cs`: WinForms RDP ActiveX viewer and exact child-session sign-out.
+- `src/ChildStream.cs`: WinForms RDP ActiveX viewer and Windows session adapter.
+- `src/ChildSessionLifecycle.cs`: offline-tested connection and sign-out state machine.
+- `src/LegacyCredentialCleanup.cs`: explicit, path-scoped legacy credential cleanup.
 - `scripts/diagnose.ps1`: read-only inventory; omits credentials and Sunshine config contents.
 - `scripts/childsession-autostart.ps1`: inert guard if a legacy all-users hook still invokes it; the original script is available in Git history for audit.
 - `docs/audit.md`: source behavior, risk/gap matrix, mutation inventory, recovery conditions, and prioritized plan.
