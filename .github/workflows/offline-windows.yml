@@ -2,7 +2,7 @@ name: Windows offline checks
 
 on:
   pull_request:
-    branches: [master]
+    branches: [master, codex/hardened-foundation]
 
 permissions:
   contents: read
@@ -15,6 +15,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Compile launcher and run pure offline tests
+      - name: Compile launcher and run pure offline launcher and installer tests
         shell: pwsh
         run: .\tests\offline.ps1

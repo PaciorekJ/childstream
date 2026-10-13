@@ -12,7 +12,7 @@ From PowerShell in the repository root:
 .\tests\offline.ps1
 ```
 
-This compiles the launcher and runs deterministic logic tests using fake session and file APIs. It does not create or connect a child session. The restricted Windows pull-request workflow runs the same script. `scripts/setup.ps1 -Mode Validate` runs read-only host diagnostics when a live diagnostic read is authorized. `Apply`, `Recover`, and `Uninstall` deliberately fail before modifying the host.
+This compiles the launcher and transactional installer foundation and runs deterministic logic and fault-injection tests using fake session and Windows resource APIs. It does not create or connect a child session. The restricted Windows pull-request workflow runs the same script. `scripts/setup.ps1 -Mode Validate` runs read-only host diagnostics when a live diagnostic read is authorized. `Apply`, `Recover`, and `Uninstall` deliberately fail before modifying the host. See the [installer foundation and recovery design](docs/installer-foundation.md) for the journal, ownership policy, and remaining Windows adapter work.
 
 The launcher uses Microsoft's documented automatic child-session authentication from the existing parent session. It does not request or persist the Windows password. Ordinary startup does not delete `cred.bin`. `ChildStream.exe -resetpass` inspects only the regular `cred.bin` beside `ChildStream.exe`, shows its exact path, requests confirmation, and verifies removal; inaccessible, unsafe, and failed states are reported separately. Copies outside that path require manual ownership review. Microsoft documents exceptions for smart-card parent logon and a parent session established before child sessions were enabled. The live behavior on Windows 11 Pro build 26200 still needs verification.
 
@@ -22,7 +22,9 @@ An explicit **End session** action checks the parent-associated child ID and its
 
 - `src/ChildStream.cs`: WinForms RDP ActiveX viewer and Windows session adapter.
 - `src/ChildSessionLifecycle.cs`: offline-tested connection and sign-out state machine.
+- `src/SessionSignOutGuard.cs`: durable, credential-free sign-out intent and explicit absence reconciliation.
 - `src/LegacyCredentialCleanup.cs`: explicit, path-scoped legacy credential cleanup.
+- `src/InstallerFoundation.cs` and `src/InstallerInventory.cs`: offline transaction engine, typed inventory, and portable package admission contracts.
 - `scripts/diagnose.ps1`: read-only inventory; omits credentials and Sunshine config contents.
 - `scripts/childsession-autostart.ps1`: inert guard if a legacy all-users hook still invokes it; the original script is available in Git history for audit.
 - `docs/audit.md`: source behavior, risk/gap matrix, mutation inventory, recovery conditions, and prioritized plan.

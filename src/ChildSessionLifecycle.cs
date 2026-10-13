@@ -37,9 +37,17 @@ internal interface IChildSessionApi
     bool Logoff(uint sessionId);
 }
 
+internal interface ISignOutIntentStore
+{
+    bool HasUnresolvedIntent(uint parentSessionId);
+    void RecordIntent(uint parentSessionId, ChildSessionIdentity child);
+    void ResolveIntent(uint parentSessionId);
+}
+
 internal enum SignOutResult
 {
     Denied,
+    PersistenceFailed,
     IdentityChanged,
     OutcomeUnknown,
     Complete
@@ -52,16 +60,18 @@ internal sealed class ChildSessionLifecycle
 {
     private readonly IChildSessionApi api;
     private readonly uint parentSessionId;
+    private readonly ISignOutIntentStore intentStore;
     private ChildSessionIdentity? observedChild;
 
     internal ChildLifecycleState State { get; private set; }
     internal ChildSessionIdentity? ObservedChild { get { return observedChild; } }
     internal string FailureReason { get; private set; }
 
-    internal ChildSessionLifecycle(IChildSessionApi api, uint parentSessionId)
+    internal ChildSessionLifecycle(IChildSessionApi api, uint parentSessionId, ISignOutIntentStore intentStore = null)
     {
         this.api = api;
         this.parentSessionId = parentSessionId;
+        this.intentStore = intentStore;
         State = ChildLifecycleState.NoChild;
     }
 
@@ -98,7 +108,13 @@ internal sealed class ChildSessionLifecycle
     {
         if (State == ChildLifecycleState.NoChild)
         {
-            try { ReadValidChild(); }
+            try
+            {
+                if (intentStore != null && intentStore.HasUnresolvedIntent(parentSessionId))
+                    throw new InvalidOperationException("An earlier sign-out is unresolved. Reconcile it before connecting.");
+                if (ReadValidChild().HasValue)
+                    throw new InvalidOperationException("A parent-associated child already exists. Reconcile it before starting a fresh connection.");
+            }
             catch (Exception ex) { FailureReason = ex.Message; State = ChildLifecycleState.Error; return false; }
             State = ChildLifecycleState.Connecting;
             return true;
@@ -128,6 +144,23 @@ internal sealed class ChildSessionLifecycle
             }
             observedChild = current;
             State = ChildLifecycleState.Connected;
+            return true;
+        }
+        catch (Exception ex) { FailureReason = ex.Message; State = ChildLifecycleState.Error; return false; }
+    }
+
+    internal bool CheckConnectionPreflight()
+    {
+        if (State != ChildLifecycleState.Connecting && State != ChildLifecycleState.Reconnecting) return false;
+        try
+        {
+            if (State == ChildLifecycleState.Reconnecting) return ObservedChildStillExists();
+            if ((intentStore != null && intentStore.HasUnresolvedIntent(parentSessionId)) || ReadValidChild().HasValue)
+            {
+                FailureReason = "A sign-out intent or parent-associated child appeared before connection.";
+                State = ChildLifecycleState.Error;
+                return false;
+            }
             return true;
         }
         catch (Exception ex) { FailureReason = ex.Message; State = ChildLifecycleState.Error; return false; }
@@ -180,12 +213,31 @@ internal sealed class ChildSessionLifecycle
                 State = current.HasValue ? ChildLifecycleState.Error : ChildLifecycleState.Terminated;
                 return SignOutResult.IdentityChanged;
             }
+            if (intentStore != null)
+            {
+                try { intentStore.RecordIntent(parentSessionId, current.Value); }
+                catch (Exception ex)
+                {
+                    FailureReason = "Sign-out intent could not be persisted; no logoff was attempted: " + ex.Message;
+                    State = ChildLifecycleState.Error;
+                    return SignOutResult.PersistenceFailed;
+                }
+            }
             // Set this before the call: a false return or exception may follow a partial logoff.
             State = ChildLifecycleState.SignOutOutcomeUnknown;
             if (!api.Logoff(current.Value.SessionId))
             {
                 FailureReason = "WTSLogoffSession did not confirm completion.";
                 return SignOutResult.OutcomeUnknown;
+            }
+            if (intentStore != null)
+            {
+                if (ReadValidChild().HasValue)
+                {
+                    FailureReason = "The child is still associated after sign-out returned.";
+                    return SignOutResult.OutcomeUnknown;
+                }
+                intentStore.ResolveIntent(parentSessionId);
             }
             State = ChildLifecycleState.Terminated;
             return SignOutResult.Complete;
