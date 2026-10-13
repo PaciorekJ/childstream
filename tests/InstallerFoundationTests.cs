@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 
 internal static class InstallerFoundationTests
 {
@@ -45,6 +47,7 @@ internal static class InstallerFoundationTests
         internal int FailSave;
         internal FaultStore(string path) { Disk = new FileJournalStore(path); }
         public InstallJournal Load() { return Disk.Load(); }
+        public InstallJournal ResolveInterruptedReplacement() { return Disk.ResolveInterruptedReplacement(); }
         public void Save(InstallJournal journal)
         {
             Saves++;
@@ -63,6 +66,26 @@ internal static class InstallerFoundationTests
         internal bool Trusted;
         public bool VerifyTrustedExecutable(string path, string thumbprint) { return Trusted && thumbprint.Length == 40; }
     }
+    private sealed class FakeJournalPathProbe : IJournalPathProbe
+    {
+        internal string Target;
+        internal Exception Failure;
+        internal FileAttributes? Attributes;
+        public FileAttributes GetAttributes(string path)
+        {
+            if (path == Target)
+            {
+                if (Failure != null) throw Failure;
+                if (Attributes.HasValue) return Attributes.Value;
+            }
+            return File.GetAttributes(path);
+        }
+    }
+    private sealed class HookOwnership : ITransactionOwnership
+    {
+        internal Action OnAcquire;
+        public IDisposable Acquire() { if (OnAcquire != null) OnAcquire(); return new MemoryStream(); }
+    }
 
     private static ResourceState Absent() { return new ResourceState { Access = ResourceAccess.Absent }; }
     private static ResourceState FileValue(string value)
@@ -74,7 +97,8 @@ internal static class InstallerFoundationTests
             OwnershipEvidence = owner, Verification = "Exact bytes and owner marker", Reversal = "Restore exact original snapshot" };
     }
     private static InstallerEngine Engine(FakeHost host, IJournalStore store)
-    { return new InstallerEngine(host, store, new InstallerPolicy(root)); }
+    { return new InstallerEngine(host, store, new InstallerPolicy(root),
+        new FileTransactionOwnership(Path.Combine(root, "transaction.lock"))); }
     private static InstallPlan Plan(InstallerEngine engine)
     { return engine.Plan(new [] { Operation(file2, "two"), Operation(file1, "one") }); }
     private static void Check(bool condition, string label)
@@ -84,6 +108,12 @@ internal static class InstallerFoundationTests
         bool threw = false;
         try { action(); } catch (T) { threw = true; }
         Check(threw, label);
+    }
+    private static void Reject(Action action, string label)
+    {
+        bool rejected = false;
+        try { action(); } catch (Exception) { rejected = true; }
+        Check(rejected, label);
     }
     private static string PathFor(string caseName) { return Path.Combine(root, caseName + ".journal"); }
     private static void Clean(string path) { if (File.Exists(path)) File.Delete(path); if (File.Exists(path + ".new")) File.Delete(path + ".new"); }
@@ -135,7 +165,7 @@ internal static class InstallerFoundationTests
             Check(host.Read(new ResourceTarget(ResourceKind.OwnedFile, file1)).Access == ResourceAccess.Absent, "write failure clears first " + write + after);
             Check(host.Read(new ResourceTarget(ResourceKind.OwnedFile, file2)).Access == ResourceAccess.Absent, "write failure clears second " + write + after);
         }
-        for (int save = 1; save <= 5; save++)
+        for (int save = 1; save <= 6; save++)
         {
             var host = new FakeHost(); string path = PathFor("rollback-save" + save); Clean(path);
             var plan = Plan(Engine(host, new FaultStore(path)));
@@ -210,6 +240,15 @@ internal static class InstallerFoundationTests
         int readsBefore = host.Reads;
         Throws<InvalidOperationException>(() => engine.Plan(new [] { native }), "native Sunshine path outside root");
         Check(host.Reads == readsBefore, "forbidden target is not inventoried by mutation planner");
+        Reject(() => engine.Plan(new[] { Operation(file1 + ":hidden", "x") }), "alternate data stream rejected");
+        Reject(() => engine.Plan(new[] { Operation(Path.Combine(root, "portable", "..", "portable", "a.exe"), "x") }),
+            "noncanonical alias rejected");
+        Reject(() => engine.Plan(new[] { Operation(@"portable\a.exe", "x") }), "relative file path rejected");
+        var pathProbe = new FakeJournalPathProbe { Target = Path.Combine(root, "portable"),
+            Attributes = FileAttributes.Directory | FileAttributes.ReparsePoint };
+        var guarded = new InstallerEngine(host, new FaultStore(PathFor("path-guard")),
+            new InstallerPolicy(root, pathProbe), new FileTransactionOwnership(Path.Combine(root, "transaction.lock")));
+        Reject(() => guarded.Plan(new[] { Operation(file1, "x") }), "reparse-point ancestor rejected");
         var vdd = Operation(Path.Combine(root, "vdd-driver.sys"), "x");
         Throws<InvalidOperationException>(() => engine.Plan(new [] { vdd }), "VDD path excluded");
         var rdp = Operation(file1, "x"); rdp.Target = new ResourceTarget(ResourceKind.RegistryValue,
@@ -228,9 +267,9 @@ internal static class InstallerFoundationTests
         }
         string path = PathFor("malformed"); Clean(path);
         File.WriteAllBytes(path, new byte [] { 1, 2, 3 });
-        Throws<InvalidDataException>(() => new FileJournalStore(path).Load(), "short journal rejected");
+        Throws<JournalStateException>(() => new FileJournalStore(path).Load(), "short journal rejected");
         File.WriteAllBytes(path, new byte[40]);
-        Throws<InvalidDataException>(() => new FileJournalStore(path).Load(), "bad checksum rejected");
+        Throws<JournalStateException>(() => new FileJournalStore(path).Load(), "bad checksum rejected");
     }
 
     private static void ExactRegistrySnapshot()
@@ -303,7 +342,7 @@ internal static class InstallerFoundationTests
 
         var package = new PortableSunshinePackage { Version = "v1.0", SourceUrl =
             "https://github.com/LizardByte/Sunshine/releases/download/v1.0/sunshine.zip",
-            PortableRoot = Path.Combine(root, "portable"), ConfigRoot = Path.Combine(root, "config"),
+            PortableRoot = Path.Combine(root, "versions", "v1.0"), ConfigRoot = Path.Combine(root, "config"),
             ExecutableSignerThumbprint = new string('a', 40), Sha256 = new string('0', 64) };
         package.Validate(root);
         using (var stream = new MemoryStream(new byte [] { 1, 2, 3 }))
@@ -316,8 +355,8 @@ internal static class InstallerFoundationTests
         using (var locked = package.Admit(artifact, new FakeProvenance { Trusted = true }))
             Check(locked.Position == 0 && locked.ReadByte() == 1, "verified package stream remains open for extraction");
         Throws<InvalidDataException>(() => package.VerifyExtractedExecutable(
-            Path.Combine(root, "portable", "sunshine.exe"), new FakeExecutableSigner()), "untrusted extracted executable blocked");
-        package.VerifyExtractedExecutable(Path.Combine(root, "portable", "sunshine.exe"),
+            Path.Combine(root, "versions", "v1.0", "sunshine.exe"), new FakeExecutableSigner()), "untrusted extracted executable blocked");
+        package.VerifyExtractedExecutable(Path.Combine(root, "versions", "v1.0", "sunshine.exe"),
             new FakeExecutableSigner { Trusted = true });
         Check(true, "trusted executable under portable root admitted by contract");
         package.SourceUrl = "https://example.com/sunshine.zip";
@@ -325,10 +364,150 @@ internal static class InstallerFoundationTests
         package.SourceUrl = "https://github.com/LizardByte/Sunshine/releases/download/v1.0/sunshine.zip";
         package.ConfigRoot = @"C:\Program Files\Sunshine";
         Throws<InvalidDataException>(() => package.Validate(root), "native Sunshine configuration excluded");
+        package.ConfigRoot = Path.Combine(root, "versions");
+        Throws<InvalidDataException>(() => package.Validate(root), "config ancestor overlaps executable directory");
+        package.ConfigRoot = Path.Combine(root, "versions", "v1.0", "config");
+        Throws<InvalidDataException>(() => package.Validate(root), "config descendant overlaps executable directory");
     }
 
-    internal static int Main()
+    private static void JournalStatesAndOwnership()
     {
+        string path = PathFor("journal-states"); Clean(path);
+        var disk = new FileJournalStore(path);
+        Check(disk.Inspect().State == JournalReadState.VerifiedAbsent, "verified journal absence");
+        var host = new FakeHost(); var engine = Engine(host, disk); var plan = Plan(engine);
+        engine.Apply(plan, plan.Hash);
+        Check(disk.Inspect().State == JournalReadState.Valid, "existing valid journal");
+        var denied = new FakeJournalPathProbe { Target = path, Failure = new UnauthorizedAccessException() };
+        var inaccessible = new FileJournalStore(path, denied);
+        Check(inaccessible.Inspect().State == JournalReadState.Inaccessible, "journal access denied distinct from absence");
+        Throws<JournalStateException>(() => Engine(host, inaccessible).Apply(plan, plan.Hash), "access failure blocks Apply");
+        Check(host.Writes == 2, "access failure made no new writes");
+        denied.Failure = null; denied.Attributes = FileAttributes.Directory;
+        Check(inaccessible.Inspect().State == JournalReadState.UnexpectedType, "directory masquerading as journal rejected");
+        denied.Attributes = FileAttributes.ReparsePoint;
+        Check(inaccessible.Inspect().State == JournalReadState.UnexpectedType, "journal reparse point rejected");
+        denied.Attributes = null; denied.Failure = new IOException("Unclassified I/O failure");
+        Check(inaccessible.Inspect().State == JournalReadState.UnknownConflict, "unclassified I/O is unknown, never absent");
+        denied.Failure = null;
+        denied.Attributes = null;
+        File.Copy(path, path + ".new");
+        Check(disk.Inspect().State == JournalReadState.InterruptedReplacement, "pending replacement classified");
+        Throws<JournalStateException>(() => Engine(host, disk).Apply(plan, plan.Hash), "pending replacement blocks Apply");
+        using (new FileTransactionOwnership(Path.Combine(root, "transaction.lock")).Acquire())
+            Throws<InvalidOperationException>(() => engine.ResolveInterruptedJournal(), "repair requires exclusive ownership");
+        Check(engine.ResolveInterruptedJournal().PlanHash == plan.Hash, "explicit repair retains authoritative journal");
+        Check(disk.Inspect().State == JournalReadState.Valid, "repair removes pending replacement from active path");
+        Check(engine.RecoverOrUninstall().Phase == JournalPhase.RolledBack, "repaired journal recovers");
+
+        string conflictPath = PathFor("replacement-conflict"); Clean(conflictPath);
+        var otherHost = new FakeHost(); var otherEngine = Engine(otherHost, new FileJournalStore(conflictPath));
+        var otherPlan = otherEngine.Plan(new[] { Operation(file1, "different") });
+        otherEngine.Apply(otherPlan, otherPlan.Hash);
+        File.Copy(conflictPath, path + ".new");
+        Check(disk.Inspect().State == JournalReadState.UnknownConflict, "different replacement plan classified as conflict");
+        Throws<JournalStateException>(() => disk.Load(), "conflicting replacement blocks load");
+        File.Delete(path + ".new");
+
+        path = PathFor("pending-only"); Clean(path);
+        File.Copy(PathFor("journal-states"), path + ".new");
+        var pendingOnly = new FileJournalStore(path);
+        Check(pendingOnly.Inspect().State == JournalReadState.InterruptedReplacement, "missing main with valid temporary is interrupted");
+        Check(pendingOnly.ResolveInterruptedReplacement() != null && pendingOnly.Inspect().State == JournalReadState.Valid,
+            "explicit repair promotes complete temporary when main absent");
+
+        path = PathFor("partial-temp"); Clean(path);
+        File.WriteAllBytes(path + ".new", new byte[] { 1, 2 });
+        var partial = new FileJournalStore(path);
+        Check(partial.Inspect().State == JournalReadState.InterruptedReplacement, "partial temporary classified");
+        Throws<InvalidDataException>(() => partial.ResolveInterruptedReplacement(), "partial temporary never promoted");
+
+        path = PathFor("busy"); Clean(path);
+        host = new FakeHost(); engine = Engine(host, new FileJournalStore(path)); plan = Plan(engine);
+        var owner = new FileTransactionOwnership(Path.Combine(root, "transaction.lock"));
+        using (owner.Acquire())
+            Throws<InvalidOperationException>(() => engine.Apply(plan, plan.Hash), "concurrent installer refused before journal read");
+        Check(engine.Apply(plan, plan.Hash).Phase == JournalPhase.Complete, "stale lock marker does not block new owner");
+        Check(host.Writes == 2, "single owner writes once");
+
+        path = PathFor("stale-after-lock"); Clean(path);
+        host = new FakeHost();
+        var hook = new HookOwnership();
+        engine = new InstallerEngine(host, new FileJournalStore(path), new InstallerPolicy(root), hook);
+        plan = Plan(engine);
+        var first = plan.Operations[0];
+        hook.OnAcquire = () => host.External(first.Target, FileValue("changed after approval"));
+        Throws<InvalidOperationException>(() => engine.Apply(plan, plan.Hash), "post-acquisition state revalidated");
+        Check(host.Writes == 0, "stale approval has no writes");
+
+        path = PathFor("missing-snapshot"); Clean(path);
+        host = new FakeHost(); engine = Engine(host, new FileJournalStore(path)); plan = Plan(engine);
+        engine.Apply(plan, plan.Hash);
+        var malformed = new FileJournalStore(path).Load();
+        malformed.Entries[0].Operation.Original.Data = new byte[] { 99 };
+        new FileJournalStore(path).Save(malformed);
+        int previousWrites = host.Writes;
+        Reject(() => Engine(host, new FileJournalStore(path)).RecoverOrUninstall(),
+            "missing or malformed original snapshot blocks recovery");
+        Check(host.Writes == previousWrites, "malformed snapshot causes no reversal writes");
+    }
+
+    private static void JournalWriteInterruptions()
+    {
+        foreach (JournalWriteBoundary boundary in Enum.GetValues(typeof(JournalWriteBoundary)))
+        {
+            string path = PathFor("write-boundary-" + boundary); Clean(path);
+            var host = new FakeHost();
+            var failing = new FileJournalStore(path, null, point =>
+            { if (point == boundary) throw new IOException("Injected at " + point); });
+            var plan = Plan(Engine(host, failing));
+            Throws<IOException>(() => Engine(host, failing).Apply(plan, plan.Hash), "journal write boundary " + boundary);
+            JournalReadState state = new FileJournalStore(path).Inspect().State;
+            Check(state == JournalReadState.VerifiedAbsent || state == JournalReadState.InterruptedReplacement ||
+                state == JournalReadState.Valid, "boundary leaves classified journal " + boundary);
+            if (state == JournalReadState.InterruptedReplacement)
+                Engine(host, new FileJournalStore(path)).ResolveInterruptedJournal();
+            if (new FileJournalStore(path).Inspect().State == JournalReadState.Valid)
+                Check(Engine(host, new FileJournalStore(path)).RecoverOrUninstall().Phase == JournalPhase.RolledBack,
+                    "boundary journal recoverable " + boundary);
+            Check(host.Writes == 0, "journal failure preceded mutation " + boundary);
+        }
+    }
+
+    private static void CrossProcessAbandonment()
+    {
+        string lockPath = Path.Combine(root, "transaction.lock");
+        string ready = Path.Combine(root, "lock-holder.ready");
+        if (File.Exists(ready)) File.Delete(ready);
+        var host = new FakeHost(); string path = PathFor("cross-process"); Clean(path);
+        var engine = Engine(host, new FileJournalStore(path));
+        var plan = engine.Plan(new[] { Operation(file1, "x") });
+        var start = new ProcessStartInfo(System.Reflection.Assembly.GetExecutingAssembly().Location,
+            "--hold-lock \"" + lockPath + "\" \"" + ready + "\"");
+        start.UseShellExecute = false; start.CreateNoWindow = true;
+        using (var child = Process.Start(start))
+        {
+            try
+            {
+                for (int i = 0; i < 200 && !File.Exists(ready) && !child.HasExited; i++) Thread.Sleep(25);
+                Check(File.Exists(ready) && !child.HasExited, "other process owns transaction lock");
+                Throws<InvalidOperationException>(() => engine.Apply(plan, plan.Hash), "other process blocks Apply");
+                child.Kill(); child.WaitForExit();
+                Check(engine.Apply(plan, plan.Hash).Phase == JournalPhase.Complete,
+                    "abandoned process handle releases ownership; journal rechecked");
+            }
+            finally { if (!child.HasExited) { child.Kill(); child.WaitForExit(); } }
+        }
+    }
+
+    internal static int Main(string[] args)
+    {
+        if (args.Length == 3 && args[0] == "--hold-lock")
+        {
+            using (new FileTransactionOwnership(args[1]).Acquire())
+            { File.WriteAllText(args[2], "ready"); Thread.Sleep(30000); }
+            return 0;
+        }
         root = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "installer-fixtures");
         Directory.CreateDirectory(root);
         file1 = Path.Combine(root, "portable", "a.exe"); file2 = Path.Combine(root, "portable", "b.exe");
@@ -336,6 +515,7 @@ internal static class InstallerFoundationTests
         {
             BasicAndIdempotence(); FaultMatrix(); ConflictsAndAuthorization(); ScopeAndMalformed();
             ExactRegistrySnapshot(); InventoryAndPackage(); TamperedJournalAndRecoveryPrivilege();
+            JournalStatesAndOwnership(); JournalWriteInterruptions(); CrossProcessAbandonment();
             Console.WriteLine("Installer offline assertions passed: " + assertions); return 0;
         }
         catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }

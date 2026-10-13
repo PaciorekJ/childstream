@@ -82,6 +82,7 @@ internal interface IJournalStore
 {
     InstallJournal Load();
     void Save(InstallJournal journal);
+    InstallJournal ResolveInterruptedReplacement();
 }
 
 internal static class Canonical
@@ -164,9 +165,12 @@ internal static class Canonical
 internal sealed class InstallerPolicy
 {
     private readonly string ownedRoot;
-    internal InstallerPolicy(string ownedRoot)
+    private readonly IJournalPathProbe pathProbe;
+    internal InstallerPolicy(string ownedRoot, IJournalPathProbe pathProbe = null)
     {
+        if (!Path.IsPathRooted(ownedRoot)) throw new ArgumentException("The owned root must be absolute.");
         this.ownedRoot = Path.GetFullPath(ownedRoot).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        this.pathProbe = pathProbe ?? new RealJournalPathProbe();
         if (Path.GetPathRoot(this.ownedRoot).Equals(this.ownedRoot, StringComparison.OrdinalIgnoreCase))
             throw new ArgumentException("The owned root must be a subdirectory.");
     }
@@ -179,7 +183,7 @@ internal sealed class InstallerPolicy
             throw new InvalidOperationException("The resource class is inventory-only.");
         if (target.Kind == ResourceKind.OwnedFile)
         {
-            string path = Path.GetFullPath(target.Identity);
+            string path = ValidateCanonicalFilePath(target.Identity, false, pathProbe);
             if (!path.StartsWith(ownedRoot, StringComparison.OrdinalIgnoreCase) ||
                 path.IndexOf("vdd", StringComparison.OrdinalIgnoreCase) >= 0)
                 throw new InvalidOperationException("File is outside the owned portable installation.");
@@ -187,6 +191,30 @@ internal sealed class InstallerPolicy
         if (target.Kind == ResourceKind.RegistryValue &&
             !target.Identity.StartsWith(@"HKCU\Software\ChildStream\", StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("Registry value is outside ChildStream ownership.");
+    }
+
+    internal static string ValidateCanonicalFilePath(string candidate, bool allowDirectory = false, IJournalPathProbe probe = null)
+    {
+        probe = probe ?? new RealJournalPathProbe();
+        if (String.IsNullOrEmpty(candidate) || !Path.IsPathRooted(candidate) || candidate.StartsWith(@"\\", StringComparison.Ordinal))
+            throw new InvalidOperationException("File path must be a local absolute path.");
+        string full = Path.GetFullPath(candidate);
+        if (!String.Equals(candidate, full, StringComparison.OrdinalIgnoreCase) ||
+            candidate.IndexOf(':', Path.GetPathRoot(full).Length) >= 0)
+            throw new InvalidOperationException("File path is noncanonical or uses an alternate data stream.");
+        for (string current = full; current != null; current = Path.GetDirectoryName(current))
+        {
+            try
+            {
+                FileAttributes attributes = probe.GetAttributes(current);
+                if ((attributes & FileAttributes.ReparsePoint) != 0 ||
+                    (current == full && !allowDirectory && (attributes & FileAttributes.Directory) != 0))
+                    throw new InvalidOperationException("File path crosses a reparse point or targets a directory.");
+            }
+            catch (FileNotFoundException) { }
+            catch (DirectoryNotFoundException) { }
+        }
+        return full;
     }
 
     internal void Validate(InstallOperation op)
@@ -227,10 +255,14 @@ internal sealed class InstallerEngine
     private readonly IInstallerHost host;
     private readonly IJournalStore store;
     private readonly InstallerPolicy policy;
-    internal InstallerEngine(IInstallerHost host, IJournalStore store, InstallerPolicy policy)
-    { this.host = host; this.store = store; this.policy = policy; }
+    private readonly ITransactionOwnership ownership;
+    internal InstallerEngine(IInstallerHost host, IJournalStore store, InstallerPolicy policy, ITransactionOwnership ownership)
+    { this.host = host; this.store = store; this.policy = policy; this.ownership = ownership; }
 
     internal InstallPlan Plan(IEnumerable<InstallOperation> requested)
+    { using (ownership.Acquire()) return PlanOwned(requested); }
+
+    private InstallPlan PlanOwned(IEnumerable<InstallOperation> requested)
     {
         var plan = new InstallPlan();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -252,10 +284,14 @@ internal sealed class InstallerEngine
     }
 
     internal InstallJournal Apply(InstallPlan plan, string approvedHash)
+    { using (ownership.Acquire()) return ApplyOwned(plan, approvedHash); }
+
+    private InstallJournal ApplyOwned(InstallPlan plan, string approvedHash)
     {
         if (plan == null || plan.Hash != Canonical.Hash(plan) || plan.Hash != approvedHash)
             throw new InvalidOperationException("The approved plan hash is absent, stale, or altered.");
         InstallJournal prior = store.Load();
+        if (prior != null) ValidateJournal(prior);
         if (prior != null && prior.Phase != JournalPhase.RolledBack)
         {
             if (prior.Phase == JournalPhase.Complete && prior.PlanHash == plan.Hash)
@@ -291,11 +327,26 @@ internal sealed class InstallerEngine
     }
 
     internal InstallJournal RecoverOrUninstall()
+    { using (ownership.Acquire()) return RecoverOwned(); }
+
+    internal InstallJournal ResolveInterruptedJournal()
+    {
+        using (ownership.Acquire())
+        {
+            InstallJournal journal = store.ResolveInterruptedReplacement();
+            ValidateJournal(journal);
+            return journal;
+        }
+    }
+
+    private InstallJournal RecoverOwned()
     {
         InstallJournal journal = store.Load();
         if (journal == null) throw new InvalidOperationException("No transaction journal exists.");
         ValidateJournal(journal);
         if (journal.Phase == JournalPhase.RolledBack) return journal;
+        if (journal.Phase != JournalPhase.Reversing)
+        { journal.Phase = JournalPhase.Reversing; store.Save(journal); }
         for (int i = journal.Entries.Count - 1; i >= 0; i--)
         {
             JournalEntry entry = journal.Entries[i];
@@ -337,6 +388,9 @@ internal sealed class InstallerEngine
         foreach (var entry in journal.Entries)
         {
             policy.Validate(entry.Operation);
+            if ((journal.Phase == JournalPhase.Complete && entry.Phase != JournalPhase.Applied) ||
+                (journal.Phase == JournalPhase.RolledBack && entry.Phase != JournalPhase.Reversed))
+                throw new InvalidDataException("Journal phase and entry phase disagree.");
             string key = entry.Operation.Target.Kind + ":" + entry.Operation.Target.Identity;
             if (!seen.Add(key) || (previous != null && StringComparer.Ordinal.Compare(previous, key) > 0))
                 throw new InvalidDataException("Journal targets are duplicated or unordered.");
@@ -347,17 +401,137 @@ internal sealed class InstallerEngine
     }
 }
 
-// One bounded, checksummed snapshot per transition. Atomic replacement and Flush(true)
-// make a killed process recoverable; power-loss durability still needs live validation.
+internal enum JournalReadState
+{ VerifiedAbsent, Valid, Inaccessible, Corrupt, UnexpectedType, InterruptedReplacement, UnknownConflict }
+
+internal sealed class JournalInspection
+{
+    internal JournalReadState State;
+    internal InstallJournal Journal;
+    internal string Detail;
+    internal JournalInspection(JournalReadState state, InstallJournal journal, string detail)
+    { State = state; Journal = journal; Detail = detail; }
+}
+
+internal sealed class JournalStateException : IOException
+{
+    internal readonly JournalReadState State;
+    internal JournalStateException(JournalReadState state, string detail) : base("Journal " + state + ": " + detail)
+    { State = state; }
+}
+
+internal interface IJournalPathProbe { FileAttributes GetAttributes(string path); }
+internal sealed class RealJournalPathProbe : IJournalPathProbe
+{ public FileAttributes GetAttributes(string path) { return File.GetAttributes(path); } }
+internal enum JournalWriteBoundary { BeforeTemporaryCreate, AfterTemporaryFlush, BeforePublish, AfterPublish }
+
+// One bounded, checksummed snapshot per transition. An interrupted .new file
+// blocks Apply and is preserved until explicit repair under transaction ownership.
 internal sealed class FileJournalStore : IJournalStore
 {
     private const int MaximumJournalBytes = 32 * 1024 * 1024;
     private readonly string path;
-    internal FileJournalStore(string path) { this.path = path; }
+    private readonly IJournalPathProbe probe;
+    private readonly Action<JournalWriteBoundary> writeFault;
+    internal FileJournalStore(string path, IJournalPathProbe probe = null, Action<JournalWriteBoundary> writeFault = null)
+    {
+        if (!Path.IsPathRooted(path)) throw new ArgumentException("Journal path must be absolute.");
+        this.path = Path.GetFullPath(path);
+        this.probe = probe ?? new RealJournalPathProbe();
+        this.writeFault = writeFault;
+    }
+
+    private JournalInspection Result(JournalReadState state, string detail)
+    { return new JournalInspection(state, null, detail); }
+
+    private JournalReadState Node(string candidate, bool directory)
+    {
+        try
+        {
+            FileAttributes attributes = probe.GetAttributes(candidate);
+            if ((attributes & FileAttributes.ReparsePoint) != 0 ||
+                ((attributes & FileAttributes.Directory) != 0) != directory)
+                return JournalReadState.UnexpectedType;
+            return JournalReadState.Valid;
+        }
+        catch (FileNotFoundException) { return JournalReadState.VerifiedAbsent; }
+        catch (DirectoryNotFoundException) { return JournalReadState.VerifiedAbsent; }
+        catch (UnauthorizedAccessException) { return JournalReadState.Inaccessible; }
+        catch (System.Security.SecurityException) { return JournalReadState.Inaccessible; }
+        catch (IOException) { return JournalReadState.UnknownConflict; }
+    }
+
+    private JournalReadState ParentState()
+    {
+        var parents = new Stack<string>();
+        for (string current = Path.GetDirectoryName(path); current != null; current = Path.GetDirectoryName(current))
+            parents.Push(current);
+        while (parents.Count != 0)
+        {
+            JournalReadState state = Node(parents.Pop(), true);
+            if (state != JournalReadState.Valid) return state;
+        }
+        return JournalReadState.Valid;
+    }
+
+    internal JournalInspection Inspect()
+    {
+        JournalReadState parent = ParentState();
+        if (parent != JournalReadState.Valid && parent != JournalReadState.VerifiedAbsent)
+            return Result(parent, "Journal directory is not a verified regular directory.");
+        JournalReadState main = Node(path, false);
+        JournalReadState pending = Node(path + ".new", false);
+        foreach (JournalReadState state in new[] { main, pending })
+            if (state == JournalReadState.Inaccessible || state == JournalReadState.UnexpectedType ||
+                state == JournalReadState.UnknownConflict)
+                return Result(state, "Journal or replacement path cannot be trusted.");
+        if (pending == JournalReadState.Valid)
+        {
+            InstallJournal replacement;
+            try
+            {
+                replacement = ReadJournal(path + ".new");
+            }
+            catch (UnauthorizedAccessException) { return Result(JournalReadState.Inaccessible, "Replacement cannot be read."); }
+            catch (System.Security.SecurityException) { return Result(JournalReadState.Inaccessible, "Replacement cannot be read."); }
+            catch (InvalidDataException) { return Result(JournalReadState.InterruptedReplacement, "Replacement is incomplete or corrupt."); }
+            catch (EndOfStreamException) { return Result(JournalReadState.InterruptedReplacement, "Replacement is incomplete."); }
+            catch (IOException) { return Result(JournalReadState.UnknownConflict, "Replacement read failed."); }
+            if (main == JournalReadState.Valid)
+            {
+                try
+                {
+                    if (ReadJournal(path).PlanHash != replacement.PlanHash)
+                        return Result(JournalReadState.UnknownConflict, "Main and replacement plans differ.");
+                }
+                catch (UnauthorizedAccessException) { return Result(JournalReadState.Inaccessible, "Main journal cannot be read."); }
+                catch (System.Security.SecurityException) { return Result(JournalReadState.Inaccessible, "Main journal cannot be read."); }
+                catch (InvalidDataException) { return Result(JournalReadState.Corrupt, "Main journal is corrupt."); }
+                catch (EndOfStreamException) { return Result(JournalReadState.Corrupt, "Main journal is truncated."); }
+                catch (IOException) { return Result(JournalReadState.UnknownConflict, "Main journal read failed."); }
+            }
+            return Result(JournalReadState.InterruptedReplacement, "A complete replacement awaits explicit recovery.");
+        }
+        if (main == JournalReadState.VerifiedAbsent) return Result(JournalReadState.VerifiedAbsent, "No journal or replacement exists.");
+        try { return new JournalInspection(JournalReadState.Valid, ReadJournal(path), "Validated journal."); }
+        catch (UnauthorizedAccessException) { return Result(JournalReadState.Inaccessible, "Journal cannot be read."); }
+        catch (System.Security.SecurityException) { return Result(JournalReadState.Inaccessible, "Journal cannot be read."); }
+        catch (InvalidDataException) { return Result(JournalReadState.Corrupt, "Journal content is corrupt."); }
+        catch (EndOfStreamException) { return Result(JournalReadState.Corrupt, "Journal content is truncated."); }
+        catch (IOException) { return Result(JournalReadState.UnknownConflict, "Journal read failed."); }
+    }
+
     public InstallJournal Load()
     {
-        if (!File.Exists(path)) return null;
-        byte[] all = File.ReadAllBytes(path);
+        JournalInspection inspection = Inspect();
+        if (inspection.State == JournalReadState.VerifiedAbsent) return null;
+        if (inspection.State == JournalReadState.Valid) return inspection.Journal;
+        throw new JournalStateException(inspection.State, inspection.Detail);
+    }
+
+    private InstallJournal ReadJournal(string candidate)
+    {
+        byte[] all = File.ReadAllBytes(candidate);
         if (all.Length < 36 || all.Length > MaximumJournalBytes) throw new InvalidDataException("Malformed journal length.");
         int payloadLength = all.Length - 32;
         byte[] payload = new byte[payloadLength]; Array.Copy(all, payload, payloadLength);
@@ -385,8 +559,31 @@ internal sealed class FileJournalStore : IJournalStore
             return journal;
         }
     }
+
+    public InstallJournal ResolveInterruptedReplacement()
+    {
+        JournalInspection state = Inspect();
+        if (state.State != JournalReadState.InterruptedReplacement)
+            throw new JournalStateException(state.State, "There is no safely resolvable interrupted replacement.");
+        InstallJournal replacement = ReadJournal(path + ".new");
+        JournalReadState main = Node(path, false);
+        if (main == JournalReadState.Valid)
+        {
+            InstallJournal original = ReadJournal(path);
+            if (original.PlanHash != replacement.PlanHash)
+                throw new JournalStateException(JournalReadState.UnknownConflict, "Replacement belongs to another plan.");
+            File.Move(path + ".new", path + ".interrupted-" + Guid.NewGuid().ToString("N"));
+        }
+        else if (main == JournalReadState.VerifiedAbsent) File.Move(path + ".new", path);
+        else throw new JournalStateException(main, "Main journal changed during recovery.");
+        return Load();
+    }
+
     public void Save(InstallJournal journal)
     {
+        JournalInspection existing = Inspect();
+        if (existing.State != JournalReadState.Valid && existing.State != JournalReadState.VerifiedAbsent)
+            throw new JournalStateException(existing.State, existing.Detail);
         byte[] payload;
         using (var stream = new MemoryStream())
         using (var writer = new BinaryWriter(stream, Encoding.UTF8))
@@ -400,10 +597,14 @@ internal sealed class FileJournalStore : IJournalStore
         byte[] checksum;
         using (var sha = SHA256.Create()) checksum = sha.ComputeHash(payload);
         string tmp = path + ".new";
-        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path)));
-        using (var file = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+        Directory.CreateDirectory(Path.GetDirectoryName(path));
+        if (writeFault != null) writeFault(JournalWriteBoundary.BeforeTemporaryCreate);
+        using (var file = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
         { file.Write(payload, 0, payload.Length); file.Write(checksum, 0, checksum.Length); file.Flush(true); }
-        if (File.Exists(path)) File.Replace(tmp, path, null);
+        if (writeFault != null) writeFault(JournalWriteBoundary.AfterTemporaryFlush);
+        if (writeFault != null) writeFault(JournalWriteBoundary.BeforePublish);
+        if (existing.State == JournalReadState.Valid) File.Replace(tmp, path, null);
         else File.Move(tmp, path);
+        if (writeFault != null) writeFault(JournalWriteBoundary.AfterPublish);
     }
 }

@@ -145,7 +145,9 @@ internal sealed class PortableSunshinePackage
     internal void Validate(string ownedRoot)
     {
         Uri uri;
-        if (String.IsNullOrEmpty(Version) || !Uri.TryCreate(SourceUrl, UriKind.Absolute, out uri) ||
+        if (String.IsNullOrEmpty(Version) || Version == "." || Version == ".." ||
+            Version.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 ||
+            !Uri.TryCreate(SourceUrl, UriKind.Absolute, out uri) ||
             uri.Scheme != Uri.UriSchemeHttps || uri.Host != "github.com" ||
             !uri.AbsolutePath.StartsWith("/LizardByte/Sunshine/releases/download/" + Version + "/", StringComparison.Ordinal) ||
             uri.Query.Length != 0 || uri.Fragment.Length != 0)
@@ -154,11 +156,13 @@ internal sealed class PortableSunshinePackage
             ExecutableSignerThumbprint == null || ExecutableSignerThumbprint.Length < 40 || !IsHex(ExecutableSignerThumbprint))
             throw new InvalidDataException("Package digest and signer pin are required.");
         string root = Path.GetFullPath(ownedRoot).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        string portable = Path.GetFullPath(PortableRoot).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        string config = Path.GetFullPath(ConfigRoot).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        string portable = InstallerPolicy.ValidateCanonicalFilePath(PortableRoot, true).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        string config = InstallerPolicy.ValidateCanonicalFilePath(ConfigRoot, true).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
         if (!portable.StartsWith(root, StringComparison.OrdinalIgnoreCase) ||
             !config.StartsWith(root, StringComparison.OrdinalIgnoreCase) ||
-            config.StartsWith(portable, StringComparison.OrdinalIgnoreCase))
+            config.StartsWith(portable, StringComparison.OrdinalIgnoreCase) ||
+            portable.StartsWith(config, StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(Path.GetFileName(portable.TrimEnd(Path.DirectorySeparatorChar)), Version, StringComparison.Ordinal))
             throw new InvalidDataException("Portable package and configuration need separate owned paths.");
     }
 
@@ -191,8 +195,8 @@ internal sealed class PortableSunshinePackage
 
     internal void VerifyExtractedExecutable(string executablePath, IExecutableSignerVerifier verifier)
     {
-        string root = Path.GetFullPath(PortableRoot).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        if (!Path.GetFullPath(executablePath).StartsWith(root, StringComparison.OrdinalIgnoreCase) ||
+        string root = InstallerPolicy.ValidateCanonicalFilePath(PortableRoot, true).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        if (!InstallerPolicy.ValidateCanonicalFilePath(executablePath).StartsWith(root, StringComparison.OrdinalIgnoreCase) ||
             verifier == null || !verifier.VerifyTrustedExecutable(executablePath, ExecutableSignerThumbprint))
             throw new InvalidDataException("Portable Sunshine executable signer or scope verification failed.");
     }

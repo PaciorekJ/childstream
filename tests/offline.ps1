@@ -11,7 +11,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Launcher compilation failed.' }
 if ($LASTEXITCODE -ne 0) { throw 'Offline test compilation failed.' }
 & (Join-Path $artifacts 'LauncherLogicTests.exe')
 if ($LASTEXITCODE -ne 0) { throw 'Offline launcher tests failed.' }
-& $csc /nologo /target:exe /main:InstallerFoundationTests "/out:$artifacts\InstallerFoundationTests.exe" (Join-Path $root 'src\InstallerFoundation.cs') (Join-Path $root 'src\InstallerInventory.cs') (Join-Path $PSScriptRoot 'InstallerFoundationTests.cs')
+& $csc /nologo /target:exe /main:InstallerFoundationTests "/out:$artifacts\InstallerFoundationTests.exe" (Join-Path $root 'src\InstallerFoundation.cs') (Join-Path $root 'src\InstallerInventory.cs') (Join-Path $root 'src\TransactionOwnership.cs') (Join-Path $PSScriptRoot 'InstallerFoundationTests.cs')
 if ($LASTEXITCODE -ne 0) { throw 'Installer test compilation failed.' }
 & (Join-Path $artifacts 'InstallerFoundationTests.exe')
 if ($LASTEXITCODE -ne 0) { throw 'Offline installer tests failed.' }
