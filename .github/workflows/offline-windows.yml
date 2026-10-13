@@ -12,7 +12,9 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Compile launcher and run pure offline tests
         shell: pwsh
         run: .\tests\offline.ps1
