@@ -3,11 +3,10 @@ using System.IO;
 using System.Security.Cryptography;
 using System.Text;
 
-// The feasibility host interface is fake-only in this branch. No Windows class
-// implements its mutation methods, and no entry point invokes this state machine
-// against the physical host.
+// The host adapter is never called by the offline tests against the physical host.
 internal enum ProbeStage
-{ Captured, PreparedEnable, AwaitFreshParent, ReadyConnect, Connecting, Connected,
+{ Captured, PreparedEnable, AwaitFreshParent, StageAQueryUnknown, StageAValidated,
+  ReadyConnect, Connecting, Connected,
   OutcomeUnknown, TeardownPrepared, ChildEnded, Restoring, Restored, Conflict }
 internal enum ProbeConnectOutcome { AutomaticLogon, CredentialPrompt, Failed, Unknown }
 
@@ -16,12 +15,16 @@ internal sealed class ProbeSnapshot
     internal ResourceAccess FeatureAccess;
     internal bool FeatureEnabled;
     internal uint ParentSessionId, ConsoleSessionId;
+    internal int ParentProtocolType;
     internal long ParentLogonTime;
     internal string AccountBinding, Edition, RdpRegistryFingerprint, ListenerFingerprint,
         FirewallFingerprint, DisplayFingerprint, NativeResourceFingerprint;
     internal int WindowsBuild;
-    internal bool NetworkRdpClosed;
+    internal bool LocalRdpPostureAccepted;
     internal ResourceAccess ChildAccess;
+    internal int ChildApiErrorCode;
+    internal bool IndependentNoUnexpectedSessions;
+    internal string SessionInventoryFingerprint;
     internal ChildSessionIdentity? AssociatedChild;
 
     internal string InfrastructureFingerprint()
@@ -43,6 +46,7 @@ internal sealed class ProbeJournal
     internal long ActiveParentLogonTime;
     internal ChildSessionIdentity? PositiveChild;
     internal bool ConsoleConfirmed;
+    internal bool ConnectionAttempted;
     internal string AuthenticationOutcome = "unobserved";
     internal int ErrorCode;
 }
@@ -72,16 +76,24 @@ internal interface IProbeStore
 
 internal static class ProbeCodec
 {
+    internal static bool PreFeatureChildGate(ProbeSnapshot s)
+    {
+        return s != null && s.IndependentNoUnexpectedSessions && !s.AssociatedChild.HasValue &&
+            (s.ChildAccess == ResourceAccess.Absent && s.ChildApiErrorCode == 0 ||
+             (!s.FeatureEnabled && s.ChildAccess == ResourceAccess.Unknown && s.ChildApiErrorCode == 1168));
+    }
     internal static byte[] PlanBytes(ProbeSnapshot snapshot)
     {
         using (var stream = new MemoryStream())
         using (var writer = new BinaryWriter(stream, Encoding.UTF8))
         {
-            writer.Write(1); writer.Write((int)snapshot.FeatureAccess); writer.Write(snapshot.FeatureEnabled);
+            writer.Write(3); writer.Write((int)snapshot.FeatureAccess); writer.Write(snapshot.FeatureEnabled);
             writer.Write(snapshot.ParentSessionId); writer.Write(snapshot.ConsoleSessionId);
+            writer.Write(snapshot.ParentProtocolType);
             writer.Write(snapshot.ParentLogonTime); writer.Write(snapshot.AccountBinding);
-            writer.Write((int)snapshot.ChildAccess);
-            writer.Write(snapshot.Edition); writer.Write(snapshot.WindowsBuild); writer.Write(snapshot.NetworkRdpClosed);
+            writer.Write((int)snapshot.ChildAccess); writer.Write(snapshot.ChildApiErrorCode);
+            writer.Write(snapshot.IndependentNoUnexpectedSessions); writer.Write(snapshot.SessionInventoryFingerprint);
+            writer.Write(snapshot.Edition); writer.Write(snapshot.WindowsBuild); writer.Write(snapshot.LocalRdpPostureAccepted);
             writer.Write(snapshot.RdpRegistryFingerprint); writer.Write(snapshot.ListenerFingerprint);
             writer.Write(snapshot.FirewallFingerprint); writer.Write(snapshot.DisplayFingerprint);
             writer.Write(snapshot.NativeResourceFingerprint);
@@ -100,24 +112,27 @@ internal static class ProbeCodec
         using (var stream = new MemoryStream(data))
         using (var reader = new BinaryReader(stream, Encoding.UTF8))
         {
-            if (reader.ReadInt32() != 1) throw new InvalidDataException("Unsupported probe plan version.");
+            if (reader.ReadInt32() != 3) throw new InvalidDataException("Unsupported probe plan version.");
             var s = new ProbeSnapshot();
             s.FeatureAccess = (ResourceAccess)reader.ReadInt32(); s.FeatureEnabled = reader.ReadBoolean();
             s.ParentSessionId = reader.ReadUInt32(); s.ConsoleSessionId = reader.ReadUInt32();
+            s.ParentProtocolType = reader.ReadInt32();
             s.ParentLogonTime = reader.ReadInt64(); s.AccountBinding = reader.ReadString();
-            s.ChildAccess = (ResourceAccess)reader.ReadInt32();
-            if (s.ChildAccess != ResourceAccess.Absent) throw new InvalidDataException("The approved plan requires verified child absence.");
-            s.Edition = reader.ReadString(); s.WindowsBuild = reader.ReadInt32(); s.NetworkRdpClosed = reader.ReadBoolean();
+            s.ChildAccess = (ResourceAccess)reader.ReadInt32(); s.ChildApiErrorCode = reader.ReadInt32();
+            s.IndependentNoUnexpectedSessions = reader.ReadBoolean(); s.SessionInventoryFingerprint = reader.ReadString();
+            if (!PreFeatureChildGate(s)) throw new InvalidDataException("Pre-feature child evidence is insufficient.");
+            s.Edition = reader.ReadString(); s.WindowsBuild = reader.ReadInt32(); s.LocalRdpPostureAccepted = reader.ReadBoolean();
             s.RdpRegistryFingerprint = reader.ReadString(); s.ListenerFingerprint = reader.ReadString();
             s.FirewallFingerprint = reader.ReadString(); s.DisplayFingerprint = reader.ReadString();
             s.NativeResourceFingerprint = reader.ReadString();
             if (stream.Position != stream.Length) throw new InvalidDataException("Trailing probe plan data.");
             if (s.FeatureAccess != ResourceAccess.Accessible || s.ParentSessionId == uint.MaxValue ||
-                s.ParentSessionId != s.ConsoleSessionId || s.ParentLogonTime <= 0 ||
-                s.Edition != "Professional" || s.WindowsBuild < 22000 || !s.NetworkRdpClosed ||
+                s.ParentSessionId != s.ConsoleSessionId || s.ParentProtocolType != 0 || s.ParentLogonTime <= 0 ||
+                s.Edition != "Professional" || s.WindowsBuild < 22000 || !s.LocalRdpPostureAccepted ||
                 String.IsNullOrEmpty(s.AccountBinding) || String.IsNullOrEmpty(s.RdpRegistryFingerprint) ||
                 String.IsNullOrEmpty(s.ListenerFingerprint) || String.IsNullOrEmpty(s.FirewallFingerprint) ||
-                String.IsNullOrEmpty(s.DisplayFingerprint) || String.IsNullOrEmpty(s.NativeResourceFingerprint))
+                String.IsNullOrEmpty(s.DisplayFingerprint) || String.IsNullOrEmpty(s.NativeResourceFingerprint) ||
+                String.IsNullOrEmpty(s.SessionInventoryFingerprint))
                 throw new InvalidDataException("Malformed probe prerequisite snapshot.");
             return s;
         }
@@ -128,11 +143,12 @@ internal static class ProbeCodec
         using (var stream = new MemoryStream())
         using (var writer = new BinaryWriter(stream, Encoding.UTF8))
         {
-            writer.Write(1); writer.Write((int)journal.Stage); writer.Write(journal.ActiveParentId);
+            writer.Write(3); writer.Write((int)journal.Stage); writer.Write(journal.ActiveParentId);
             writer.Write(journal.ActiveParentLogonTime); writer.Write(journal.PositiveChild.HasValue);
             if (journal.PositiveChild.HasValue)
             { writer.Write(journal.PositiveChild.Value.SessionId); writer.Write(journal.PositiveChild.Value.LogonTime); }
-            writer.Write(journal.ConsoleConfirmed); writer.Write(journal.AuthenticationOutcome);
+            writer.Write(journal.ConsoleConfirmed); writer.Write(journal.ConnectionAttempted);
+            writer.Write(journal.AuthenticationOutcome);
             writer.Write(journal.ErrorCode); writer.Flush(); return stream.ToArray();
         }
     }
@@ -142,12 +158,13 @@ internal static class ProbeCodec
         using (var stream = new MemoryStream(data))
         using (var reader = new BinaryReader(stream, Encoding.UTF8))
         {
-            if (reader.ReadInt32() != 1) throw new InvalidDataException("Unsupported probe journal version.");
+            if (reader.ReadInt32() != 3) throw new InvalidDataException("Unsupported probe journal version.");
             journal.Stage = (ProbeStage)reader.ReadInt32();
             if (!Enum.IsDefined(typeof(ProbeStage), journal.Stage)) throw new InvalidDataException("Invalid probe stage.");
             journal.ActiveParentId = reader.ReadUInt32(); journal.ActiveParentLogonTime = reader.ReadInt64();
             if (reader.ReadBoolean()) journal.PositiveChild = new ChildSessionIdentity(reader.ReadUInt32(), reader.ReadInt64());
-            journal.ConsoleConfirmed = reader.ReadBoolean(); journal.AuthenticationOutcome = reader.ReadString();
+            journal.ConsoleConfirmed = reader.ReadBoolean(); journal.ConnectionAttempted = reader.ReadBoolean();
+            journal.AuthenticationOutcome = reader.ReadString();
             journal.ErrorCode = reader.ReadInt32();
             if (stream.Position != stream.Length) throw new InvalidDataException("Trailing probe journal data.");
             if (journal.ActiveParentId == uint.MaxValue || journal.ActiveParentLogonTime <= 0 ||
@@ -158,6 +175,7 @@ internal static class ProbeCodec
                 ((journal.Stage == ProbeStage.Connected || journal.Stage == ProbeStage.TeardownPrepared ||
                   journal.Stage == ProbeStage.ChildEnded) && !journal.PositiveChild.HasValue) ||
                 (journal.Stage == ProbeStage.Connected && journal.AuthenticationOutcome != "AutomaticLogon") ||
+                (journal.Stage == ProbeStage.Connected && !journal.ConnectionAttempted) ||
                 (journal.Stage == ProbeStage.ChildEnded && !journal.ConsoleConfirmed))
                 throw new InvalidDataException("Inconsistent probe progress snapshot.");
         }
@@ -182,7 +200,7 @@ internal sealed class FileProbeStore : IProbeStore
             throw new InvalidDataException("Unexpected probe journal record.");
         InstallOperation op = raw.Entries[0].Operation;
         if (op.Original.Access != ResourceAccess.Accessible || op.Desired.Access != ResourceAccess.Accessible ||
-            op.Original.ValueType != "ProbePlanV1" || op.Desired.ValueType != "ProbeProgressV1" ||
+            op.Original.ValueType != "ProbePlanV3" || op.Desired.ValueType != "ProbeProgressV3" ||
             raw.PlanHash != ProbeCodec.Hash(op.Original.Data))
             throw new InvalidDataException("Probe plan integrity failed.");
         var plan = new ProbePlan { Original = ProbeCodec.ReadPlan(op.Original.Data), Hash = raw.PlanHash };
@@ -198,8 +216,8 @@ internal sealed class FileProbeStore : IProbeStore
         raw.Entries.Add(new JournalEntry { Phase = JournalPhase.Applied,
             Operation = new InstallOperation {
                 Target = new ResourceTarget(ResourceKind.ChildSessions, "ChildStream.FeasibilityProbe"),
-                Original = new ResourceState { Access = ResourceAccess.Accessible, ValueType = "ProbePlanV1", Data = planData },
-                Desired = new ResourceState { Access = ResourceAccess.Accessible, ValueType = "ProbeProgressV1", Data = ProbeCodec.JournalBytes(journal) },
+                Original = new ResourceState { Access = ResourceAccess.Accessible, ValueType = "ProbePlanV3", Data = planData },
+                Desired = new ResourceState { Access = ResourceAccess.Accessible, ValueType = "ProbeProgressV3", Data = ProbeCodec.JournalBytes(journal) },
                 Privilege = InstallPrivilege.Administrator, OwnershipEvidence = "FeasibilityProbe",
                 Verification = "Feature state and session identity", Reversal = "Restore exact original child feature" } });
         store.Save(raw);
@@ -220,30 +238,29 @@ internal sealed class FeasibilityProbe
     private static void ValidateInitial(ProbeSnapshot s)
     {
         Require(s != null && s.FeatureAccess == ResourceAccess.Accessible && s.ParentSessionId != uint.MaxValue &&
-            s.ParentSessionId == s.ConsoleSessionId && s.ParentLogonTime > 0 &&
-            s.Edition == "Professional" && s.WindowsBuild >= 22000 && s.NetworkRdpClosed &&
-            s.ChildAccess == ResourceAccess.Absent && !s.AssociatedChild.HasValue && !String.IsNullOrEmpty(s.AccountBinding) &&
+            s.ParentSessionId == s.ConsoleSessionId && s.ParentProtocolType == 0 && s.ParentLogonTime > 0 &&
+            s.Edition == "Professional" && s.WindowsBuild >= 22000 && s.LocalRdpPostureAccepted &&
+            ProbeCodec.PreFeatureChildGate(s) && !String.IsNullOrEmpty(s.AccountBinding) &&
             !String.IsNullOrEmpty(s.RdpRegistryFingerprint) && !String.IsNullOrEmpty(s.ListenerFingerprint) &&
             !String.IsNullOrEmpty(s.FirewallFingerprint) && !String.IsNullOrEmpty(s.DisplayFingerprint) &&
-            !String.IsNullOrEmpty(s.NativeResourceFingerprint),
+            !String.IsNullOrEmpty(s.NativeResourceFingerprint) &&
+            !String.IsNullOrEmpty(s.SessionInventoryFingerprint),
             "The Windows 11 Pro console, child feature, session, or closed-RDP prerequisites are uncertain.");
     }
 
     private static void ValidateUnchanged(ProbeJournal journal, ProbeSnapshot current)
     {
         Require(current != null && current.FeatureAccess == ResourceAccess.Accessible &&
-            current.AccountBinding == journal.Plan.Original.AccountBinding &&
-            current.NetworkRdpClosed && current.InfrastructureFingerprint() == journal.Plan.Original.InfrastructureFingerprint(),
+            current.AccountBinding == journal.Plan.Original.AccountBinding && current.ParentProtocolType == 0 &&
+            current.LocalRdpPostureAccepted && current.InfrastructureFingerprint() == journal.Plan.Original.InfrastructureFingerprint(),
             "RDP, display, native resources, account, or feature observation drifted.");
     }
 
     internal ProbePlan Plan()
     {
-        using (owner.Acquire())
-        {
-            ProbeSnapshot s = host.Capture(); ValidateInitial(s);
-            return new ProbePlan { Original = s, Hash = ProbeCodec.Hash(ProbeCodec.PlanBytes(s)) };
-        }
+        // Planning must leave no lock file or journal on the host.
+        ProbeSnapshot s = host.Capture(); ValidateInitial(s);
+        return new ProbePlan { Original = s, Hash = ProbeCodec.Hash(ProbeCodec.PlanBytes(s)) };
     }
 
     internal ProbeJournal Begin(ProbePlan plan, string approvedHash, bool explicitConsent)
@@ -268,7 +285,8 @@ internal sealed class FeasibilityProbe
             ProbeJournal j = RequiredJournal(); Require(j.Stage == ProbeStage.Captured, "Feature preparation is not available in this stage.");
             ProbeSnapshot s = host.Capture(); ValidateUnchanged(j, s);
             Require(s.ParentSessionId == j.ActiveParentId && s.ParentLogonTime == j.ActiveParentLogonTime &&
-                s.ChildAccess == ResourceAccess.Absent && !s.AssociatedChild.HasValue && s.FeatureEnabled == j.Plan.Original.FeatureEnabled,
+                ProbeCodec.PreFeatureChildGate(s) && s.SessionInventoryFingerprint == j.Plan.Original.SessionInventoryFingerprint &&
+                s.FeatureEnabled == j.Plan.Original.FeatureEnabled,
                 "Parent, child, or child-feature state changed before preparation.");
             if (!s.FeatureEnabled)
             {
@@ -276,7 +294,8 @@ internal sealed class FeasibilityProbe
                 j.Stage = ProbeStage.PreparedEnable; store.Save(j);
                 Require(host.CompareExchangeChildFeature(false, true), "Child-feature enablement did not match the recorded original.");
                 ProbeSnapshot verified = host.Capture(); ValidateUnchanged(j, verified);
-                Require(verified.FeatureEnabled && verified.ChildAccess == ResourceAccess.Absent &&
+                Require(verified.FeatureEnabled && verified.IndependentNoUnexpectedSessions &&
+                    !verified.AssociatedChild.HasValue &&
                     verified.ParentSessionId == j.ActiveParentId && verified.ParentLogonTime == j.ActiveParentLogonTime,
                     "Child-feature enablement could not be verified.");
             }
@@ -291,9 +310,28 @@ internal sealed class FeasibilityProbe
             ProbeJournal j = RequiredJournal(); Require(j.Stage == ProbeStage.AwaitFreshParent, "No fresh-parent boundary is pending.");
             ProbeSnapshot s = host.Capture(); ValidateUnchanged(j, s);
             Require(s.ParentSessionId == s.ConsoleSessionId && s.ParentLogonTime != j.Plan.Original.ParentLogonTime &&
-                s.ParentLogonTime > 0 && s.FeatureEnabled && s.ChildAccess == ResourceAccess.Absent && !s.AssociatedChild.HasValue,
-                "A fresh, child-free parent console logon is required before automatic authentication.");
+                s.ParentLogonTime > 0 && s.FeatureEnabled && s.IndependentNoUnexpectedSessions && !s.AssociatedChild.HasValue,
+                "A fresh parent console logon without an unexpected session is required.");
             j.ActiveParentId = s.ParentSessionId; j.ActiveParentLogonTime = s.ParentLogonTime;
+            j.Stage = s.ChildAccess == ResourceAccess.Absent && s.ChildApiErrorCode == 0
+                ? ProbeStage.StageAValidated : ProbeStage.StageAQueryUnknown;
+            store.Save(j); return j;
+        }
+    }
+
+    internal ProbeJournal ApproveStageB(string approvedHash, bool explicitConsent)
+    {
+        using (owner.Acquire())
+        {
+            ProbeJournal j = RequiredJournal();
+            Require(j.Stage == ProbeStage.StageAValidated && explicitConsent && j.Plan.Hash == approvedHash,
+                "Stage B requires separate consent for the exact Stage A plan.");
+            ProbeSnapshot s = host.Capture(); ValidateUnchanged(j, s);
+            Require(s.ParentSessionId == j.ActiveParentId && s.ParentLogonTime == j.ActiveParentLogonTime &&
+                s.ParentSessionId == s.ConsoleSessionId && s.FeatureEnabled &&
+                s.ChildAccess == ResourceAccess.Absent && s.ChildApiErrorCode == 0 &&
+                s.IndependentNoUnexpectedSessions && !s.AssociatedChild.HasValue,
+                "Stage B requires a fresh positive API no-child result and independent session evidence.");
             j.Stage = ProbeStage.ReadyConnect; store.Save(j); return j;
         }
     }
@@ -305,22 +343,31 @@ internal sealed class FeasibilityProbe
             ProbeJournal j = RequiredJournal(); Require(j.Stage == ProbeStage.ReadyConnect, "The one connection attempt is unavailable.");
             ProbeSnapshot before = host.Capture(); ValidateUnchanged(j, before);
             Require(before.ParentSessionId == j.ActiveParentId && before.ParentLogonTime == j.ActiveParentLogonTime &&
-                before.FeatureEnabled && before.ChildAccess == ResourceAccess.Absent && !before.AssociatedChild.HasValue, "Parent or child changed before connection.");
-            j.Stage = ProbeStage.Connecting; store.Save(j);
-            ProbeConnectionResult result;
-            try { result = host.ConnectWithoutPassword(); }
-            catch { j.Stage = ProbeStage.OutcomeUnknown; store.Save(j); throw; }
-            ProbeSnapshot after = host.Capture(); ValidateUnchanged(j, after);
-            Require(result != null, "The connection result is missing; the attempt is unresolved.");
-            j.ErrorCode = result.ErrorCode; j.AuthenticationOutcome = result.Outcome.ToString();
-            if (after.ParentSessionId == j.ActiveParentId && after.ParentLogonTime == j.ActiveParentLogonTime &&
-                after.ChildAccess == ResourceAccess.Accessible && result.Identity.HasValue && after.AssociatedChild.HasValue &&
-                result.Identity.Value.Equals(after.AssociatedChild.Value) &&
-                result.Identity.Value.SessionId != before.ParentSessionId && result.Identity.Value.LogonTime > 0)
-                j.PositiveChild = result.Identity;
-            j.Stage = result.Outcome == ProbeConnectOutcome.AutomaticLogon && j.PositiveChild.HasValue
-                ? ProbeStage.Connected : ProbeStage.OutcomeUnknown;
-            store.Save(j); return j;
+                before.FeatureEnabled && before.ChildAccess == ResourceAccess.Absent && before.ChildApiErrorCode == 0 &&
+                before.IndependentNoUnexpectedSessions && !before.AssociatedChild.HasValue,
+                "Parent or child changed before connection.");
+            j.ConnectionAttempted = true; j.Stage = ProbeStage.Connecting; store.Save(j);
+            try
+            {
+                ProbeConnectionResult result = host.ConnectWithoutPassword();
+                ProbeSnapshot after = host.Capture(); ValidateUnchanged(j, after);
+                Require(result != null, "The connection result is missing; the attempt is unresolved.");
+                j.ErrorCode = result.ErrorCode; j.AuthenticationOutcome = result.Outcome.ToString();
+                if (after.ParentSessionId == j.ActiveParentId && after.ParentLogonTime == j.ActiveParentLogonTime &&
+                    after.ChildAccess == ResourceAccess.Accessible && result.Identity.HasValue && after.AssociatedChild.HasValue &&
+                    result.Identity.Value.Equals(after.AssociatedChild.Value) &&
+                    result.Identity.Value.SessionId != before.ParentSessionId && result.Identity.Value.LogonTime > 0)
+                    j.PositiveChild = result.Identity;
+                j.Stage = result.Outcome == ProbeConnectOutcome.AutomaticLogon && j.PositiveChild.HasValue
+                    ? ProbeStage.Connected : ProbeStage.OutcomeUnknown;
+                store.Save(j); return j;
+            }
+            catch (Exception ex)
+            {
+                j.Stage = ProbeStage.OutcomeUnknown; j.ErrorCode = ex.HResult;
+                j.AuthenticationOutcome = "Exception:" + ex.GetType().Name;
+                store.Save(j); throw;
+            }
         }
     }
 
@@ -369,16 +416,15 @@ internal sealed class FeasibilityProbe
         using (owner.Acquire())
         {
             ProbeJournal j = RequiredJournal();
-            ProbeSnapshot s = host.Capture(); ValidateUnchanged(j, s);
+            ProbeSnapshot s = host.Capture();
+            Require(RecoveryCanExcludeChild(j, s),
+                "A child or an unexpected session may exist; restoration is blocked.");
             if (j.Stage == ProbeStage.Restored)
             {
-                Require(s.ChildAccess == ResourceAccess.Absent && !s.AssociatedChild.HasValue &&
-                    s.FeatureEnabled == j.Plan.Original.FeatureEnabled,
+                Require(s.FeatureEnabled == j.Plan.Original.FeatureEnabled && InfrastructureUnchanged(j, s),
                     "The previously restored state drifted.");
                 return j;
             }
-            Require(s.ChildAccess == ResourceAccess.Absent && !s.AssociatedChild.HasValue,
-                "A child is present or uncertain; feature restoration is blocked.");
             if (s.FeatureEnabled != j.Plan.Original.FeatureEnabled)
             {
                 Require(j.Stage != ProbeStage.Captured &&
@@ -388,11 +434,33 @@ internal sealed class FeasibilityProbe
                     "Feature state drifted or Administrator privilege is missing; no escalation is attempted.");
                 j.Stage = ProbeStage.Restoring; store.Save(j);
                 Require(host.CompareExchangeChildFeature(true, false), "Child-feature restoration did not match expected state.");
-                s = host.Capture(); ValidateUnchanged(j, s);
-                Require(!s.FeatureEnabled, "Child-feature restoration was not verified.");
+                s = host.Capture();
+                Require(RecoveryCanExcludeChild(j, s) && !s.FeatureEnabled,
+                    "Child-feature restoration or session absence was not verified.");
             }
-            j.Stage = ProbeStage.Restored; store.Save(j); return j;
+            j.Stage = InfrastructureUnchanged(j, s) ? ProbeStage.Restored : ProbeStage.Conflict;
+            store.Save(j);
+            Require(j.Stage == ProbeStage.Restored,
+                "Feature restoration was verified, but another original-state observation drifted.");
+            return j;
         }
+    }
+
+    private static bool InfrastructureUnchanged(ProbeJournal j, ProbeSnapshot s)
+    {
+        return s.LocalRdpPostureAccepted &&
+            s.InfrastructureFingerprint() == j.Plan.Original.InfrastructureFingerprint();
+    }
+
+    private static bool RecoveryCanExcludeChild(ProbeJournal j, ProbeSnapshot s)
+    {
+        if (s == null || s.FeatureAccess != ResourceAccess.Accessible ||
+            s.AccountBinding != j.Plan.Original.AccountBinding ||
+            s.ParentSessionId != s.ConsoleSessionId || s.ParentProtocolType != 0 || !s.IndependentNoUnexpectedSessions ||
+            s.AssociatedChild.HasValue) return false;
+        bool stageAOnly = !j.ConnectionAttempted;
+        return (s.ChildAccess == ResourceAccess.Absent && s.ChildApiErrorCode == 0) ||
+            (stageAOnly && s.ChildAccess == ResourceAccess.Unknown && s.ChildApiErrorCode == 1168);
     }
 
     internal ProbeJournal ResolveInterruptedJournal()

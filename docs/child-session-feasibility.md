@@ -1,59 +1,76 @@
-# Child-session feasibility boundary
+# One-session Windows feasibility experiment
 
-## Question and evidence level
+This branch provides an operator-controlled experiment harness, not approval to run it. No Stage A or B command has been executed on the physical host. Synthetic tests establish code behavior, not Windows build 26200 behavior.
 
-The single experiment asks whether a Windows 11 Pro console can open one local, password-free child session while ordinary network Remote Desktop remains disabled. The code in this branch is **offline-only**: `FeasibilityProbe` has a fake-host interface and no implementation that enables the feature, connects an RDP control, or logs off a Windows session. `scripts/feasibility-inventory.ps1` is a read-only candidate adapter; it has been syntax checked and its embedded native shim compiled, but it has not been run on the target computer. Synthetic success is not platform evidence.
+Microsoft documents child sessions as local loopback sessions connected through `ConnectToChildSession`, with an automatic-logon exception when the parent signed in before the feature was enabled. General network Remote Desktop enablement is not a documented prerequisite. If it proves necessary here, **stop**. This harness has no RDP registry, firewall, service, display, Sunshine, VDD, audio, or Steam writer. [Child Sessions](https://learn.microsoft.com/en-us/windows/win32/termserv/child-sessions), [WTSEnableChildSessions](https://learn.microsoft.com/en-us/windows/win32/api/wtsapi32/nf-wtsapi32-wtsenablechildsessions).
 
-Microsoft describes the child session as a loopback session tied to the parent, created through the Remote Desktop ActiveX control after setting `ConnectToChildSession`; automatic logon has exceptions for smart-card logon and a parent signed in before child sessions were enabled. It does **not** state that general network RDP must be enabled. Therefore the experiment must never set `fDenyTSConnections`, start an RDP listener, or add a firewall rule. A network RDP opening is a failed precondition, not a fallback. Sources: [Child Sessions](https://learn.microsoft.com/en-us/windows/win32/termserv/child-sessions), [ConnectToChildSession property](https://learn.microsoft.com/en-us/windows/win32/termserv/imsrdpextendedsettings-property), [WTSEnableChildSessions](https://learn.microsoft.com/en-us/windows/win32/api/wtsapi32/nf-wtsapi32-wtsenablechildsessions).
+## Measured host evidence and corrections
 
-## Read-only inventory and original snapshot
+The 2026-10-13 physical-console inventory observed Windows 11 Pro build 26200, process/console session 1 and protocol 0, disabled child feature, and repeated `WTSGetChildSessionId` failure 1168. The latter is **Unknown**, not absence: Microsoft's successful no-child result is `UINT_MAX`. Parent `WTSINFOEX` logon generation appeared plausible. Independent WTS enumeration showed no unexpected interactive session; this is the narrow pre-feature safety gate for Stage A, not a successful child API response. [WTSGetChildSessionId](https://learn.microsoft.com/en-us/windows/win32/api/wtsapi32/nf-wtsapi32-wtsgetchildsessionid), [WTSINFOEX_LEVEL1](https://learn.microsoft.com/en-us/windows/win32/api/wtsapi32/ns-wtsapi32-wtsinfoex_level1_w).
 
-The inventory reports typed `Accessible`, `Absent`, `Inaccessible`, or `Unknown` states instead of treating failed reads as absence. It captures the exact child-feature Boolean; active console, current process, associated child ID and WTS session logon generation; Windows build; exact local and policy `fDenyTSConnections` values with registry types; configured RDP TCP port; listener addresses; effective RDP firewall rule identity, action, profile and remote scope; display bounds; and Sunshine service/process and VDD device identity. Account SID and Sunshine paths appear only as SHA-256 hashes. Usernames, passwords, pairing material, and Sunshine configuration contents are never collected.
+Local `fDenyTSConnections=1`, absent policy override, stopped Manual `TermService`, and no inspected TCP/UDP RDP listener were observed. The updated inventory also reads related services, configured RDP port, TCP/UDP endpoints, firewall profiles, RDP rules, port ranges, and broad inbound allow rules with program/service scope. `LocalRdpPostureAccepted` is a conservative **local observation gate**, not a proof that every network route is closed. It fails on enabled RDP-relevant allow rules, unscoped broad allows, an observed listener, an unreadable firewall view, or a disabled firewall profile. This updated inventory has not yet been run on the host.
 
-`WTSLogonTime` is documented as unsupported. The inventory uses read-only `WTSSessionInfoEx` for logon generation instead. Its native structure layout and readings still need validation on the target Windows build. The screen list is current-session topology, **not proof of physical display identity**. The adapter labels network closure unverified; an operator must review all listening ports, policy and effective firewall state before a plan may be approved. Sources: [WTS_INFO_CLASS](https://learn.microsoft.com/en-us/windows/win32/api/wtsapi32/ne-wtsapi32-wts_info_class), [WTSINFOEX_LEVEL1](https://learn.microsoft.com/en-us/windows/win32/api/wtsapi32/ns-wtsapi32-wtsinfoex_level1_w).
+The native service is `SunshineService`. Inventory now discovers services by name, display name and executable identity. It reports hashed service commands and process paths. VDD selection requires exact Display/Monitor class, PnP root and name, and joins signed-driver metadata; `Xvdd SCSI Miniport` is excluded. The measured primary 3440×1440 screen is topology evidence, not proven physical hardware identity. The inventory does not read Sunshine pairing/configuration contents, usernames or passwords.
 
-The approved `ProbePlan` hashes the canonical original state: feature value, parent session ID and logon generation, console ID, account binding, OS edition/build, verified closed network RDP, and fingerprints of RDP registry, listener, firewall, display and native resources. Child absence must be positively established. The journal stores the snapshot before any intended mutation. Any inaccessible, unknown, or conflicting field blocks the live plan.
+## Transaction and recovery
 
-## Transaction sequence and stop rules
+`plan` reads inventory without creating a lock or journal. It requires process session ID to match the active console and `WTSClientProtocolType=0`; a remote RDP session (protocol 2), inaccessible protocol query, or remote shell cannot pass. `begin HASH` is explicit Stage A approval: it repeats inventory and writes the original-state snapshot only when the hash matches. `prepare-a` is a separate command. Only it can call `WTSEnableChildSessions(true)`, once, when the original feature was false. It requires an **already elevated Administrator token** for the same Windows identity; there is no automatic elevation. Changed session, account, feature state, local RDP posture, or infrastructure fingerprint blocks the call. [WTSQuerySessionInformation](https://learn.microsoft.com/en-us/windows/win32/api/wtsapi32/nf-wtsapi32-wtsquerysessioninformationw).
 
-1. Read inventory under the exclusive cross-process lock. Verify Windows 11 Pro, same parent and console session, no associated child, closed network RDP, known feature state and stable resource fingerprints. Review and approve the exact plan hash and the single proposed feature change separately from this PR.
-2. Under the lock, reload the journal and inventory. Persist `Captured`, then `PreparedEnable` **before** calling `WTSEnableChildSessions(TRUE)` if the original value was false. Require an already elevated Administrator token for that call; never elevate automatically. Verify the feature by rereading `WTSIsChildSessionsEnabled`. If it was already true, make no feature write.
-3. Persist `AwaitFreshParent`. The operator signs out and signs back in; the probe resumes only for the same account binding with a different parent logon generation, same closed-RDP and resource fingerprints, and no child. This boundary is required even if the feature was already enabled, so the automatic-authentication prerequisite is explicit.
-4. Persist `Connecting` and make **one** local ActiveX child-session connection attempt with `ConnectToChildSession=true`. Record HRESULT/Win32 error, whether credentials were requested, and the parent-associated child session ID plus its logon generation. Never supply, save, or prompt for credentials. Only an automatic-authentication result with a matching parent-associated identity may enter `Connected`. A failure or uncertain return enters `OutcomeUnknown`; no automatic retry occurs.
-5. A human verifies the physical console still works independently and records this checkpoint. Before teardown, reread the associated child and compare **both** ID and logon generation. Persist `TeardownPrepared`, then log off that exact child only with explicit teardown consent. An exception or uncertain result leaves the durable intent and forbids another automatic logoff.
-6. Verify no associated child. Restore only the child-feature Boolean that this transaction changed: if originally false, compare/exchange true to false with Administrator rights, then reread and verify false. If originally true, leave it true. Mark `Restored` only after verification. No RDP, firewall, display, Sunshine or VDD value is in the write interface.
+Journal and lock live at `%LOCALAPPDATA%\ChildStream-Feasibility`. Creation uses a protected DACL limited to the current SID, SYSTEM and Administrators. Existing state must have an approved owner and no other allow principals. Reparse paths, alternate data streams, unexpected state files/directories and ambiguous `.new` replacements are rejected. The lock is an exclusive OS file handle, and the checksum-protected journal is atomically replaced. Keep this directory private and never copy it into the repository or CI.
 
-An interruption before the feature write can resume at `PreparedEnable` and verify the original false value. If `PreparedEnable` survives and the value is true, the intent alone cannot prove whether this probe or an external actor made the change. Restoration then requires explicit reviewed acknowledgement; an unplanned change from `Captured` is blocked even with that acknowledgement. A partial journal replacement blocks action until explicit journal repair under the same lock. An interruption around connection or teardown leaves `Connecting` or `TeardownPrepared`; it requires a new read-only assessment and a human decision. A failed restore stays `Restoring` with the snapshot and can be retried only after state and privilege checks. A child with unknown identity, a different ID/generation, a changed parent or account, any RDP drift, or uncertain child query blocks destructive action. The operator must preserve the journal and diagnostics when rollback cannot be verified. These are state-machine guarantees under a truthful host adapter; they do not make the Windows API calls atomic.
+After Stage A enabling, the operator saves ordinary work and signs out/in at the physical console. `verify-a` requires the same SID and a different parent logon generation. A positive `WTSGetChildSessionId` no-child response (`UINT_MAX`) plus independent enumeration yields `StageAValidated`. Error 1168 or another ambiguous query yields `StageAQueryUnknown`; Stage B is blocked and restoration is the normal next action. Stage A never creates a child.
 
-## Privilege and command boundary
+Stage B has a **separate** `approve-b HASH` command available only after validation. `connect-once` durably records `Connecting` before one local ActiveX call. Prompt suppression properties are mandatory; no username or password is supplied or saved. If a required property is missing, the control fails before `Connect`. `Connect` is asynchronous: only an observed connected control plus a parent-associated child ID and `WTSINFOEX` generation can yield `Connected`. Any failed or ambiguous attempt becomes `OutcomeUnknown`, without retry. Actual COM property availability, automatic authentication, and viewer lifetime remain live-validation questions. Do not authorize Stage B solely from offline tests. [IMsTscAx::Connect](https://learn.microsoft.com/en-us/windows/win32/termserv/imstscax-connect), [AllowPromptingForCredentials](https://learn.microsoft.com/en-us/windows/win32/termserv/imsrdpclientnonscriptable5-allowpromptingforcredentials).
 
-The first **currently executable** live-host command, after separate authorization, is read-only and should run from the interactive parent console:
+The operator confirms the physical console works, then separately approves `end-child ID:LOGON` using the ID and generation printed by `status`. The adapter rereads the **parent-associated** child and generation immediately before `WTSLogoffSession` for that exact ID. Any mismatch blocks it. `TeardownPrepared` is durable before the call; uncertain outcome never retries automatically. `restore` checks session absence and restores only the original child-feature value when the journal proves this probe changed it. Error 1168 is accepted only for Stage A recovery with independent no-unexpected-session evidence. After a Stage B attempt, restoration requires positive no-child API evidence. Failed restoration preserves the journal. [WTSLogoffSession](https://learn.microsoft.com/en-us/windows/win32/api/wtsapi32/nf-wtsapi32-wtslogoffsession).
+
+## Exact commands for a separately authorized run
+
+Run from the repository root in the **physical Windows console**, never through RDP, CI, a container or remote shell. The commands below exist in this branch but were **not executed** in Stages A or B during this task. Keep the checkout at the reviewed, tested SHA and obtain separate authorization for each stage.
 
 ```powershell
+# Read-only baseline. Review JSON locally; do not publish it.
+pwsh -NoProfile -File .\scripts\feasibility-inventory.ps1
+
+# Offline build/tests; creates only ignored repository artifacts.
+pwsh -NoProfile -File .\tests\offline.ps1
+
+# Read-only plan; record and review the printed hash and inventory.
+.\tests\.artifacts\ChildStreamFeasibilityProbe.exe plan
+
+# Stage A, only after separate approval of the exact plan/hash.
+.\tests\.artifacts\ChildStreamFeasibilityProbe.exe begin <PLAN_HASH>
+# In already elevated PowerShell of the SAME account at the console:
+.\tests\.artifacts\ChildStreamFeasibilityProbe.exe prepare-a
+.\tests\.artifacts\ChildStreamFeasibilityProbe.exe status
+
+# Save all work; the operator signs out and signs back in manually.
+# No harness command signs out Windows.
+.\tests\.artifacts\ChildStreamFeasibilityProbe.exe verify-a
+.\tests\.artifacts\ChildStreamFeasibilityProbe.exe status
+
+# Stage B is a separate later decision, only if Stage A validated.
+.\tests\.artifacts\ChildStreamFeasibilityProbe.exe approve-b <PLAN_HASH>
+.\tests\.artifacts\ChildStreamFeasibilityProbe.exe connect-once
+.\tests\.artifacts\ChildStreamFeasibilityProbe.exe status
+# Only after personally confirming the physical console is usable:
+.\tests\.artifacts\ChildStreamFeasibilityProbe.exe confirm-console
+# Only after separate approval of the exact identified test child:
+.\tests\.artifacts\ChildStreamFeasibilityProbe.exe end-child <SESSION_ID>:<LOGON_TIME>
+
+# In an already elevated same-account console if original feature was false:
+.\tests\.artifacts\ChildStreamFeasibilityProbe.exe restore
+.\tests\.artifacts\ChildStreamFeasibilityProbe.exe status
 pwsh -NoProfile -File .\scripts\feasibility-inventory.ps1
 ```
 
-Do not pipe its output to a public log. The inventory has no write method. A signed, reviewable Windows mutation adapter and CLI still must be implemented and independently reviewed before any Apply command exists. The planned CLI contract for that future boundary is:
+`status` reads the private journal. If `prepare-a` stopped at `PreparedEnable`, inspect inventory and journal at the physical console. If the feature is still false, `restore` can close the journal without a write. If true and change ownership is ambiguous, only after separate manual review use elevated `restore-reviewed`; it does not override session gates. Inspect both files before `repair-journal` when a `.new` replacement exists. Never delete journal files or repeat `prepare-a`, `connect-once`, or `end-child` after uncertain outcomes.
 
-```powershell
-# Proposed only; these commands are not available in this branch.
-.\ChildStreamProbe.exe plan --inventory .\private\inventory.json --journal .\private\probe.journal
-.\ChildStreamProbe.exe begin --approved-sha256 <exact-plan-hash> --consent-enable-child-feature
-.\ChildStreamProbe.exe prepare-feature
-# Sign out and sign back in to a new parent console logon.
-.\ChildStreamProbe.exe resume --journal .\private\probe.journal
-.\ChildStreamProbe.exe connect-once --journal .\private\probe.journal
-.\ChildStreamProbe.exe confirm-console --journal .\private\probe.journal
-.\ChildStreamProbe.exe end-positive-child --consent-logoff-exact-child
-.\ChildStreamProbe.exe restore-original --journal .\private\probe.journal
-```
+If the parent closes unexpectedly, log back in physically under the same account, run read-only inventory and `status`, and use `restore` only if child/session gates allow it. If a child is visible but its parent binding or generation is unknown, stop and preserve the journal; never use generic session logoff. If the feature is restored but RDP/firewall/display/native observations drift, the journal records `Conflict` for investigation. No harness command changes those resources.
 
-`prepare-feature` and `restore-original` require an already elevated Administrator token **only when changing the feature**. Connection must run in the correct interactive parent session. Teardown authority must be established for the exact child; the API permissions and safe host implementation still need Windows review. This plan never needs Administrator rights to change ordinary RDP or firewall because neither is changed.
+## Stop points before a live experiment
 
-## Gates before the first mutating test
-
-- Separately authorize the specific host, time window, feature enablement (if needed), one connection, exact-child teardown, and restoration. Keep a second operator at the physical console and a recovery route if the display becomes unusable.
-- Verify the read-only adapter's WTS structure layout, session generations, registry values, listener/firewall coverage, display interpretation and native resource identity on the target build. Resolve every `Unknown` or `Inaccessible` result. Confirm smart-card logon is not involved.
-- Implement and offline-test the narrow Windows host adapter with the documented ActiveX control, `WTSEnableChildSessions`, `WTSIsChildSessionsEnabled`, `WTSGetChildSessionId`, session-generation query, and exact-child logoff. Bind it to the locked journal and explicit approvals; do not add global RDP or firewall setters.
-- Review ACLs and placement for the journal and lock, ensure no untrusted process can replace them, and verify the operator has an independent host recovery method. This branch's fake host and generic file journal do not prove these Windows deployment properties.
-- Demonstrate an offline rehearsal of interrupted states and a manual recovery sheet for unresolved child identity or failed feature restoration. Recheck network RDP remains closed before and after the experiment.
+- Re-run the **updated** read-only inventory and inspect broad allowances, firewall profiles, service state, VDD identity, and WTS sessions. The prior host report predates these corrections.
+- Review the exact checkout and CI result. Confirm an already elevated same-account token can be used without switching SIDs, and a physical-console recovery route exists. Save all work before the required sign-out.
+- Authorize Stage A as its own host change. Stop after `verify-a` if child APIs remain Unknown, an unexpected session appears, RDP posture drifts, or restoration cannot be verified.
+- Stage B requires another decision after actual Stage A evidence. ActiveX no-prompt COM behavior, authentication, viewer close behavior and exact logoff permissions remain unverified on this host.

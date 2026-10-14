@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Web.Script.Serialization;
 
 internal static class FeasibilityProbeTests
 {
@@ -41,17 +43,23 @@ internal static class FeasibilityProbeTests
     private static ProbeSnapshot Base()
     {
         return new ProbeSnapshot { FeatureAccess = ResourceAccess.Accessible, FeatureEnabled = false,
-            ChildAccess = ResourceAccess.Absent, ParentSessionId = 2, ConsoleSessionId = 2, ParentLogonTime = 100,
-            AccountBinding = "sid-hash", Edition = "Professional", WindowsBuild = 26100, NetworkRdpClosed = true,
+            ChildAccess = ResourceAccess.Absent, ChildApiErrorCode = 0,
+            IndependentNoUnexpectedSessions = true, SessionInventoryFingerprint = "session-inventory-1",
+            ParentSessionId = 2, ConsoleSessionId = 2, ParentProtocolType = 0, ParentLogonTime = 100,
+            AccountBinding = "sid-hash", Edition = "Professional", WindowsBuild = 26100, LocalRdpPostureAccepted = true,
             RdpRegistryFingerprint = "registry-1", ListenerFingerprint = "listener-1", FirewallFingerprint = "firewall-1",
             DisplayFingerprint = "display-1", NativeResourceFingerprint = "native-1" };
     }
     private static ProbeSnapshot Clone(ProbeSnapshot x)
     {
         return new ProbeSnapshot { FeatureAccess = x.FeatureAccess, FeatureEnabled = x.FeatureEnabled,
-            ChildAccess = x.ChildAccess, ParentSessionId = x.ParentSessionId, ConsoleSessionId = x.ConsoleSessionId,
+            ChildAccess = x.ChildAccess, ChildApiErrorCode = x.ChildApiErrorCode,
+            IndependentNoUnexpectedSessions = x.IndependentNoUnexpectedSessions,
+            SessionInventoryFingerprint = x.SessionInventoryFingerprint,
+            ParentSessionId = x.ParentSessionId, ConsoleSessionId = x.ConsoleSessionId,
+            ParentProtocolType = x.ParentProtocolType,
             ParentLogonTime = x.ParentLogonTime, AccountBinding = x.AccountBinding, Edition = x.Edition,
-            WindowsBuild = x.WindowsBuild, NetworkRdpClosed = x.NetworkRdpClosed,
+            WindowsBuild = x.WindowsBuild, LocalRdpPostureAccepted = x.LocalRdpPostureAccepted,
             RdpRegistryFingerprint = x.RdpRegistryFingerprint, ListenerFingerprint = x.ListenerFingerprint,
             FirewallFingerprint = x.FirewallFingerprint, DisplayFingerprint = x.DisplayFingerprint,
             NativeResourceFingerprint = x.NativeResourceFingerprint, AssociatedChild = x.AssociatedChild };
@@ -76,7 +84,8 @@ internal static class FeasibilityProbeTests
         internal ProbeJournal Ready()
         {
             Begin(); Probe.PrepareFeature(); Host.State.ParentLogonTime = 101;
-            return Probe.ResumeAfterFreshLogon();
+            ProbeJournal stageA = Probe.ResumeAfterFreshLogon();
+            return Probe.ApproveStageB(stageA.Plan.Hash, true);
         }
         public void Dispose() { Directory.Delete(Root, true); }
     }
@@ -91,6 +100,7 @@ internal static class FeasibilityProbeTests
         {
             ProbePlan p = f.Probe.Plan();
             Check(p.NeedsEnable && p.Hash.Length == 64, "exact plan and feature need");
+            Check(!File.Exists(Path.Combine(f.Root, "probe.lock")), "read-only planning creates no lock file");
             Throws<InvalidOperationException>(() => f.Probe.Begin(p, "wrong", true), "wrong approval hash");
             Throws<InvalidOperationException>(() => f.Probe.Begin(p, p.Hash, false), "missing explicit consent");
             f.Host.State.FirewallFingerprint = "drift";
@@ -108,10 +118,12 @@ internal static class FeasibilityProbeTests
             f.Host.State.AssociatedChild = new ChildSessionIdentity(31, 200);
             Throws<InvalidOperationException>(() => f.Probe.Plan(), "existing child blocks planning");
             f.Host.State.ChildAccess = ResourceAccess.Absent; f.Host.State.AssociatedChild = null;
-            f.Host.State.NetworkRdpClosed = false;
+            f.Host.State.LocalRdpPostureAccepted = false;
             Throws<InvalidOperationException>(() => f.Probe.Plan(), "network RDP open blocks planning");
-            f.Host.State.NetworkRdpClosed = true; f.Host.State.Edition = "Home";
+            f.Host.State.LocalRdpPostureAccepted = true; f.Host.State.Edition = "Home";
             Throws<InvalidOperationException>(() => f.Probe.Plan(), "unsupported edition blocks planning");
+            f.Host.State.Edition = "Professional"; f.Host.State.ParentProtocolType = 2;
+            Throws<InvalidOperationException>(() => f.Probe.Plan(), "remote RDP protocol cannot masquerade as console");
         }
     }
 
@@ -255,12 +267,173 @@ internal static class FeasibilityProbeTests
         }
     }
 
+    private static void ObservedHostBoundary()
+    {
+        using (var f = new Fixture())
+        {
+            f.Host.State.ChildAccess = ResourceAccess.Unknown;
+            f.Host.State.ChildApiErrorCode = 1168;
+            f.Begin();
+            Check(f.Probe.PrepareFeature().Stage == ProbeStage.AwaitFreshParent,
+                "documented pre-feature 1168 can pass only with independent session evidence");
+            f.Host.State.ParentLogonTime = 101;
+            Check(f.Probe.ResumeAfterFreshLogon().Stage == ProbeStage.StageAQueryUnknown,
+                "post-logon 1168 remains unknown");
+            Throws<InvalidOperationException>(() => f.Probe.ApproveStageB(f.Store.Load().Plan.Hash, true),
+                "unknown child query blocks Stage B");
+            Check(f.Probe.RestoreOriginal().Stage == ProbeStage.Restored && !f.Host.State.FeatureEnabled,
+                "Stage A only 1168 allows controlled feature restoration");
+        }
+        using (var f = new Fixture())
+        {
+            f.Host.State.ChildAccess = ResourceAccess.Unknown;
+            f.Host.State.ChildApiErrorCode = 1168;
+            f.Host.State.IndependentNoUnexpectedSessions = false;
+            Throws<InvalidOperationException>(() => f.Probe.Plan(), "1168 alone cannot establish child absence");
+        }
+        using (var f = new Fixture())
+        {
+            f.Begin(); f.Probe.PrepareFeature(); f.Host.State.ParentLogonTime = 101;
+            Check(f.Probe.ResumeAfterFreshLogon().Stage == ProbeStage.StageAValidated,
+                "positive API absence after fresh logon validates Stage A");
+            Throws<InvalidOperationException>(() => f.Probe.ConnectOnce(), "Stage B cannot start before separate approval");
+            Throws<InvalidOperationException>(() => f.Probe.ApproveStageB("wrong", true), "Stage B exact hash required");
+            f.Probe.ApproveStageB(f.Store.Load().Plan.Hash, true);
+            f.Host.State.LocalRdpPostureAccepted = false;
+            Throws<InvalidOperationException>(() => f.Probe.ConnectOnce(), "new RDP exposure blocks connection");
+            Check(f.Host.Connections == 0, "exposure never reaches adapter connect");
+        }
+    }
+
+    private sealed class SyntheticInventory : IProbeInventory
+    {
+        internal string Json;
+        public string ReadJson() { return Json; }
+    }
+    private sealed class SyntheticNative : IProbeNative
+    {
+        internal bool Feature, FailFeature;
+        internal uint Child = uint.MaxValue;
+        internal long Generation = 400;
+        internal int FeatureWrites, Logoffs;
+        public int LastError { get { return 5; } }
+        public bool IsFeatureEnabled(out bool enabled) { enabled = Feature; return true; }
+        public bool EnableFeature(bool enabled) { FeatureWrites++; if (FailFeature) return false; Feature = enabled; return true; }
+        public bool GetChildId(out uint id) { id = Child; return true; }
+        public long? LogonTime(uint id) { return id == Child ? (long?)Generation : null; }
+        public bool Logoff(uint id) { Logoffs++; Child = uint.MaxValue; return true; }
+    }
+    private static string SyntheticJson()
+    {
+        var serializer = new JavaScriptSerializer();
+        return serializer.Serialize(new {
+            Schema = "ChildStream.ReadOnlyFeasibilityInventory.v1", HostMutation = false,
+            Windows = new { State = "Accessible", Caption = "Microsoft Windows 11 Pro", BuildNumber = 26200 },
+            AccountBindingHash = "synthetic-sid-hash",
+            ChildFeature = new { State = "Accessible", Enabled = false, ErrorCode = 0 },
+            Sessions = new {
+                ProcessSessionId = 1, ActiveConsoleSessionId = 1,
+                Current = new { State = "Accessible", SessionId = 1, LogonTime = 300L },
+                CurrentProtocol = new { State = "Accessible", Value = 0, ErrorCode = 0 },
+                AssociatedChild = new { State = "Unknown", SessionId = (int?)null, ErrorCode = 1168 },
+                AssociatedChildDetails = (object)null,
+                Enumerated = new { State = "Accessible", Items = new object[] {
+                    new { SessionId = 0, ConnectionState = 4 }, new { SessionId = 1, ConnectionState = 0 } } }
+            },
+            Rdp = new {
+                LocalDenyConnections = new { State = "Accessible", Data = 1 },
+                PolicyDenyConnections = new { State = "Absent", Data = (int?)null },
+                TcpPort = new { State = "Accessible", Data = 3389 },
+                Services = new { State = "Accessible", Items = new object[] {
+                    new { Name = "TermService", State = "Stopped", StartMode = "Manual" } } },
+                TcpListener = new { State = "Accessible", Items = new object[0] },
+                UdpEndpoint = new { State = "Accessible", Items = new object[0] },
+                FirewallProfiles = new { State = "Accessible", Items = new object[] {
+                    new { Name = "Domain", Enabled = true }, new { Name = "Private", Enabled = true },
+                    new { Name = "Public", Enabled = true } } },
+                Firewall = new { State = "Accessible", Items = new object[] {
+                    new { Name = "RemoteDesktop-UserMode-In-TCP", Enabled = "False", Direction = "Inbound",
+                        Action = "Allow", RdpRelevant = true, BroadPort = false, ProgramHash = (string)null, Service = "Any" },
+                    new { Name = "Sunshine", Enabled = "True", Direction = "Inbound",
+                        Action = "Allow", RdpRelevant = false, BroadPort = true, ProgramHash = "sunshine-path-hash", Service = "Any" } } }
+            },
+            Displays = new { State = "Accessible", Items = new object[] { new { Primary = true, Width = 3440, Height = 1440 } } },
+            Sunshine = new { State = "Accessible", Services = new object[] { new { Name = "SunshineService", State = "Running" } } },
+            Vdd = new { State = "Accessible", Items = new object[] {
+                new { Name = "Virtual Display Driver", Class = "Display", InfName = "oem61.inf" } } }
+        });
+    }
+    private static void WindowsAdapterSynthetic()
+    {
+        var input = new SyntheticInventory { Json = SyntheticJson() };
+        var native = new SyntheticNative();
+        var host = new WindowsFeasibilityHost(input, native, () => true);
+        ProbeSnapshot s = host.Capture();
+        Check(s.WindowsBuild == 26200 && s.ParentSessionId == 1 && s.ConsoleSessionId == 1,
+            "synthetic Windows inventory mapped to console identity");
+        Check(s.ChildAccess == ResourceAccess.Unknown && s.ChildApiErrorCode == 1168 &&
+            s.IndependentNoUnexpectedSessions, "1168 preserved with independent session evidence");
+        Check(s.LocalRdpPostureAccepted, "scoped Sunshine broad allowance does not masquerade as RDP allowance");
+        Check(host.CompareExchangeChildFeature(false, true) && native.FeatureWrites == 1,
+            "narrow feature write uses compare exchange");
+        Check(!host.CompareExchangeChildFeature(false, true) && native.FeatureWrites == 1,
+            "feature drift prevents second write");
+        native.FailFeature = true;
+        Throws<System.ComponentModel.Win32Exception>(() => host.CompareExchangeChildFeature(true, false),
+            "feature API failure is surfaced");
+        native.FailFeature = false;
+        native.Child = 31;
+        Check(!host.LogoffExact(new ChildSessionIdentity(31, 401)) && native.Logoffs == 0,
+            "different logon generation cannot be logged off");
+        Check(host.LogoffExact(new ChildSessionIdentity(31, 400)) && native.Logoffs == 1,
+            "exact associated child may be logged off once");
+        var denied = new WindowsFeasibilityHost(input, native, () => false);
+        Throws<InvalidOperationException>(() => denied.CompareExchangeChildFeature(true, false),
+            "adapter never elevates itself");
+        var serializer = new JavaScriptSerializer();
+        var document = (Dictionary<string, object>)serializer.DeserializeObject(SyntheticJson());
+        var rdp = (Dictionary<string, object>)document["Rdp"];
+        var firewall = (Dictionary<string, object>)rdp["Firewall"];
+        firewall["Items"] = new object[] { new Dictionary<string, object> {
+            { "Enabled", "True" }, { "Direction", "Inbound" }, { "Action", "Allow" },
+            { "RdpRelevant", false }, { "BroadPort", true }, { "ProgramHash", null }, { "Service", "Any" } } };
+        input.Json = serializer.Serialize(document);
+        Check(!host.Capture().LocalRdpPostureAccepted, "unscoped broad firewall allow blocks local posture gate");
+        rdp["Firewall"] = new { State = "Accessible", Items = new object[0] };
+        rdp["TcpListener"] = new { State = "Accessible", Items = new object[] { new { LocalPort = 3389 } } };
+        input.Json = serializer.Serialize(document);
+        Check(!host.Capture().LocalRdpPostureAccepted, "RDP listener blocks local posture gate");
+        rdp["TcpListener"] = new { State = "Accessible", Items = new object[0] };
+        var sessions = (Dictionary<string, object>)document["Sessions"];
+        sessions["Enumerated"] = new { State = "Accessible", Items = new object[] {
+            new { SessionId = 0 }, new { SessionId = 1 }, new { SessionId = 8 } } };
+        input.Json = serializer.Serialize(document);
+        Check(!host.Capture().IndependentNoUnexpectedSessions, "unexpected session blocks independent absence gate");
+    }
+    private static void PrivateStateSynthetic()
+    {
+        using (var f = new Fixture())
+        {
+            string path = Path.Combine(f.Root, "private");
+            Throws<DirectoryNotFoundException>(() => ProbePrivateState.VerifyAt(path, false),
+                "read-only state verification never creates a directory");
+            ProbePrivateState.VerifyAt(path, true);
+            Check(Directory.GetAccessControl(path).AreAccessRulesProtected,
+                "created state directory has protected ACL");
+            File.WriteAllText(Path.Combine(path, "probe.lock"), "synthetic");
+            ProbePrivateState.VerifyAt(path, false);
+            File.WriteAllText(Path.Combine(path, "unexpected"), "synthetic");
+            Throws<InvalidDataException>(() => ProbePrivateState.VerifyAt(path, false),
+                "unexpected state file is rejected");
+        }
+    }
+
     public static int Main()
     {
         try
         {
             PlanningAndApproval(); FeatureFailureAndRecovery(); FreshLogonAndConnection(); TeardownAndRollback();
-            JournalAndOwnership();
+            JournalAndOwnership(); ObservedHostBoundary(); WindowsAdapterSynthetic(); PrivateStateSynthetic();
             Console.WriteLine("Feasibility probe: " + assertions + " offline assertions passed."); return 0;
         }
         catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }

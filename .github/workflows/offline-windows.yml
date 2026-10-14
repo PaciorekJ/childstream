@@ -15,6 +15,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Compile launcher and run pure offline launcher and installer tests
+      - name: Compile and run offline launcher, installer, and feasibility tests
         shell: pwsh
         run: .\tests\offline.ps1

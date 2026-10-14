@@ -80,6 +80,22 @@ public static class ChildStreamReadOnlyWts
         }
         finally { WTSFreeMemory(data); }
     }
+    public static object CurrentProtocol()
+    {
+        IntPtr data; int bytes;
+        if (!Query(IntPtr.Zero, uint.MaxValue, 16, out data, out bytes))
+        {
+            int error = Marshal.GetLastWin32Error();
+            return new { State = error == 5 ? "Inaccessible" : "Unknown", Value = (int?)null, ErrorCode = error };
+        }
+        try
+        {
+            if (data == IntPtr.Zero || bytes < 2)
+                return new { State = "Unknown", Value = (int?)null, ErrorCode = 0 };
+            return new { State = "Accessible", Value = (int?)((ushort)Marshal.ReadInt16(data)), ErrorCode = 0 };
+        }
+        finally { if (data != IntPtr.Zero) WTSFreeMemory(data); }
+    }
     public static object Sessions()
     {
         IntPtr data; int count;
@@ -137,7 +153,7 @@ $tcp = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-T
 $rdpLocal = RegistryValue $base 'fDenyTSConnections'
 $rdpPolicy = RegistryValue $policy 'fDenyTSConnections'
 $rdpPort = RegistryValue $tcp 'PortNumber'
-$ports = @(3389)
+$ports = @(3389, 3392)
 if ($rdpPort.State -eq 'Accessible' -and $rdpPort.Data -is [int] -and $rdpPort.Data -ge 1 -and $rdpPort.Data -le 65535) {
     $ports += [int]$rdpPort.Data
 }
@@ -158,6 +174,7 @@ $report = [ordered]@{
         ProcessSessionId = $processSession
         ActiveConsoleSessionId = $console
         Current = [ChildStreamReadOnlyWts]::Session([uint32]$processSession)
+        CurrentProtocol = [ChildStreamReadOnlyWts]::CurrentProtocol()
         AssociatedChild = $child
         AssociatedChildDetails = if ($child.State -eq 'Accessible') { [ChildStreamReadOnlyWts]::Session([uint32]$child.SessionId) } else { $null }
         Enumerated = [ChildStreamReadOnlyWts]::Sessions()
@@ -166,22 +183,52 @@ $report = [ordered]@{
         LocalDenyConnections = $rdpLocal
         PolicyDenyConnections = $rdpPolicy
         TcpPort = $rdpPort
-        Listener = Observed { [ordered]@{ State = 'Accessible'; Items = @(Get-NetTCPConnection -State Listen -ErrorAction Stop |
+        Services = Observed { [ordered]@{ State = 'Accessible'; Items = @(Get-CimInstance Win32_Service -ErrorAction Stop |
+            Where-Object { $_.Name -in 'TermService','UmRdpService','SessionEnv' } |
+            Select-Object Name, State, StartMode) } }
+        TcpListener = Observed { [ordered]@{ State = 'Accessible'; Items = @(Get-NetTCPConnection -State Listen -ErrorAction Stop |
             Where-Object { $_.LocalPort -in $ports } | Select-Object LocalAddress, LocalPort, State) } }
+        UdpEndpoint = Observed { [ordered]@{ State = 'Accessible'; Items = @(Get-NetUDPEndpoint -ErrorAction Stop |
+            Where-Object { $_.LocalPort -in $ports } | Select-Object LocalAddress, LocalPort) } }
+        FirewallProfiles = Observed { [ordered]@{ State = 'Accessible'; Items = @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop |
+            Select-Object Name, Enabled, DefaultInboundAction) } }
         Firewall = Observed {
+            $broadAllowCount = 0
             $items = @(Get-NetFirewallRule -PolicyStore ActiveStore -ErrorAction Stop | ForEach-Object {
                 $rule = $_
                 $filter = $rule | Get-NetFirewallPortFilter -ErrorAction Stop
-                if ($filter.LocalPort -in $ports -or $rule.DisplayGroup -like '*Remote Desktop*') {
+                $application = $rule | Get-NetFirewallApplicationFilter -ErrorAction Stop
+                $service = $rule | Get-NetFirewallServiceFilter -ErrorAction Stop
+                $broad = @($filter.LocalPort) -contains 'Any'
+                $portMatch = @($filter.LocalPort | Where-Object {
+                    $entry = [string]$_
+                    if ($entry -in @($ports | ForEach-Object { [string]$_ })) { return $true }
+                    if ($entry -match '^(\d+)-(\d+)$') {
+                        $low = [int]$Matches[1]; $high = [int]$Matches[2]
+                        return @($ports | Where-Object { $_ -ge $low -and $_ -le $high }).Count -gt 0
+                    }
+                    return $false
+                }).Count -gt 0
+                $rdpRule = $portMatch -or $rule.Name -like 'RemoteDesktop-*' -or
+                    $rule.DisplayGroup -like '*Remote Desktop*' -or $service.Service -eq 'TermService'
+                if ($rule.Enabled -eq 'True' -and $rule.Direction -eq 'Inbound' -and $rule.Action -eq 'Allow' -and $broad) {
+                    $broadAllowCount++
+                }
+                if ($rdpRule -or ($broad -and $rule.Enabled -eq 'True' -and
+                    $rule.Direction -eq 'Inbound' -and $rule.Action -eq 'Allow')) {
                     $address = $rule | Get-NetFirewallAddressFilter -ErrorAction Stop
                     [ordered]@{ Name = $rule.Name; Enabled = [string]$rule.Enabled; Direction = [string]$rule.Direction;
                         Action = [string]$rule.Action; Profile = [string]$rule.Profile; Protocol = [string]$filter.Protocol;
-                        LocalPort = @($filter.LocalPort); RemoteAddress = @($address.RemoteAddress) }
+                        LocalPort = @($filter.LocalPort); RemoteAddress = @($address.RemoteAddress);
+                        ProgramHash = if ($application.Program -and $application.Program -ne 'Any') { Sha256Text $application.Program } else { $null };
+                        Service = [string]$service.Service;
+                        RdpRelevant = [bool]$rdpRule; BroadPort = [bool]$broad }
                 }
             })
-            [ordered]@{ State = 'Accessible'; Items = $items }
+            [ordered]@{ State = 'Accessible'; Items = $items; BroadInboundAllowCount = $broadAllowCount;
+                Coverage = 'Known RDP ports and ranges, RDP rule names and display group, service-specific and enabled broad-port allows; not a complete reachability proof' }
         }
-        NetworkClosedAssessment = 'Unverified; inspect policy, all listeners and effective firewall before approval'
+        NetworkClosedAssessment = 'Unverified; local inventory cannot prove remote reachability or all listener and firewall paths'
     }
     Displays = Observed {
         Add-Type -AssemblyName System.Windows.Forms
@@ -191,17 +238,32 @@ $report = [ordered]@{
                     Width = $_.Bounds.Width; Height = $_.Bounds.Height } }) }
     }
     Sunshine = Observed {
-        $service = Get-CimInstance Win32_Service -Filter "Name = 'sunshine'" -ErrorAction Stop
+        $services = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object {
+            $_.Name -match '(?i)sunshine' -or $_.DisplayName -match '(?i)sunshine' -or
+            $_.PathName -match '(?i)(^|[\\/])sunshine\.exe([\s"\x27]|$)'
+        } | ForEach-Object { [ordered]@{ Name = $_.Name; State = $_.State; StartMode = $_.StartMode;
+            CommandHash = Sha256Text $_.PathName } })
         $processes = @(Get-Process sunshine -ErrorAction SilentlyContinue | ForEach-Object {
-            [ordered]@{ Id = $_.Id; SessionId = $_.SessionId; PathHash = Sha256Text $_.Path } })
-        [ordered]@{ State = 'Accessible'; ServicePresent = $null -ne $service;
-            ServiceState = if ($service) { $service.State } else { $null };
-            ServiceCommandHash = if ($service) { Sha256Text $service.PathName } else { $null };
+            [ordered]@{ Id = $_.Id; SessionId = $_.SessionId; PathState = if ($_.Path) { 'Accessible' } else { 'Unknown' };
+                PathHash = Sha256Text $_.Path } })
+        [ordered]@{ State = 'Accessible'; Services = $services;
             Processes = $processes; ConfigurationContentsRead = $false }
     }
-    Vdd = Observed { [ordered]@{ State = 'Accessible'; Items = @(Get-PnpDevice -PresentOnly -ErrorAction Stop |
-        Where-Object { $_.FriendlyName -match 'Virtual Display|IDD|VDD' } |
-        ForEach-Object { [ordered]@{ Name = $_.FriendlyName; Status = $_.Status; Class = $_.Class } }) } }
+    Vdd = Observed {
+        $drivers = @(Get-CimInstance Win32_PnPSignedDriver -ErrorAction Stop)
+        $items = @(Get-PnpDevice -PresentOnly -ErrorAction Stop | Where-Object {
+            ($_.Class -eq 'Display' -and $_.FriendlyName -eq 'Virtual Display Driver' -and $_.InstanceId -like 'ROOT\*') -or
+            ($_.Class -eq 'Monitor' -and $_.FriendlyName -eq 'Generic Monitor (VDD by MTT)' -and $_.InstanceId -like 'DISPLAY\*')
+        } | ForEach-Object {
+            $device = $_
+            $driver = $drivers | Where-Object { $_.DeviceID -eq $device.InstanceId } | Select-Object -First 1
+            [ordered]@{ Name = $device.FriendlyName; Status = $device.Status; Class = $device.Class;
+                InstanceIdHash = Sha256Text $device.InstanceId; DriverProvider = $driver.DriverProviderName;
+                DriverVersion = $driver.DriverVersion; InfName = $driver.InfName;
+                IdentityState = if ($driver) { 'Accessible' } else { 'Unknown' } }
+        })
+        [ordered]@{ State = 'Accessible'; Items = $items; MatchRule = 'Display/Monitor class, exact name and PnP root, with signed-driver metadata' }
+    }
 }
 
 [pscustomobject]$report | ConvertTo-Json -Depth 12

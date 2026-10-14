@@ -481,10 +481,29 @@ internal sealed class FileJournalStore : IJournalStore
             return Result(parent, "Journal directory is not a verified regular directory.");
         JournalReadState main = Node(path, false);
         JournalReadState pending = Node(path + ".new", false);
-        foreach (JournalReadState state in new[] { main, pending })
+        JournalReadState prior = Node(path + ".prior", false);
+        foreach (JournalReadState state in new[] { main, pending, prior })
             if (state == JournalReadState.Inaccessible || state == JournalReadState.UnexpectedType ||
                 state == JournalReadState.UnknownConflict)
                 return Result(state, "Journal or replacement path cannot be trusted.");
+        if (prior == JournalReadState.Valid)
+        {
+            if (pending == JournalReadState.Valid || main != JournalReadState.Valid)
+                return Result(JournalReadState.UnknownConflict, "Prior journal coexists with an ambiguous publish state.");
+            try
+            {
+                if (ReadJournal(path).PlanHash != ReadJournal(path + ".prior").PlanHash)
+                    return Result(JournalReadState.UnknownConflict, "Published and prior journal plans differ.");
+            }
+            catch (Exception ex)
+            {
+                if (ex is IOException || ex is InvalidDataException || ex is EndOfStreamException ||
+                    ex is UnauthorizedAccessException || ex is System.Security.SecurityException)
+                    return Result(JournalReadState.UnknownConflict, "Published or prior journal cannot be verified.");
+                throw;
+            }
+            return Result(JournalReadState.InterruptedReplacement, "Published journal has an unretired prior copy.");
+        }
         if (pending == JournalReadState.Valid)
         {
             InstallJournal replacement;
@@ -565,6 +584,14 @@ internal sealed class FileJournalStore : IJournalStore
         JournalInspection state = Inspect();
         if (state.State != JournalReadState.InterruptedReplacement)
             throw new JournalStateException(state.State, "There is no safely resolvable interrupted replacement.");
+        if (Node(path + ".prior", false) == JournalReadState.Valid)
+        {
+            if (Node(path, false) != JournalReadState.Valid ||
+                ReadJournal(path).PlanHash != ReadJournal(path + ".prior").PlanHash)
+                throw new JournalStateException(JournalReadState.UnknownConflict, "Prior journal cannot be retired safely.");
+            File.Move(path + ".prior", path + ".interrupted-" + Guid.NewGuid().ToString("N"));
+            return Load();
+        }
         InstallJournal replacement = ReadJournal(path + ".new");
         JournalReadState main = Node(path, false);
         if (main == JournalReadState.Valid)
@@ -603,7 +630,11 @@ internal sealed class FileJournalStore : IJournalStore
         { file.Write(payload, 0, payload.Length); file.Write(checksum, 0, checksum.Length); file.Flush(true); }
         if (writeFault != null) writeFault(JournalWriteBoundary.AfterTemporaryFlush);
         if (writeFault != null) writeFault(JournalWriteBoundary.BeforePublish);
-        if (existing.State == JournalReadState.Valid) File.Replace(tmp, path, null);
+        if (existing.State == JournalReadState.Valid)
+        {
+            File.Replace(tmp, path, path + ".prior");
+            File.Delete(path + ".prior");
+        }
         else File.Move(tmp, path);
         if (writeFault != null) writeFault(JournalWriteBoundary.AfterPublish);
     }

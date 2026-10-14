@@ -500,6 +500,22 @@ internal static class InstallerFoundationTests
         }
     }
 
+    private static void PriorPublishRecovery()
+    {
+        string path = PathFor("prior-publish");
+        var host = new FakeHost(); var engine = Engine(host, new FileJournalStore(path));
+        var plan = Plan(engine);
+        Check(engine.Apply(plan, plan.Hash).Phase == JournalPhase.Complete, "prior fixture is committed");
+        File.Copy(path, path + ".prior");
+        Check(new FileJournalStore(path).Inspect().State == JournalReadState.InterruptedReplacement,
+            "unretired prior copy is classified rather than ignored");
+        Reject(() => engine.RecoverOrUninstall(), "prior copy blocks mutation until explicit repair");
+        Check(engine.ResolveInterruptedJournal().Phase == JournalPhase.Complete,
+            "matching prior copy is retired under explicit recovery");
+        Check(engine.RecoverOrUninstall().Phase == JournalPhase.RolledBack,
+            "rollback proceeds after verified prior recovery");
+    }
+
     internal static int Main(string[] args)
     {
         if (args.Length == 3 && args[0] == "--hold-lock")
@@ -508,14 +524,16 @@ internal static class InstallerFoundationTests
             { File.WriteAllText(args[2], "ready"); Thread.Sleep(30000); }
             return 0;
         }
-        root = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "installer-fixtures");
+        // Isolate repeated offline runs from stale files and transient readers.
+        root = Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
+            "installer-fixtures-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
         file1 = Path.Combine(root, "portable", "a.exe"); file2 = Path.Combine(root, "portable", "b.exe");
         try
         {
             BasicAndIdempotence(); FaultMatrix(); ConflictsAndAuthorization(); ScopeAndMalformed();
             ExactRegistrySnapshot(); InventoryAndPackage(); TamperedJournalAndRecoveryPrivilege();
-            JournalStatesAndOwnership(); JournalWriteInterruptions(); CrossProcessAbandonment();
+            JournalStatesAndOwnership(); JournalWriteInterruptions(); CrossProcessAbandonment(); PriorPublishRecovery();
             Console.WriteLine("Installer offline assertions passed: " + assertions); return 0;
         }
         catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
