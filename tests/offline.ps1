@@ -30,3 +30,17 @@ $nativeShim = [regex]::Match($inventorySource, "(?s)Add-Type -TypeDefinition @'\
 if (-not $nativeShim.Success) { throw 'Read-only inventory native shim is missing.' }
 Add-Type -TypeDefinition $nativeShim.Groups[1].Value -ErrorAction Stop
 Write-Output 'Read-only inventory syntax and native shim compilation passed (host API calls not run).'
+& pwsh -NoProfile -File (Join-Path $PSScriptRoot 'NetworkBoundaryDiagnosticTests.ps1')
+if ($LASTEXITCODE -ne 0) { throw 'Network boundary diagnostic regression tests failed.' }
+$diagnosticPath = Join-Path $root 'scripts\network-boundary-diagnostic.ps1'
+$diagnosticTokens = $null
+$diagnosticErrors = $null
+$diagnosticAst = [System.Management.Automation.Language.Parser]::ParseFile($diagnosticPath,
+    [ref]$diagnosticTokens, [ref]$diagnosticErrors)
+if ($diagnosticErrors.Count -ne 0) { throw "Network diagnostic syntax failed: $($diagnosticErrors[0].Message)" }
+$writes = @($diagnosticAst.FindAll({ param($node)
+    $node -is [System.Management.Automation.Language.CommandAst] -and
+    $node.GetCommandName() -match '^(Set|New|Remove|Disable|Enable|Stop|Restart|Start|Connect|Disconnect)-'
+}, $true))
+if ($writes.Count -ne 0) { throw "Network diagnostic contains a host-mutation command: $($writes[0].GetCommandName())" }
+Write-Output 'Read-only network diagnostic syntax and mutation-command audit passed.'
