@@ -323,11 +323,30 @@ internal static class FeasibilityProbeTests
         public long? LogonTime(uint id) { return id == Child ? (long?)Generation : null; }
         public bool Logoff(uint id) { Logoffs++; Child = uint.MaxValue; return true; }
     }
+    private static Dictionary<string, object> SyntheticRule(string name, bool enabled, bool rdpNamed)
+    {
+        return new Dictionary<string, object> {
+            { "Name", name }, { "Enabled", enabled ? (object)"True" : "False" },
+            { "Direction", "Inbound" }, { "Action", "Allow" }, { "Profile", "Any" },
+            { "Protocol", "TCP" }, { "LocalPort", new object[] { "Any" } },
+            { "RemotePort", new object[] { "Any" } }, { "LocalAddress", new object[] { "Any" } },
+            { "RemoteAddress", new object[] { "Any" } },
+            { "ProgramState", enabled ? "Accessible" : "Any" },
+            { "ProgramHash", enabled ? new string('b', 64) : null },
+            { "PackageState", "Any" }, { "PackageHash", null }, { "Service", "Any" },
+            { "InterfaceAliasHashes", new object[0] }, { "InterfaceType", "Any" },
+            { "Authentication", "NotRequired" }, { "Encryption", "NotRequired" },
+            { "OverrideBlockRules", "False" }, { "SecurityPrincipalHash", null },
+            { "PolicyStoreSourceType", "Local" }, { "PolicyStoreSourceHash", new string('c', 64) },
+            { "PrimaryStatus", "OK" }, { "StatusCode", 65536 },
+            { "EnforcementStatus", new object[] { "Enforced" } }, { "RdpNamed", rdpNamed }
+        };
+    }
     private static string SyntheticJson()
     {
         var serializer = new JavaScriptSerializer();
         return serializer.Serialize(new {
-            Schema = "ChildStream.ReadOnlyFeasibilityInventory.v1", HostMutation = false,
+            Schema = "ChildStream.ReadOnlyFeasibilityInventory.v2", HostMutation = false,
             Windows = new { State = "Accessible", Caption = "Microsoft Windows 11 Pro", BuildNumber = 26200 },
             AccountBindingHash = "synthetic-sid-hash",
             ChildFeature = new { State = "Accessible", Enabled = false, ErrorCode = 0 },
@@ -345,17 +364,21 @@ internal static class FeasibilityProbeTests
                 PolicyDenyConnections = new { State = "Absent", Data = (int?)null },
                 TcpPort = new { State = "Accessible", Data = 3389 },
                 Services = new { State = "Accessible", Items = new object[] {
-                    new { Name = "TermService", State = "Stopped", StartMode = "Manual" } } },
+                    new { Name = "TermService", State = "Stopped", StartMode = "Manual" },
+                    new { Name = "UmRdpService", State = "Stopped", StartMode = "Manual" },
+                    new { Name = "SessionEnv", State = "Stopped", StartMode = "Manual" } },
+                    TermServiceImageHash = new string('a', 64), TermServiceImageState = "Accessible",
+                    TermServiceIsClassicHost = true },
                 TcpListener = new { State = "Accessible", Items = new object[0] },
                 UdpEndpoint = new { State = "Accessible", Items = new object[0] },
                 FirewallProfiles = new { State = "Accessible", Items = new object[] {
-                    new { Name = "Domain", Enabled = true }, new { Name = "Private", Enabled = true },
-                    new { Name = "Public", Enabled = true } } },
+                    new { Name = "Domain", Enabled = 1, DefaultInboundAction = 4 },
+                    new { Name = "Private", Enabled = 1, DefaultInboundAction = 4 },
+                    new { Name = "Public", Enabled = 1, DefaultInboundAction = 4 } } },
                 Firewall = new { State = "Accessible", Items = new object[] {
-                    new { Name = "RemoteDesktop-UserMode-In-TCP", Enabled = "False", Direction = "Inbound",
-                        Action = "Allow", RdpRelevant = true, BroadPort = false, ProgramHash = (string)null, Service = "Any" },
-                    new { Name = "Sunshine", Enabled = "True", Direction = "Inbound",
-                        Action = "Allow", RdpRelevant = false, BroadPort = true, ProgramHash = "sunshine-path-hash", Service = "Any" } } }
+                    SyntheticRule("RemoteDesktop-UserMode-In-TCP", false, true),
+                    SyntheticRule("Sunshine", true, false) },
+                    UnknownHeaderCount = 0, SelectedInboundAllowCount = 1, BroadInboundAllowCount = 1 }
             },
             Displays = new { State = "Accessible", Items = new object[] { new { Primary = true, Width = 3440, Height = 1440 } } },
             Sunshine = new { State = "Accessible", Services = new object[] { new { Name = "SunshineService", State = "Running" } } },
@@ -394,12 +417,13 @@ internal static class FeasibilityProbeTests
         var document = (Dictionary<string, object>)serializer.DeserializeObject(SyntheticJson());
         var rdp = (Dictionary<string, object>)document["Rdp"];
         var firewall = (Dictionary<string, object>)rdp["Firewall"];
-        firewall["Items"] = new object[] { new Dictionary<string, object> {
-            { "Enabled", "True" }, { "Direction", "Inbound" }, { "Action", "Allow" },
-            { "RdpRelevant", false }, { "BroadPort", true }, { "ProgramHash", null }, { "Service", "Any" } } };
+        var unscoped = SyntheticRule("Unscoped", true, false);
+        unscoped["ProgramState"] = "Any"; unscoped["ProgramHash"] = null;
+        firewall["Items"] = new object[] { unscoped };
         input.Json = serializer.Serialize(document);
         Check(!host.Capture().LocalRdpPostureAccepted, "unscoped broad firewall allow blocks local posture gate");
-        rdp["Firewall"] = new { State = "Accessible", Items = new object[0] };
+        rdp["Firewall"] = new { State = "Accessible", Items = new object[0],
+            UnknownHeaderCount = 0, SelectedInboundAllowCount = 0, BroadInboundAllowCount = 0 };
         rdp["TcpListener"] = new { State = "Accessible", Items = new object[] { new { LocalPort = 3389 } } };
         input.Json = serializer.Serialize(document);
         Check(!host.Capture().LocalRdpPostureAccepted, "RDP listener blocks local posture gate");
@@ -409,6 +433,147 @@ internal static class FeasibilityProbeTests
             new { SessionId = 0 }, new { SessionId = 1 }, new { SessionId = 8 } } };
         input.Json = serializer.Serialize(document);
         Check(!host.Capture().IndependentNoUnexpectedSessions, "unexpected session blocks independent absence gate");
+    }
+    private static ProbeSnapshot FirewallSnapshot(Action<Dictionary<string, object>> change)
+    {
+        var serializer = new JavaScriptSerializer();
+        var document = (Dictionary<string, object>)serializer.DeserializeObject(SyntheticJson());
+        if (change != null) change(document);
+        return WindowsFeasibilityHost.ParseInventory(serializer.Serialize(document));
+    }
+    private static Dictionary<string, object> RdpPart(Dictionary<string, object> document)
+    { return (Dictionary<string, object>)document["Rdp"]; }
+    private static Dictionary<string, object> SunshineRule(Dictionary<string, object> document)
+    {
+        var firewall = (Dictionary<string, object>)RdpPart(document)["Firewall"];
+        return (Dictionary<string, object>)((object[])firewall["Items"])[1];
+    }
+    private static Dictionary<string, object> FirstProfile(Dictionary<string, object> document)
+    {
+        var profiles = (Dictionary<string, object>)RdpPart(document)["FirewallProfiles"];
+        return (Dictionary<string, object>)((object[])profiles["Items"])[0];
+    }
+    private static void FirewallGateSynthetic()
+    {
+        ProbeSnapshot baseline = FirewallSnapshot(null);
+        Check(baseline.LocalRdpPostureAccepted, "host-shaped numeric profile enums are accepted");
+        ProbeSnapshot named = FirewallSnapshot(d => {
+            foreach (object p in (object[])((Dictionary<string, object>)RdpPart(d)["FirewallProfiles"])["Items"])
+            {
+                var profile = (Dictionary<string, object>)p;
+                profile["Enabled"] = "True"; profile["DefaultInboundAction"] = "Block";
+            }
+            SunshineRule(d)["Enabled"] = 1;
+            SunshineRule(d)["Protocol"] = 6;
+        });
+        Check(named.LocalRdpPostureAccepted && baseline.FirewallFingerprint == named.FirewallFingerprint,
+            "recognized enum representations share a deterministic firewall fingerprint");
+        Check(!FirewallSnapshot(d => FirstProfile(d)["Enabled"] = 2).LocalRdpPostureAccepted,
+            "disabled profile blocks");
+        Check(!FirewallSnapshot(d => FirstProfile(d)["Enabled"] = 0).LocalRdpPostureAccepted,
+            "NotConfigured profile is unknown and blocks");
+        Check(!FirewallSnapshot(d => FirstProfile(d)["Enabled"] = "yes").LocalRdpPostureAccepted,
+            "unrecognized profile state blocks");
+        Check(!FirewallSnapshot(d => FirstProfile(d)["DefaultInboundAction"] = 2).LocalRdpPostureAccepted,
+            "default inbound Allow blocks");
+        Check(!FirewallSnapshot(d => FirstProfile(d)["DefaultInboundAction"] = "NotConfigured").LocalRdpPostureAccepted,
+            "unknown default inbound action blocks");
+        Check(!FirewallSnapshot(d => {
+            var firewall = (Dictionary<string, object>)RdpPart(d)["Firewall"];
+            firewall["UnknownHeaderCount"] = 1;
+        }).LocalRdpPostureAccepted, "incomplete rule enumeration blocks");
+        Check(!FirewallSnapshot(d => SunshineRule(d)["Direction"] = "Sideways").LocalRdpPostureAccepted,
+            "unknown rule direction blocks");
+        Check(!FirewallSnapshot(d => SunshineRule(d)["Action"] = "Maybe").LocalRdpPostureAccepted,
+            "unknown rule action blocks");
+        Check(!FirewallSnapshot(d => SunshineRule(d)["Profile"] = "Domain, Other").LocalRdpPostureAccepted,
+            "unknown profile applicability blocks");
+        Check(!FirewallSnapshot(d => {
+            SunshineRule(d)["PrimaryStatus"] = "Unknown";
+            SunshineRule(d)["ProgramState"] = "Any"; SunshineRule(d)["ProgramHash"] = null;
+        }).LocalRdpPostureAccepted,
+            "unknown active rule status blocks");
+        Check(!FirewallSnapshot(d => {
+            SunshineRule(d)["RemotePort"] = new object[] { "RPC" };
+            SunshineRule(d)["ProgramState"] = "Any"; SunshineRule(d)["ProgramHash"] = null;
+        }).LocalRdpPostureAccepted,
+            "unresolved remote-port specification blocks");
+        Check(!FirewallSnapshot(d => {
+            var rule = SunshineRule(d);
+            rule["ProgramState"] = "Any"; rule["ProgramHash"] = null;
+        }).LocalRdpPostureAccepted, "unscoped broad TCP allow is potentially RDP permissive");
+        Check(!FirewallSnapshot(d => {
+            var firewall = (Dictionary<string, object>)RdpPart(d)["Firewall"];
+            var rules = new object[21];
+            rules[0] = ((object[])firewall["Items"])[0];
+            for (int i = 1; i < rules.Length; i++)
+            {
+                var rule = SyntheticRule("AppLike-" + i, true, false);
+                rule["ProgramState"] = "Any"; rule["ProgramHash"] = null;
+                rule["PackageState"] = "Any"; rule["PackageHash"] = null;
+                rule["OwnerKind"] = "AppPackage";
+                rules[i] = rule;
+            }
+            firewall["Items"] = rules;
+            firewall["SelectedInboundAllowCount"] = 20;
+            firewall["BroadInboundAllowCount"] = 20;
+        }).LocalRdpPostureAccepted,
+            "twenty app-named or owner-tagged rules with Any traffic scope still block");
+        Check(FirewallSnapshot(d => {
+            var rule = SunshineRule(d);
+            rule["ProgramState"] = "Any"; rule["ProgramHash"] = null;
+            rule["PackageState"] = "AppPackage"; rule["PackageHash"] = new string('d', 64);
+        }).LocalRdpPostureAccepted, "package-constrained rule excludes a classic TermService host");
+        Check(!FirewallSnapshot(d => {
+            var rule = SunshineRule(d);
+            rule["ProgramState"] = "Any"; rule["ProgramHash"] = null;
+            rule["PackageState"] = "AppPackage"; rule["PackageHash"] = new string('d', 64);
+            ((Dictionary<string, object>)RdpPart(d)["Services"])["TermServiceIsClassicHost"] = false;
+        }).LocalRdpPostureAccepted, "package exclusion requires classic service-host evidence");
+        Check(!FirewallSnapshot(d => SunshineRule(d)["ProgramHash"] = new string('a', 64)).LocalRdpPostureAccepted,
+            "allow for the TermService executable remains potentially permissive");
+        Check(!FirewallSnapshot(d => {
+            var rule = SunshineRule(d);
+            rule["ProgramState"] = "Any"; rule["ProgramHash"] = null; rule["Service"] = "termservice";
+        }).LocalRdpPostureAccepted, "TermService matching is case insensitive");
+        Check(FirewallSnapshot(d => {
+            var rule = SunshineRule(d);
+            rule["ProgramState"] = "Any"; rule["ProgramHash"] = null; rule["Service"] = "OtherService";
+        }).LocalRdpPostureAccepted, "other service binding excludes TermService");
+        Check(FirewallSnapshot(d => {
+            var rule = SunshineRule(d);
+            rule["ProgramState"] = "Any"; rule["ProgramHash"] = null; rule["Protocol"] = "2";
+        }).LocalRdpPostureAccepted, "non-TCP and non-UDP protocol excludes direct RDP");
+        Check(FirewallSnapshot(d => {
+            var rule = SunshineRule(d);
+            rule["ProgramState"] = "Any"; rule["ProgramHash"] = null;
+            rule["LocalPort"] = new object[] { "48010" };
+            ((Dictionary<string, object>)RdpPart(d)["Firewall"])["BroadInboundAllowCount"] = 0;
+        }).LocalRdpPostureAccepted, "different local port excludes configured RDP");
+        Check(!FirewallSnapshot(d => {
+            var rule = SunshineRule(d);
+            rule["ProgramState"] = "Any"; rule["ProgramHash"] = null;
+            rule["LocalPort"] = new object[] { "3380-3399" };
+            ((Dictionary<string, object>)RdpPart(d)["Firewall"])["BroadInboundAllowCount"] = 0;
+        }).LocalRdpPostureAccepted, "range including RDP port remains potentially permissive");
+        ProbeSnapshot reordered = FirewallSnapshot(d => {
+            Array.Reverse((object[])((Dictionary<string, object>)RdpPart(d)["FirewallProfiles"])["Items"]);
+            Array.Reverse((object[])((Dictionary<string, object>)RdpPart(d)["Firewall"])["Items"]);
+            Array.Reverse((object[])((Dictionary<string, object>)RdpPart(d)["Services"])["Items"]);
+            Array.Reverse((object[])((Dictionary<string, object>)((Dictionary<string, object>)d["Sessions"])["Enumerated"])["Items"]);
+        });
+        Check(ProbeCodec.Hash(ProbeCodec.PlanBytes(baseline)) == ProbeCodec.Hash(ProbeCodec.PlanBytes(reordered)),
+            "rule, profile, service, and session enumeration order does not change the plan hash");
+        ProbeSnapshot drifted = FirewallSnapshot(d => SunshineRule(d)["RemoteAddress"] = new object[] { "LocalSubnet" });
+        Check(baseline.FirewallFingerprint != drifted.FirewallFingerprint,
+            "meaningful firewall address change changes approved inventory hash");
+        ProbeSnapshot serviceDrift = FirewallSnapshot(d => {
+            var services = (Dictionary<string, object>)RdpPart(d)["Services"];
+            var term = (Dictionary<string, object>)((object[])services["Items"])[0];
+            term["StartMode"] = "Automatic";
+        });
+        Check(baseline.ListenerFingerprint != serviceDrift.ListenerFingerprint,
+            "meaningful service configuration drift changes approved inventory hash");
     }
     private static void PrivateStateSynthetic()
     {
@@ -433,7 +598,7 @@ internal static class FeasibilityProbeTests
         try
         {
             PlanningAndApproval(); FeatureFailureAndRecovery(); FreshLogonAndConnection(); TeardownAndRollback();
-            JournalAndOwnership(); ObservedHostBoundary(); WindowsAdapterSynthetic(); PrivateStateSynthetic();
+            JournalAndOwnership(); ObservedHostBoundary(); WindowsAdapterSynthetic(); FirewallGateSynthetic(); PrivateStateSynthetic();
             Console.WriteLine("Feasibility probe: " + assertions + " offline assertions passed."); return 0;
         }
         catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }

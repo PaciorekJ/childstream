@@ -1,7 +1,9 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -77,7 +79,7 @@ internal sealed class ScriptProbeInventory : IProbeInventory
         {
             var errorRead = process.StandardError.ReadToEndAsync();
             string output = process.StandardOutput.ReadToEnd();
-            if (!process.WaitForExit(90000)) { process.Kill(); throw new TimeoutException("Read-only inventory timed out."); }
+            if (!process.WaitForExit(180000)) { process.Kill(); throw new TimeoutException("Read-only inventory timed out."); }
             if (process.ExitCode != 0) throw new InvalidOperationException("Read-only inventory failed: " + errorRead.Result);
             if (output.Length > 1024 * 1024) throw new InvalidDataException("Inventory exceeds size limit.");
             return output;
@@ -106,14 +108,33 @@ internal sealed class WindowsFeasibilityHost : IFeasibilityHost
     private static bool Is(object value, string state) { return Str(At(value, "State")) == state; }
     private static object[] Items(object value)
     { return At(value, "Items") as object[] ?? new object[0]; }
+    private static string Canonical(object value)
+    {
+        if (value == null) return "null";
+        var map = value as Dictionary<string, object>;
+        if (map != null) return "{" + String.Join(",", map.Keys.OrderBy(x => x, StringComparer.Ordinal)
+            .Select(x => new JavaScriptSerializer().Serialize(x) + ":" + Canonical(map[x]))) + "}";
+        var list = value as IEnumerable;
+        if (list != null && !(value is string))
+        {
+            var entries = new List<string>();
+            foreach (object item in list) entries.Add(Canonical(item));
+            entries.Sort(StringComparer.Ordinal);
+            return "[" + String.Join(",", entries) + "]";
+        }
+        if (value is bool) return (bool)value ? "true" : "false";
+        if (value is string) return new JavaScriptSerializer().Serialize(value);
+        if (value is IConvertible) return Convert.ToString(value, CultureInfo.InvariantCulture);
+        throw new InvalidDataException("Unsupported inventory fingerprint value.");
+    }
     private static string Digest(object value)
-    { return ProbeCodec.Hash(Encoding.UTF8.GetBytes(new JavaScriptSerializer().Serialize(value))); }
+    { return ProbeCodec.Hash(Encoding.UTF8.GetBytes(Canonical(value))); }
 
     internal static ProbeSnapshot ParseInventory(string json)
     {
         var parser = new JavaScriptSerializer { MaxJsonLength = 1024 * 1024 };
         object root = parser.DeserializeObject(json);
-        if (Str(At(root, "Schema")) != "ChildStream.ReadOnlyFeasibilityInventory.v1" ||
+        if (Str(At(root, "Schema")) != "ChildStream.ReadOnlyFeasibilityInventory.v2" ||
             At(root, "HostMutation") == null || Convert.ToBoolean(At(root, "HostMutation")))
             throw new InvalidDataException("Unexpected inventory schema or mutation marker.");
         object windows = At(root, "Windows"), feature = At(root, "ChildFeature"), sessions = At(root, "Sessions");
@@ -133,17 +154,8 @@ internal sealed class WindowsFeasibilityHost : IFeasibilityHost
         bool servicesKnown = Is(services, "Accessible") && Items(services).Any(x => Str(At(x, "Name")) == "TermService") &&
             Items(services).Where(x => Str(At(x, "Name")) == "TermService")
                 .All(x => Str(At(x, "State")) == "Stopped");
-        bool firewallKnown = Is(firewall, "Accessible") && Is(profiles, "Accessible") &&
-            Items(profiles).Length >= 3 && Items(profiles).All(x => Str(At(x, "Enabled")) == "True") &&
-            Items(firewall).All(x =>
-            {
-                if (Str(At(x, "Enabled")) != "True" || Str(At(x, "Direction")) != "Inbound" ||
-                    Str(At(x, "Action")) != "Allow") return true;
-                if (At(x, "RdpRelevant") == null || Convert.ToBoolean(At(x, "RdpRelevant"))) return false;
-                return At(x, "BroadPort") != null && Convert.ToBoolean(At(x, "BroadPort")) &&
-                    (!String.IsNullOrEmpty(Str(At(x, "ProgramHash"))) ||
-                     !String.IsNullOrEmpty(Str(At(x, "Service"))) && Str(At(x, "Service")) != "Any");
-            });
+        FirewallRdpAssessment firewallAssessment = FirewallRdpAssessment.Assess(profiles, firewall, services, At(rdp, "TcpPort"));
+        bool firewallKnown = firewallAssessment.Accepted;
         // This means the local posture meets the reviewed narrow gate. It is not
         // a claim that every possible remote network route is closed.
         bool posture = Is(local, "Accessible") && Num(At(local, "Data")) == 1 &&
@@ -161,7 +173,7 @@ internal sealed class WindowsFeasibilityHost : IFeasibilityHost
             IndependentNoUnexpectedSessions = independent,
             SessionInventoryFingerprint = Digest(enumerated),
             RdpRegistryFingerprint = Digest(new object[] { local, policy, At(rdp, "TcpPort") }),
-            ListenerFingerprint = Digest(new object[] { tcp, udp, services }), FirewallFingerprint = Digest(new object[] { firewall, profiles }),
+            ListenerFingerprint = Digest(new object[] { tcp, udp, services }), FirewallFingerprint = Digest(firewallAssessment.Canonical),
             DisplayFingerprint = Digest(At(root, "Displays")),
             NativeResourceFingerprint = Digest(new object[] { At(At(root, "Sunshine"), "Services"), At(root, "Vdd") })
         };

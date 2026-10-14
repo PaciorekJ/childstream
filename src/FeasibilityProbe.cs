@@ -239,13 +239,15 @@ internal sealed class FeasibilityProbe
     {
         Require(s != null && s.FeatureAccess == ResourceAccess.Accessible && s.ParentSessionId != uint.MaxValue &&
             s.ParentSessionId == s.ConsoleSessionId && s.ParentProtocolType == 0 && s.ParentLogonTime > 0 &&
-            s.Edition == "Professional" && s.WindowsBuild >= 22000 && s.LocalRdpPostureAccepted &&
+            s.Edition == "Professional" && s.WindowsBuild >= 22000 &&
             ProbeCodec.PreFeatureChildGate(s) && !String.IsNullOrEmpty(s.AccountBinding) &&
             !String.IsNullOrEmpty(s.RdpRegistryFingerprint) && !String.IsNullOrEmpty(s.ListenerFingerprint) &&
             !String.IsNullOrEmpty(s.FirewallFingerprint) && !String.IsNullOrEmpty(s.DisplayFingerprint) &&
             !String.IsNullOrEmpty(s.NativeResourceFingerprint) &&
             !String.IsNullOrEmpty(s.SessionInventoryFingerprint),
             "The Windows 11 Pro console, child feature, session, or closed-RDP prerequisites are uncertain.");
+        Require(s.LocalRdpPostureAccepted,
+            "Observed local RDP posture is not acceptable: a listener, service, policy, firewall rule, or required reading blocks the plan.");
     }
 
     private static void ValidateUnchanged(ProbeJournal journal, ProbeSnapshot current)

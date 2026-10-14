@@ -4,7 +4,7 @@
 .DESCRIPTION
   Emits JSON only. It never calls child-session enable/connect/logoff APIs, writes a
   registry value, changes a firewall rule, or reads Sunshine pairing/config files.
-  This adapter has not been run on the target host in this PR.
+  Host observations are local and sensitive; save the JSON only in a private path.
 #>
 [CmdletBinding()]
 param()
@@ -146,6 +146,24 @@ function Sha256Text([string] $Value) {
     try { return [Convert]::ToHexString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Value))).ToLowerInvariant() }
     finally { $sha.Dispose() }
 }
+function ExecutablePath([string] $Command) {
+    if ([string]::IsNullOrWhiteSpace($Command) -or $Command -eq 'Any') { return $null }
+    $expanded = [Environment]::ExpandEnvironmentVariables($Command.Trim())
+    if ($expanded -match '^\s*"([^"]+\.exe)"(?:\s|$)') { $path = $Matches[1] }
+    elseif ($expanded -match '^\s*(.+?\.exe)(?:\s|$)') { $path = $Matches[1] }
+    else { return $null }
+    if (-not [IO.Path]::IsPathFullyQualified($path)) { return $null }
+    try { return [IO.Path]::GetFullPath($path).ToLowerInvariant() }
+    catch { return $null }
+}
+function ExecutableHash([string] $Command) {
+    $path = ExecutablePath $Command
+    if ($path) { return Sha256Text $path }
+    return $null
+}
+function HashValues($Values) {
+    return @($Values | ForEach-Object { Sha256Text ([string]$_) } | Sort-Object)
+}
 
 $base = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
 $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
@@ -163,7 +181,7 @@ $child = [ChildStreamReadOnlyWts]::AssociatedChild()
 $console = [ChildStreamReadOnlyWts]::WTSGetActiveConsoleSessionId()
 
 $report = [ordered]@{
-    Schema = 'ChildStream.ReadOnlyFeasibilityInventory.v1'
+    Schema = 'ChildStream.ReadOnlyFeasibilityInventory.v2'
     CapturedUtc = [DateTime]::UtcNow.ToString('o')
     HostMutation = $false
     Windows = Observed { $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop;
@@ -183,50 +201,94 @@ $report = [ordered]@{
         LocalDenyConnections = $rdpLocal
         PolicyDenyConnections = $rdpPolicy
         TcpPort = $rdpPort
-        Services = Observed { [ordered]@{ State = 'Accessible'; Items = @(Get-CimInstance Win32_Service -ErrorAction Stop |
-            Where-Object { $_.Name -in 'TermService','UmRdpService','SessionEnv' } |
-            Select-Object Name, State, StartMode) } }
+        Services = Observed {
+            $selected = @(Get-CimInstance Win32_Service -ErrorAction Stop |
+                Where-Object { $_.Name -in 'TermService','UmRdpService','SessionEnv' })
+            $term = $selected | Where-Object Name -eq 'TermService' | Select-Object -First 1
+            $termPath = if ($term) { ExecutablePath $term.PathName } else { $null }
+            $systemHost = [IO.Path]::GetFullPath((Join-Path $env:SystemRoot 'System32\svchost.exe')).ToLowerInvariant()
+            [ordered]@{ State = 'Accessible'; Items = @($selected | Select-Object Name, State, StartMode);
+                TermServiceImageHash = if ($termPath) { Sha256Text $termPath } else { $null };
+                TermServiceImageState = if ($termPath) { 'Accessible' } else { 'Unknown' };
+                TermServiceIsClassicHost = [bool]($termPath -and $termPath -eq $systemHost) }
+        }
         TcpListener = Observed { [ordered]@{ State = 'Accessible'; Items = @(Get-NetTCPConnection -State Listen -ErrorAction Stop |
             Where-Object { $_.LocalPort -in $ports } | Select-Object LocalAddress, LocalPort, State) } }
         UdpEndpoint = Observed { [ordered]@{ State = 'Accessible'; Items = @(Get-NetUDPEndpoint -ErrorAction Stop |
             Where-Object { $_.LocalPort -in $ports } | Select-Object LocalAddress, LocalPort) } }
         FirewallProfiles = Observed { [ordered]@{ State = 'Accessible'; Items = @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop |
-            Select-Object Name, Enabled, DefaultInboundAction) } }
+            ForEach-Object { [ordered]@{ Name = [string]$_.Name; Enabled = [string]$_.Enabled;
+                DefaultInboundAction = [string]$_.DefaultInboundAction } }) } }
         Firewall = Observed {
             $broadAllowCount = 0
-            $items = @(Get-NetFirewallRule -PolicyStore ActiveStore -ErrorAction Stop | ForEach-Object {
+            $selectedInboundAllowCount = 0
+            $unknownHeaderCount = 0
+            $items = @(Get-NetFirewallRule -PolicyStore ActiveStore -TracePolicyStore -ErrorAction Stop | ForEach-Object {
                 $rule = $_
+                $enabled = [string]$rule.Enabled; $direction = [string]$rule.Direction; $action = [string]$rule.Action
+                if ($enabled -notin @('True','False') -or $direction -notin @('Inbound','Outbound') -or
+                    $action -notin @('Allow','Block')) { $unknownHeaderCount++ }
+                $rdpName = $rule.Name -like 'RemoteDesktop-*' -or $rule.Name -like 'MCX-TERMSRV*' -or
+                    $rule.DisplayGroup -like '*Remote Desktop*'
+                if (-not ($enabled -eq 'True' -and $direction -eq 'Inbound' -and $action -eq 'Allow') -and
+                    -not $rdpName) { return }
+                if ($enabled -eq 'True' -and $direction -eq 'Inbound' -and $action -eq 'Allow') {
+                    $selectedInboundAllowCount++
+                }
                 $filter = $rule | Get-NetFirewallPortFilter -ErrorAction Stop
                 $application = $rule | Get-NetFirewallApplicationFilter -ErrorAction Stop
                 $service = $rule | Get-NetFirewallServiceFilter -ErrorAction Stop
+                $address = $rule | Get-NetFirewallAddressFilter -ErrorAction Stop
+                $interface = $rule | Get-NetFirewallInterfaceFilter -ErrorAction Stop
+                $interfaceType = $rule | Get-NetFirewallInterfaceTypeFilter -ErrorAction Stop
+                $security = $rule | Get-NetFirewallSecurityFilter -ErrorAction Stop
                 $broad = @($filter.LocalPort) -contains 'Any'
-                $portMatch = @($filter.LocalPort | Where-Object {
-                    $entry = [string]$_
-                    if ($entry -in @($ports | ForEach-Object { [string]$_ })) { return $true }
-                    if ($entry -match '^(\d+)-(\d+)$') {
-                        $low = [int]$Matches[1]; $high = [int]$Matches[2]
-                        return @($ports | Where-Object { $_ -ge $low -and $_ -le $high }).Count -gt 0
-                    }
-                    return $false
-                }).Count -gt 0
-                $rdpRule = $portMatch -or $rule.Name -like 'RemoteDesktop-*' -or
-                    $rule.DisplayGroup -like '*Remote Desktop*' -or $service.Service -eq 'TermService'
-                if ($rule.Enabled -eq 'True' -and $rule.Direction -eq 'Inbound' -and $rule.Action -eq 'Allow' -and $broad) {
+                if ($enabled -eq 'True' -and $direction -eq 'Inbound' -and $action -eq 'Allow' -and $broad) {
                     $broadAllowCount++
                 }
-                if ($rdpRule -or ($broad -and $rule.Enabled -eq 'True' -and
-                    $rule.Direction -eq 'Inbound' -and $rule.Action -eq 'Allow')) {
-                    $address = $rule | Get-NetFirewallAddressFilter -ErrorAction Stop
-                    [ordered]@{ Name = $rule.Name; Enabled = [string]$rule.Enabled; Direction = [string]$rule.Direction;
-                        Action = [string]$rule.Action; Profile = [string]$rule.Profile; Protocol = [string]$filter.Protocol;
-                        LocalPort = @($filter.LocalPort); RemoteAddress = @($address.RemoteAddress);
-                        ProgramHash = if ($application.Program -and $application.Program -ne 'Any') { Sha256Text $application.Program } else { $null };
-                        Service = [string]$service.Service;
-                        RdpRelevant = [bool]$rdpRule; BroadPort = [bool]$broad }
-                }
+                $package = [string]$application.Package
+                $securityPrincipals = @($security.LocalUser,$security.RemoteUser,$security.RemoteMachine) |
+                    Where-Object { $_ -and [string]$_ -ne 'Any' }
+                $owner = [string]$rule.Owner
+                [ordered]@{ Name = [string]$rule.Name; Enabled = $enabled; Direction = $direction;
+                    Action = $action; Profile = [string]$rule.Profile; Protocol = [string]$filter.Protocol;
+                    LocalPort = @($filter.LocalPort | ForEach-Object { [string]$_ });
+                    RemotePort = @($filter.RemotePort | ForEach-Object { [string]$_ });
+                    LocalAddress = @($address.LocalAddress | ForEach-Object { [string]$_ });
+                    RemoteAddress = @($address.RemoteAddress | ForEach-Object { [string]$_ });
+                    ProgramState = if ([string]$application.Program -eq 'Any') { 'Any' }
+                        elseif (ExecutableHash ([string]$application.Program)) { 'Accessible' } else { 'Unknown' };
+                    ProgramHash = ExecutableHash ([string]$application.Program);
+                    PackageState = if ([string]::IsNullOrEmpty($package) -or $package -eq 'Any') { 'Any' }
+                        elseif ($package -match '^S-1-15-2(-\d+)+$') { 'AppPackage' } else { 'Unknown' };
+                    PackageHash = if ($package -and $package -ne 'Any') { Sha256Text $package } else { $null };
+                    Service = [string]$service.Service;
+                    InterfaceAliasHashes = HashValues @($interface.InterfaceAlias);
+                    InterfaceType = [string]$interfaceType.InterfaceType;
+                    Authentication = [string]$security.Authentication;
+                    Encryption = [string]$security.Encryption;
+                    OverrideBlockRules = [string]$security.OverrideBlockRules;
+                    SecurityScope = if ($securityPrincipals.Count -gt 0) { 'Restricted' } else { 'Any' };
+                    SecurityPrincipalHash = if ($securityPrincipals.Count -gt 0) {
+                        Sha256Text (($securityPrincipals | ForEach-Object { [string]$_ }) -join '|') } else { $null };
+                    OwnerKind = if ($owner -match '^S-1-15-2(-\d+)+$') { 'AppPackage' }
+                        elseif ([string]::IsNullOrEmpty($owner)) { 'Absent' } else { 'Other' };
+                    OwnerHash = Sha256Text $owner;
+                    PolicyAppIdHash = Sha256Text ([string]$rule.PolicyAppId);
+                    RemoteDynamicAddressCount = @($rule.RemoteDynamicKeywordAddresses).Count;
+                    EdgeTraversalPolicy = [string]$rule.EdgeTraversalPolicy;
+                    LocalOnlyMapping = [bool]$rule.LocalOnlyMapping;
+                    LooseSourceMapping = [bool]$rule.LooseSourceMapping;
+                    PolicyStoreSourceType = [string]$rule.PolicyStoreSourceType;
+                    PolicyStoreSourceHash = Sha256Text ([string]$rule.PolicyStoreSource);
+                    PrimaryStatus = [string]$rule.PrimaryStatus; StatusCode = $rule.StatusCode;
+                    EnforcementStatus = @($rule.EnforcementStatus | ForEach-Object { [string]$_ });
+                    RdpNamed = [bool]$rdpName }
             })
             [ordered]@{ State = 'Accessible'; Items = $items; BroadInboundAllowCount = $broadAllowCount;
-                Coverage = 'Known RDP ports and ranges, RDP rule names and display group, service-specific and enabled broad-port allows; not a complete reachability proof' }
+                SelectedInboundAllowCount = $selectedInboundAllowCount;
+                UnknownHeaderCount = $unknownHeaderCount;
+                Coverage = 'All enabled inbound allow rules plus named RDP rules from ActiveStore; all associated filters read; not a complete reachability proof' }
         }
         NetworkClosedAssessment = 'Unverified; local inventory cannot prove remote reachability or all listener and firewall paths'
     }
