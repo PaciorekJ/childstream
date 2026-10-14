@@ -2,6 +2,8 @@
 
 This branch provides an operator-controlled experiment harness, not approval to run it. No Stage A or B command has been executed on the physical host. Synthetic tests establish code behavior, not Windows build 26200 behavior.
 
+The separate [network-isolated Stage A runbook](network-isolated-stage-a.md) describes an offline-only posture that can tolerate the existing 20 potentially RDP-permissive and six unknown rules **only while independent network isolation is verified**. The connected-network gate below remains unchanged. An isolated plan cannot authorize Stage B. No physical network isolation or feature change has been executed by this work.
+
 Microsoft documents child sessions as local loopback sessions connected through `ConnectToChildSession`, with an automatic-logon exception when the parent signed in before the feature was enabled. General network Remote Desktop enablement is not a documented prerequisite. If it proves necessary here, **stop**. This harness has no RDP registry, firewall, service, display, Sunshine, VDD, audio, or Steam writer. [Child Sessions](https://learn.microsoft.com/en-us/windows/win32/termserv/child-sessions), [WTSEnableChildSessions](https://learn.microsoft.com/en-us/windows/win32/api/wtsapi32/nf-wtsapi32-wtsenablechildsessions).
 
 ## Measured host evidence and corrections

@@ -164,6 +164,18 @@ function ExecutableHash([string] $Command) {
 function HashValues($Values) {
     return @($Values | ForEach-Object { Sha256Text ([string]$_) } | Sort-Object)
 }
+function AdapterCategory([string] $Name, [string] $Description) {
+    $label = "$Name $Description"
+    if ($label -match '(?i)loopback pseudo-interface') { return 'Loopback' }
+    if ($label -match '(?i)bluetooth|\bPAN\b') { return 'BluetoothPAN' }
+    if ($label -match '(?i)cellular|WWAN|mobile|\bLTE\b|\b5G\b|modem') { return 'Mobile' }
+    if ($label -match '(?i)\bUSB\b|RNDIS|tether|\bNCM\b') { return 'USB' }
+    if ($label -match '(?i)VPN|\bTAP\b|\bTUN\b|Wintun|WireGuard|OpenVPN|IPSec|WAN Miniport') { return 'VPN' }
+    if ($label -match '(?i)vEthernet|virtual|Hyper-V|VMware|VirtualBox|bridge|container|\bWSL\b') { return 'VirtualOrBridge' }
+    if ($label -match '(?i)Wi-Fi|wireless|802\.11|\bWLAN\b') { return 'WiFi' }
+    if ($label -match '(?i)ethernet|802\.3|\bLAN\b') { return 'Ethernet' }
+    return 'Other'
+}
 
 $base = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
 $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
@@ -181,7 +193,7 @@ $child = [ChildStreamReadOnlyWts]::AssociatedChild()
 $console = [ChildStreamReadOnlyWts]::WTSGetActiveConsoleSessionId()
 
 $report = [ordered]@{
-    Schema = 'ChildStream.ReadOnlyFeasibilityInventory.v2'
+    Schema = 'ChildStream.ReadOnlyFeasibilityInventory.v3'
     CapturedUtc = [DateTime]::UtcNow.ToString('o')
     HostMutation = $false
     Windows = Observed { $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop;
@@ -291,6 +303,32 @@ $report = [ordered]@{
                 Coverage = 'All enabled inbound allow rules plus named RDP rules from ActiveStore; all associated filters read; not a complete reachability proof' }
         }
         NetworkClosedAssessment = 'Unverified; local inventory cannot prove remote reachability or all listener and firewall paths'
+    }
+    Network = [ordered]@{
+        Adapters = Observed { [ordered]@{ State = 'Accessible'; Items = @(Get-NetAdapter -Name '*' -IncludeHidden -ErrorAction Stop |
+            ForEach-Object { [ordered]@{ InterfaceIndex = [int]$_.ifIndex;
+                NameHash = Sha256Text ([string]$_.Name);
+                DescriptionHash = Sha256Text ([string]$_.InterfaceDescription);
+                InterfaceGuidHash = Sha256Text ([string]$_.InterfaceGuid);
+                Category = AdapterCategory ([string]$_.Name) ([string]$_.InterfaceDescription);
+                Status = [string]$_.Status; MediaConnectionState = [string]$_.MediaConnectionState } }) } }
+        IpInterfaces = Observed { [ordered]@{ State = 'Accessible'; Items = @(Get-NetIPInterface -PolicyStore ActiveStore -IncludeAllCompartments -ErrorAction Stop |
+            ForEach-Object { [ordered]@{ InterfaceIndex = [int]$_.InterfaceIndex;
+                CompartmentId = [int]$_.CompartmentId; AddressFamily = [string]$_.AddressFamily;
+                AliasHash = Sha256Text ([string]$_.InterfaceAlias);
+                LoopbackAlias = [bool]($_.InterfaceIndex -eq 1 -and $_.InterfaceAlias -eq 'Loopback Pseudo-Interface 1');
+                ConnectionState = [string]$_.ConnectionState } }) } }
+        IpAddresses = Observed { [ordered]@{ State = 'Accessible'; Items = @(Get-NetIPAddress -PolicyStore ActiveStore -IncludeAllCompartments -ErrorAction Stop |
+            ForEach-Object { [ordered]@{ InterfaceIndex = [int]$_.InterfaceIndex;
+                CompartmentId = [int]$_.CompartmentId; AddressFamily = [string]$_.AddressFamily;
+                Address = [string]$_.IPAddress; PrefixLength = [int]$_.PrefixLength;
+                AddressState = [string]$_.AddressState } }) } }
+        Routes = Observed { [ordered]@{ State = 'Accessible'; Items = @(Get-NetRoute -PolicyStore ActiveStore -IncludeAllCompartments -ErrorAction Stop |
+            ForEach-Object { [ordered]@{ InterfaceIndex = [int]$_.InterfaceIndex;
+                CompartmentId = [int]$_.CompartmentId; AddressFamily = [string]$_.AddressFamily;
+                DestinationPrefix = [string]$_.DestinationPrefix;
+                NextHop = [string]$_.NextHop; State = [string]$_.State } }) } }
+        Scope = 'Visible and hidden adapters plus active IPv4/IPv6 interfaces, addresses, and routes in all compartments; no connectivity inference from default routes alone'
     }
     Displays = Observed {
         Add-Type -AssemblyName System.Windows.Forms

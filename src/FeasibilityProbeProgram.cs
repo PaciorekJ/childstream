@@ -65,9 +65,14 @@ internal static class ProbePrivateState
 
 internal static class FeasibilityProbeProgram
 {
+    private const string IsolationConfirmation = "I-CONFIRM-PHYSICAL-ISOLATION";
+    private static bool Confirmed(string[] args, int index)
+    { return args.Length == index + 1 && args[index] == IsolationConfirmation; }
     private static void Usage()
     {
-        Console.WriteLine("Commands: plan | begin HASH | prepare-a | status | verify-a | approve-b HASH | connect-once | confirm-console | end-child ID:LOGON | restore | restore-reviewed | repair-journal");
+        Console.WriteLine("Connected posture: plan | begin HASH | prepare-a | verify-a | restore | restore-reviewed");
+        Console.WriteLine("Isolated Stage A: plan-isolated CONFIRM | begin-isolated HASH CONFIRM | prepare-isolated CONFIRM | verify-isolated CONFIRM | restore-isolated CONFIRM | restore-isolated-reviewed CONFIRM | reconnect-check CONFIRM");
+        Console.WriteLine("CONFIRM is the literal " + IsolationConfirmation + ". Other commands: status | approve-b HASH | connect-once | confirm-console | end-child ID:LOGON | repair-journal");
         Console.WriteLine("All commands must run at the physical console. No automatic elevation or sign-out is performed.");
     }
     private static void Print(ProbeJournal journal)
@@ -77,6 +82,10 @@ internal static class FeasibilityProbeProgram
             " Parent=" + journal.ActiveParentId + ":" + journal.ActiveParentLogonTime +
             " Child=" + (journal.PositiveChild.HasValue
                 ? journal.PositiveChild.Value.SessionId + ":" + journal.PositiveChild.Value.LogonTime : "none") +
+            " Posture=" + journal.Plan.Original.NetworkPosture +
+            " NetworkDeviation=" + journal.NetworkDeviationObserved +
+            " NetworkRecoveryReviewed=" + journal.NetworkRecoveryReviewed +
+            " DeviationReason=" + journal.NetworkDeviationReason +
             " Auth=" + journal.AuthenticationOutcome + " Error=" + journal.ErrorCode);
     }
     [STAThread]
@@ -92,6 +101,7 @@ internal static class FeasibilityProbeProgram
             var host = new WindowsFeasibilityHost(new ScriptProbeInventory(script), new ProbeNative());
             if (command == "plan")
             {
+                if (args.Length != 1) throw new ArgumentException("Use plan without extra arguments.");
                 var readOnly = new FeasibilityProbe(host, null, null).Plan();
                 Console.WriteLine("Plan=" + readOnly.Hash + " OriginalFeature=" + readOnly.Original.FeatureEnabled +
                     " Parent=" + readOnly.Original.ParentSessionId + ":" + readOnly.Original.ParentLogonTime +
@@ -100,7 +110,18 @@ internal static class FeasibilityProbeProgram
                     " LocalRdpPostureAccepted=" + readOnly.Original.LocalRdpPostureAccepted);
                 return 0;
             }
-            ProbePrivateState.Verify(command == "begin");
+            if (command == "plan-isolated")
+            {
+                if (!Confirmed(args, 1)) throw new ArgumentException("Explicit physical isolation confirmation is required.");
+                var readOnly = new FeasibilityProbe(host, null, null).Plan(
+                    ProbeNetworkPosture.NetworkIsolated, true);
+                Console.WriteLine("Plan=" + readOnly.Hash + " Posture=NetworkIsolated" +
+                    " NetworkIsolationAccepted=" + readOnly.Original.NetworkIsolationAccepted +
+                    " RdpPolicyDenied=" + readOnly.Original.RdpPolicyDenied +
+                    " Parent=" + readOnly.Original.ParentSessionId + ":" + readOnly.Original.ParentLogonTime);
+                return 0;
+            }
+            ProbePrivateState.Verify(command == "begin" || command == "begin-isolated");
             string dir = ProbePrivateState.DirectoryPath;
             var store = new FileProbeStore(Path.Combine(dir, "probe.journal"));
             var probe = new FeasibilityProbe(host, store,
@@ -111,8 +132,19 @@ internal static class FeasibilityProbeProgram
                 case "begin":
                     if (args.Length != 2) throw new ArgumentException("Use begin with the reviewed exact plan hash.");
                     var plan = probe.Plan(); result = probe.Begin(plan, args[1], true); break;
+                case "begin-isolated":
+                    if (args.Length != 3 || !Confirmed(args, 2))
+                        throw new ArgumentException("Use begin-isolated with the reviewed hash and physical isolation confirmation.");
+                    var isolatedPlan = probe.Plan(ProbeNetworkPosture.NetworkIsolated, true);
+                    result = probe.Begin(isolatedPlan, args[1], true); break;
                 case "prepare-a": result = probe.PrepareFeature(); break;
+                case "prepare-isolated":
+                    if (!Confirmed(args, 1)) throw new ArgumentException("Physical isolation confirmation is required.");
+                    result = probe.PrepareFeature(true); break;
                 case "verify-a": result = probe.ResumeAfterFreshLogon(); break;
+                case "verify-isolated":
+                    if (!Confirmed(args, 1)) throw new ArgumentException("Physical isolation confirmation is required.");
+                    result = probe.ResumeAfterFreshLogon(true); break;
                 case "approve-b":
                     if (args.Length != 2) throw new ArgumentException("Use approve-b with the reviewed exact plan hash.");
                     result = probe.ApproveStageB(args[1], true); break;
@@ -127,6 +159,33 @@ internal static class FeasibilityProbeProgram
                     result = probe.EndPositiveChild(true); break;
                 case "restore": result = probe.RestoreOriginal(); break;
                 case "restore-reviewed": result = probe.RestoreOriginal(true); break;
+                case "restore-isolated":
+                    if (!Confirmed(args, 1)) throw new ArgumentException("Physical isolation confirmation is required.");
+                    var isolatedRestore = store.Load();
+                    if (isolatedRestore == null ||
+                        isolatedRestore.Plan.Original.NetworkPosture != ProbeNetworkPosture.NetworkIsolated)
+                        throw new InvalidOperationException("This command requires an isolated probe journal.");
+                    result = probe.RestoreOriginal(false, false, true); break;
+                case "restore-isolated-reviewed":
+                    if (!Confirmed(args, 1)) throw new ArgumentException("Physical isolation confirmation is required.");
+                    var reviewedRestore = store.Load();
+                    if (reviewedRestore == null ||
+                        reviewedRestore.Plan.Original.NetworkPosture != ProbeNetworkPosture.NetworkIsolated)
+                        throw new InvalidOperationException("This command requires an isolated probe journal.");
+                    result = probe.RestoreOriginal(true, true, true); break;
+                case "reconnect-check":
+                    if (!Confirmed(args, 1)) throw new ArgumentException("Physical isolation confirmation is required.");
+                    var assessment = probe.AssessReconnect(true);
+                    Console.WriteLine("ReconnectReady=" + assessment.Ready +
+                        " FeatureRestored=" + assessment.FeatureRestored +
+                        " ChildExcluded=" + assessment.ChildExcluded +
+                        " NetworkIsolated=" + assessment.NetworkIsolated +
+                        " RdpPolicyDenied=" + assessment.RdpPolicyDenied +
+                        " TermServiceStopped=" + assessment.TermServiceStopped +
+                        " RdpListenersAbsent=" + assessment.RdpListenersAbsent +
+                        " InfrastructureRestored=" + assessment.InfrastructureRestored +
+                        " JournalRestored=" + assessment.JournalRestored);
+                    return assessment.Ready ? 0 : 1;
                 case "repair-journal": result = probe.ResolveInterruptedJournal(); break;
                 case "status": result = store.Load(); break;
                 default: Usage(); return 2;

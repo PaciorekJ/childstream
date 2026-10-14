@@ -10,7 +10,7 @@ internal static class FeasibilityProbeTests
     {
         internal ProbeSnapshot State = Base();
         internal bool Admin = true, FailBeforeFeature, FailAfterFeature, FailRestore, FailConnectAfterChild,
-            FailLogoffAfterChild, CredentialPrompt;
+            FailLogoffAfterChild, CredentialPrompt, LoseNetworkAfterFeature, StartRdpAfterFeature;
         internal int FeatureWrites, Connections, Logoffs;
         internal ChildSessionIdentity TestChild = new ChildSessionIdentity(31, 200);
         public bool HasAdministratorPrivilege { get { return Admin; } }
@@ -20,6 +20,13 @@ internal static class FeasibilityProbeTests
             if (State.FeatureEnabled != expected) return false;
             if (FailBeforeFeature || (FailRestore && !desired)) throw new IOException("Before feature write");
             FeatureWrites++; State.FeatureEnabled = desired;
+            if (desired && LoseNetworkAfterFeature) State.NetworkIsolationAccepted = false;
+            if (desired && StartRdpAfterFeature)
+            {
+                State.TermServiceStopped = false;
+                State.RdpListenersAbsent = false;
+                State.ListenerFingerprint = "listener-started";
+            }
             if (FailAfterFeature) throw new IOException("After feature write");
             return true;
         }
@@ -47,12 +54,16 @@ internal static class FeasibilityProbeTests
             IndependentNoUnexpectedSessions = true, SessionInventoryFingerprint = "session-inventory-1",
             ParentSessionId = 2, ConsoleSessionId = 2, ParentProtocolType = 0, ParentLogonTime = 100,
             AccountBinding = "sid-hash", Edition = "Professional", WindowsBuild = 26100, LocalRdpPostureAccepted = true,
+            RdpPolicyDenied = true, TermServiceStopped = true, RdpListenersAbsent = true,
+            FirewallObservationComplete = true,
             RdpRegistryFingerprint = "registry-1", ListenerFingerprint = "listener-1", FirewallFingerprint = "firewall-1",
             DisplayFingerprint = "display-1", NativeResourceFingerprint = "native-1" };
     }
     private static ProbeSnapshot Clone(ProbeSnapshot x)
     {
-        return new ProbeSnapshot { FeatureAccess = x.FeatureAccess, FeatureEnabled = x.FeatureEnabled,
+        return new ProbeSnapshot { FormatVersion = x.FormatVersion, NetworkPosture = x.NetworkPosture,
+            OperatorConfirmedIsolation = x.OperatorConfirmedIsolation,
+            FeatureAccess = x.FeatureAccess, FeatureEnabled = x.FeatureEnabled,
             ChildAccess = x.ChildAccess, ChildApiErrorCode = x.ChildApiErrorCode,
             IndependentNoUnexpectedSessions = x.IndependentNoUnexpectedSessions,
             SessionInventoryFingerprint = x.SessionInventoryFingerprint,
@@ -60,6 +71,10 @@ internal static class FeasibilityProbeTests
             ParentProtocolType = x.ParentProtocolType,
             ParentLogonTime = x.ParentLogonTime, AccountBinding = x.AccountBinding, Edition = x.Edition,
             WindowsBuild = x.WindowsBuild, LocalRdpPostureAccepted = x.LocalRdpPostureAccepted,
+            RdpPolicyDenied = x.RdpPolicyDenied, TermServiceStopped = x.TermServiceStopped,
+            RdpListenersAbsent = x.RdpListenersAbsent,
+            FirewallObservationComplete = x.FirewallObservationComplete,
+            NetworkIsolationAccepted = x.NetworkIsolationAccepted, NetworkFingerprint = x.NetworkFingerprint,
             RdpRegistryFingerprint = x.RdpRegistryFingerprint, ListenerFingerprint = x.ListenerFingerprint,
             FirewallFingerprint = x.FirewallFingerprint, DisplayFingerprint = x.DisplayFingerprint,
             NativeResourceFingerprint = x.NativeResourceFingerprint, AssociatedChild = x.AssociatedChild };
@@ -80,6 +95,18 @@ internal static class FeasibilityProbeTests
         internal ProbeJournal Begin()
         {
             ProbePlan plan = Probe.Plan(); return Probe.Begin(plan, plan.Hash, true);
+        }
+        internal void SetIsolated()
+        {
+            Host.State.LocalRdpPostureAccepted = false;
+            Host.State.NetworkIsolationAccepted = true;
+            Host.State.NetworkFingerprint = "network-1";
+        }
+        internal ProbeJournal BeginIsolated()
+        {
+            SetIsolated();
+            ProbePlan plan = Probe.Plan(ProbeNetworkPosture.NetworkIsolated, true);
+            return Probe.Begin(plan, plan.Hash, true);
         }
         internal ProbeJournal Ready()
         {
@@ -577,6 +604,247 @@ internal static class FeasibilityProbeTests
         Check(baseline.ListenerFingerprint != serviceDrift.ListenerFingerprint,
             "meaningful service configuration drift changes approved inventory hash");
     }
+    private static Dictionary<string, object> NetworkFixture()
+    {
+        var serializer = new JavaScriptSerializer();
+        return (Dictionary<string, object>)serializer.DeserializeObject(serializer.Serialize(new {
+            Adapters = new { State = "Accessible", Items = new object[] {
+                new { InterfaceIndex = 5, Category = "Ethernet", Status = "Disconnected", MediaConnectionState = "Unknown" },
+                new { InterfaceIndex = 6, Category = "WiFi", Status = "Disabled", MediaConnectionState = "Unknown" },
+                new { InterfaceIndex = 7, Category = "VPN", Status = "Disabled", MediaConnectionState = "Unknown" },
+                new { InterfaceIndex = 8, Category = "BluetoothPAN", Status = "Disabled", MediaConnectionState = "Unknown" },
+                new { InterfaceIndex = 9, Category = "Mobile", Status = "Disabled", MediaConnectionState = "Unknown" },
+                new { InterfaceIndex = 10, Category = "USB", Status = "Disabled", MediaConnectionState = "Unknown" },
+                new { InterfaceIndex = 11, Category = "VirtualOrBridge", Status = "Disabled", MediaConnectionState = "Unknown" } } },
+            IpInterfaces = new { State = "Accessible", Items = new object[] {
+                new { InterfaceIndex = 1, CompartmentId = 1, AddressFamily = "IPv4", LoopbackAlias = true, ConnectionState = "Connected" },
+                new { InterfaceIndex = 1, CompartmentId = 1, AddressFamily = "IPv6", LoopbackAlias = true, ConnectionState = "Connected" },
+                new { InterfaceIndex = 5, CompartmentId = 1, AddressFamily = "IPv4", LoopbackAlias = false, ConnectionState = "Disconnected" },
+                new { InterfaceIndex = 6, CompartmentId = 1, AddressFamily = "IPv4", LoopbackAlias = false, ConnectionState = "Disconnected" } } },
+            IpAddresses = new { State = "Accessible", Items = new object[] {
+                new { InterfaceIndex = 1, CompartmentId = 0, AddressFamily = "IPv4", Address = "127.0.0.1", PrefixLength = 8 },
+                new { InterfaceIndex = 1, CompartmentId = 0, AddressFamily = "IPv6", Address = "::1", PrefixLength = 128 } } },
+            Routes = new { State = "Accessible", Items = new object[] {
+                new { InterfaceIndex = 1, CompartmentId = 1, AddressFamily = "IPv4", DestinationPrefix = "127.0.0.0/8", NextHop = "0.0.0.0" },
+                new { InterfaceIndex = 1, CompartmentId = 1, AddressFamily = "IPv6", DestinationPrefix = "::1/128", NextHop = "::" } } }
+        }));
+    }
+    private static Dictionary<string, object> NetworkPart(Dictionary<string, object> document)
+    { return (Dictionary<string, object>)document["Network"]; }
+    private static ProbeSnapshot IsolatedInventorySnapshot(Action<Dictionary<string, object>> change)
+    {
+        var serializer = new JavaScriptSerializer();
+        var document = (Dictionary<string, object>)serializer.DeserializeObject(SyntheticJson());
+        document["Schema"] = "ChildStream.ReadOnlyFeasibilityInventory.v3";
+        document["Network"] = NetworkFixture();
+        SunshineRule(document)["ProgramState"] = "Any";
+        SunshineRule(document)["ProgramHash"] = null;
+        if (change != null) change(document);
+        return WindowsFeasibilityHost.ParseInventory(serializer.Serialize(document));
+    }
+    private static void NetworkGateSynthetic()
+    {
+        ProbeSnapshot baseline = IsolatedInventorySnapshot(null);
+        Check(baseline.NetworkIsolationAccepted && !baseline.LocalRdpPostureAccepted,
+            "verified isolation is independent from the connected-network firewall blocker");
+        for (int i = 0; i < 7; i++)
+        {
+            int index = i;
+            Check(!IsolatedInventorySnapshot(d => {
+                var adapters = (Dictionary<string, object>)NetworkPart(d)["Adapters"];
+                var adapter = (Dictionary<string, object>)((object[])adapters["Items"])[index];
+                adapter["Status"] = "Up"; adapter["MediaConnectionState"] = "Connected";
+            }).NetworkIsolationAccepted, "active Ethernet/Wi-Fi/VPN/PAN/mobile/USB/virtual adapter blocks: " + i);
+        }
+        Check(!IsolatedInventorySnapshot(d => {
+            var routes = (Dictionary<string, object>)NetworkPart(d)["Routes"];
+            routes["Items"] = new object[] { new { InterfaceIndex = 5, CompartmentId = 1, AddressFamily = "IPv4",
+                DestinationPrefix = "192.0.2.0/24", NextHop = "0.0.0.0" } };
+        }).NetworkIsolationAccepted, "active local-subnet route blocks even without a default route");
+        Check(!IsolatedInventorySnapshot(d => {
+            var addresses = (Dictionary<string, object>)NetworkPart(d)["IpAddresses"];
+            addresses["Items"] = new object[] { new { InterfaceIndex = 6, CompartmentId = 0, AddressFamily = "IPv6",
+                Address = "fe80::1", PrefixLength = 64 } };
+        }).NetworkIsolationAccepted, "non-loopback link-local address blocks without a route");
+        Check(!IsolatedInventorySnapshot(d => {
+            var interfaces = (Dictionary<string, object>)NetworkPart(d)["IpInterfaces"];
+            ((Dictionary<string, object>)((object[])interfaces["Items"])[2])["ConnectionState"] = "Connected";
+        }).NetworkIsolationAccepted, "connected IP interface blocks even without an address or route");
+        Check(!IsolatedInventorySnapshot(d => {
+            ((Dictionary<string, object>)NetworkPart(d)["Routes"])["State"] = "Unknown";
+        }).NetworkIsolationAccepted, "inaccessible route enumeration fails closed");
+        Check(!IsolatedInventorySnapshot(d => {
+            var adapters = (Dictionary<string, object>)NetworkPart(d)["Adapters"];
+            ((Dictionary<string, object>)((object[])adapters["Items"])[0])["Status"] = "Mystery";
+        }).NetworkIsolationAccepted, "unrecognized adapter status fails closed");
+        Check(!IsolatedInventorySnapshot(d => {
+            var adapters = (Dictionary<string, object>)NetworkPart(d)["Adapters"];
+            ((Dictionary<string, object>)((object[])adapters["Items"])[0])["MediaConnectionState"] = "Connected";
+        }).NetworkIsolationAccepted, "contradictory connected media blocks a disconnected adapter");
+        ProbeSnapshot reordered = IsolatedInventorySnapshot(d => {
+            foreach (string part in new[] { "Adapters", "IpInterfaces", "IpAddresses", "Routes" })
+                Array.Reverse((object[])((Dictionary<string, object>)NetworkPart(d)[part])["Items"]);
+        });
+        Check(baseline.NetworkFingerprint == reordered.NetworkFingerprint,
+            "network inventory ordering does not change the approved fingerprint");
+        ProbeSnapshot drifted = IsolatedInventorySnapshot(d => {
+            var adapters = (Dictionary<string, object>)NetworkPart(d)["Adapters"];
+            ((Dictionary<string, object>)((object[])adapters["Items"])[1])["Status"] = "Disconnected";
+            ((Dictionary<string, object>)((object[])adapters["Items"])[1])["MediaConnectionState"] = "Disconnected";
+        });
+        Check(drifted.NetworkIsolationAccepted && baseline.NetworkFingerprint != drifted.NetworkFingerprint,
+            "safe-looking adapter-state drift still changes the approved fingerprint");
+    }
+    private static void IsolatedLifecycle()
+    {
+        using (var f = new Fixture())
+        {
+            f.SetIsolated();
+            Throws<InvalidOperationException>(() => f.Probe.Plan(), "connected posture remains blocked by broad firewall allowances");
+            Throws<InvalidOperationException>(() => f.Probe.Plan(ProbeNetworkPosture.NetworkIsolated, false),
+                "operator isolation confirmation is mandatory");
+            ProbePlan plan = f.Probe.Plan(ProbeNetworkPosture.NetworkIsolated, true);
+            Check(plan.Original.FormatVersion == 4 && plan.Original.NetworkPosture == ProbeNetworkPosture.NetworkIsolated,
+                "isolated posture and confirmation are bound into v4 plan");
+            f.Host.State.NetworkFingerprint = "network-2";
+            Throws<InvalidOperationException>(() => f.Probe.Begin(plan, plan.Hash, true),
+                "network-state drift invalidates exact approved plan");
+        }
+        using (var f = new Fixture())
+        {
+            f.BeginIsolated();
+            Throws<InvalidOperationException>(() => f.Probe.PrepareFeature(),
+                "connected prepare command cannot enable an isolated plan");
+            f.Host.State.NetworkFingerprint = "network-2";
+            Throws<InvalidOperationException>(() => f.Probe.PrepareFeature(true),
+                "network drift stops feature enablement");
+            Check(f.Host.FeatureWrites == 0 && f.Store.Load().NetworkDeviationObserved,
+                "prewrite network deviation is durably recorded without a feature write");
+            f.Host.State.NetworkFingerprint = "network-1";
+            Throws<InvalidOperationException>(() => f.Probe.PrepareFeature(true),
+                "recorded deviation prohibits resumed feature enablement");
+            Throws<InvalidOperationException>(() => f.Probe.RestoreOriginal(false, false, true),
+                "ordinary restoration cannot ignore recorded deviation");
+            Check(f.Probe.RestoreOriginal(false, true, true).Stage == ProbeStage.Restored,
+                "reviewed recovery closes prewrite deviation after isolation is restored");
+        }
+        using (var f = new Fixture())
+        {
+            f.BeginIsolated(); f.Host.State.FirewallFingerprint = "firewall-changed";
+            Throws<InvalidOperationException>(() => f.Probe.PrepareFeature(true),
+                "isolated posture does not permit changing existing firewall rules");
+            Check(f.Host.FeatureWrites == 0, "firewall drift blocks before feature enablement");
+        }
+        using (var f = new Fixture())
+        {
+            f.BeginIsolated(); f.Host.LoseNetworkAfterFeature = true;
+            Throws<InvalidOperationException>(() => f.Probe.PrepareFeature(true),
+                "network loss after non-atomic enablement stops progression");
+            Check(f.Host.FeatureWrites == 1 && f.Store.Load().Stage == ProbeStage.PreparedEnable &&
+                f.Store.Load().NetworkDeviationObserved, "enable intent and network deviation remain durable");
+            Throws<InvalidOperationException>(() => f.Probe.RestoreOriginal(true, true, true),
+                "restoration is blocked while network isolation is lost");
+            Check(f.Host.FeatureWrites == 1, "lost network causes no further feature write");
+            f.Host.State.NetworkIsolationAccepted = true;
+            Throws<InvalidOperationException>(() => f.Probe.RestoreOriginal(true, false, true),
+                "restored isolation still requires reviewed recovery");
+            Check(f.Probe.RestoreOriginal(true, true, true).Stage == ProbeStage.Restored &&
+                !f.Host.State.FeatureEnabled && f.Store.Load().NetworkRecoveryReviewed,
+                "reviewed same-account recovery verifies original feature state");
+            Check(f.Probe.AssessReconnect(true).Ready,
+                "reconnect check requires restored feature, isolation, and original infrastructure");
+            Throws<InvalidOperationException>(() => f.Probe.ApproveStageB(f.Store.Load().Plan.Hash, true),
+                "isolated Stage A journal can never authorize Stage B");
+        }
+        using (var f = new Fixture())
+        {
+            f.BeginIsolated(); f.Host.StartRdpAfterFeature = true;
+            Throws<InvalidOperationException>(() => f.Probe.PrepareFeature(true),
+                "unexpected TermService or RDP listener stops Stage A after the feature write");
+            Check(f.Store.Load().Stage == ProbeStage.PreparedEnable && f.Host.FeatureWrites == 1,
+                "unexpected listener leaves a durable ambiguous enable intent");
+            Throws<InvalidOperationException>(() => f.Probe.RestoreOriginal(true, false, true),
+                "feature restoration cannot clear unrelated service or listener drift");
+            Check(!f.Host.State.FeatureEnabled && f.Store.Load().Stage == ProbeStage.Conflict &&
+                !f.Probe.AssessReconnect(true).Ready,
+                "restored feature with active listener forbids network reconnection");
+        }
+        using (var f = new Fixture())
+        {
+            f.BeginIsolated(); f.Host.FailBeforeFeature = true;
+            Throws<IOException>(() => f.Probe.PrepareFeature(true), "failed isolated feature enablement remains ambiguous");
+            Check(f.Store.Load().Stage == ProbeStage.PreparedEnable && f.Host.FeatureWrites == 0,
+                "prewrite failure preserves enable intent without assuming mutation");
+            Check(f.Probe.RestoreOriginal(false, false, true).Stage == ProbeStage.Restored,
+                "verified unchanged feature can close failed enable intent");
+        }
+        using (var f = new Fixture())
+        {
+            f.BeginIsolated(); f.Host.FailAfterFeature = true;
+            Throws<IOException>(() => f.Probe.PrepareFeature(true),
+                "exception after isolated feature write remains ambiguous");
+            Check(f.Store.Load().Stage == ProbeStage.PreparedEnable && f.Host.State.FeatureEnabled,
+                "postwrite failure retains intent and observed enabled feature");
+            Throws<InvalidOperationException>(() => f.Probe.RestoreOriginal(false, false, true),
+                "ambiguous feature write needs reviewed restoration");
+            f.Host.FailAfterFeature = false;
+            Check(f.Probe.RestoreOriginal(true, false, true).Stage == ProbeStage.Restored,
+                "reviewed restoration returns original feature after postwrite failure");
+        }
+        using (var f = new Fixture())
+        {
+            f.BeginIsolated(); f.Probe.PrepareFeature(true); f.Host.State.ParentLogonTime = 101;
+            f.Host.State.NetworkIsolationAccepted = false;
+            Throws<InvalidOperationException>(() => f.Probe.ResumeAfterFreshLogon(true),
+                "reappearing Wi-Fi after fresh logon blocks Stage A verification");
+            Check(f.Store.Load().NetworkDeviationObserved && f.Store.Load().Stage == ProbeStage.AwaitFreshParent,
+                "post-logon network loss is durable without creating a child");
+            f.Host.State.NetworkIsolationAccepted = true;
+            Check(f.Probe.RestoreOriginal(true, true, true).Stage == ProbeStage.Restored,
+                "re-isolation plus reviewed recovery restores feature after post-logon deviation");
+        }
+        using (var f = new Fixture())
+        {
+            f.SetIsolated(); f.Host.State.ChildAccess = ResourceAccess.Unknown; f.Host.State.ChildApiErrorCode = 1168;
+            ProbePlan plan = f.Probe.Plan(ProbeNetworkPosture.NetworkIsolated, true);
+            f.Probe.Begin(plan, plan.Hash, true); f.Probe.PrepareFeature(true);
+            f.Host.State.ParentLogonTime = 101;
+            Check(f.Probe.ResumeAfterFreshLogon(true).Stage == ProbeStage.StageAQueryUnknown,
+                "persistent post-logon 1168 remains unknown in isolated Stage A");
+            Throws<InvalidOperationException>(() => f.Probe.ApproveStageB(plan.Hash, true),
+                "1168 and isolated posture both block Stage B");
+            Check(f.Probe.RestoreOriginal(false, false, true).Stage == ProbeStage.Restored,
+                "Stage A only 1168 permits controlled feature restoration while isolated");
+        }
+        using (var f = new Fixture())
+        {
+            f.BeginIsolated(); f.Probe.PrepareFeature(true);
+            f.Host.FailRestore = true;
+            Throws<IOException>(() => f.Probe.RestoreOriginal(false, false, true),
+                "failed restoration is not reported as complete");
+            Check(!f.Probe.AssessReconnect(true).Ready && f.Store.Load().Stage == ProbeStage.Restoring,
+                "incomplete feature restoration forbids reconnection");
+            f.Host.FailRestore = false;
+            f.Host.State.TermServiceStopped = false;
+            f.Host.State.ListenerFingerprint = "listener-changed";
+            Throws<InvalidOperationException>(() => f.Probe.RestoreOriginal(false, false, true),
+                "unexpected TermService or listener drift is a conflict after feature restoration");
+            Check(f.Store.Load().Stage == ProbeStage.Conflict && !f.Probe.AssessReconnect(true).Ready,
+                "service/listener conflict forbids reconnection even after feature is restored");
+            f.Host.State.TermServiceStopped = true; f.Host.State.ListenerFingerprint = "listener-1";
+            Check(f.Probe.RestoreOriginal(false, false, true).Stage == ProbeStage.Restored &&
+                f.Probe.AssessReconnect(true).Ready, "reconnection requires original infrastructure verified again");
+            f.Host.State.NetworkIsolationAccepted = false;
+            Check(!f.Probe.AssessReconnect(true).Ready && f.Store.Load().NetworkDeviationObserved,
+                "network loss after restoration is recorded and prevents reconnection");
+            f.Host.State.NetworkIsolationAccepted = true;
+            Throws<InvalidOperationException>(() => f.Probe.RestoreOriginal(false, false, true),
+                "post-restoration deviation still requires reviewed recovery");
+            Check(f.Probe.RestoreOriginal(true, true, true).Stage == ProbeStage.Restored &&
+                f.Probe.AssessReconnect(true).Ready,
+                "reviewed re-isolation restores reconnect eligibility without another feature write");
+        }
+    }
     private static void PrivateStateSynthetic()
     {
         using (var f = new Fixture())
@@ -600,7 +868,8 @@ internal static class FeasibilityProbeTests
         try
         {
             PlanningAndApproval(); FeatureFailureAndRecovery(); FreshLogonAndConnection(); TeardownAndRollback();
-            JournalAndOwnership(); ObservedHostBoundary(); WindowsAdapterSynthetic(); FirewallGateSynthetic(); PrivateStateSynthetic();
+            JournalAndOwnership(); ObservedHostBoundary(); WindowsAdapterSynthetic(); FirewallGateSynthetic();
+            NetworkGateSynthetic(); IsolatedLifecycle(); PrivateStateSynthetic();
             Console.WriteLine("Feasibility probe: " + assertions + " offline assertions passed."); return 0;
         }
         catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }

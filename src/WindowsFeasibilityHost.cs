@@ -81,7 +81,7 @@ internal sealed class ScriptProbeInventory : IProbeInventory
             string output = process.StandardOutput.ReadToEnd();
             if (!process.WaitForExit(180000)) { process.Kill(); throw new TimeoutException("Read-only inventory timed out."); }
             if (process.ExitCode != 0) throw new InvalidOperationException("Read-only inventory failed: " + errorRead.Result);
-            if (output.Length > 1024 * 1024) throw new InvalidDataException("Inventory exceeds size limit.");
+            if (output.Length > 4 * 1024 * 1024) throw new InvalidDataException("Inventory exceeds size limit.");
             return output;
         }
     }
@@ -132,9 +132,10 @@ internal sealed class WindowsFeasibilityHost : IFeasibilityHost
 
     internal static ProbeSnapshot ParseInventory(string json)
     {
-        var parser = new JavaScriptSerializer { MaxJsonLength = 1024 * 1024 };
+        var parser = new JavaScriptSerializer { MaxJsonLength = 4 * 1024 * 1024 };
         object root = parser.DeserializeObject(json);
-        if (Str(At(root, "Schema")) != "ChildStream.ReadOnlyFeasibilityInventory.v2" ||
+        if ((Str(At(root, "Schema")) != "ChildStream.ReadOnlyFeasibilityInventory.v2" &&
+             Str(At(root, "Schema")) != "ChildStream.ReadOnlyFeasibilityInventory.v3") ||
             At(root, "HostMutation") == null || Convert.ToBoolean(At(root, "HostMutation")))
             throw new InvalidDataException("Unexpected inventory schema or mutation marker.");
         object windows = At(root, "Windows"), feature = At(root, "ChildFeature"), sessions = At(root, "Sessions");
@@ -143,6 +144,7 @@ internal sealed class WindowsFeasibilityHost : IFeasibilityHost
         object local = At(rdp, "LocalDenyConnections"), policy = At(rdp, "PolicyDenyConnections");
         object tcp = At(rdp, "TcpListener"), udp = At(rdp, "UdpEndpoint");
         object firewall = At(rdp, "Firewall"), profiles = At(rdp, "FirewallProfiles"), services = At(rdp, "Services");
+        object network = At(root, "Network");
         uint parent = checked((uint)Num(At(sessions, "ProcessSessionId")));
         uint console = checked((uint)Num(At(sessions, "ActiveConsoleSessionId")));
         object[] sessionItems = Items(enumerated);
@@ -155,12 +157,13 @@ internal sealed class WindowsFeasibilityHost : IFeasibilityHost
             Items(services).Where(x => Str(At(x, "Name")) == "TermService")
                 .All(x => Str(At(x, "State")) == "Stopped");
         FirewallRdpAssessment firewallAssessment = FirewallRdpAssessment.Assess(profiles, firewall, services, At(rdp, "TcpPort"));
+        NetworkIsolationAssessment networkAssessment = NetworkIsolationAssessment.Assess(network);
         bool firewallKnown = firewallAssessment.Accepted;
         // This means the local posture meets the reviewed narrow gate. It is not
         // a claim that every possible remote network route is closed.
-        bool posture = Is(local, "Accessible") && Num(At(local, "Data")) == 1 &&
-            (Is(policy, "Absent") || Is(policy, "Accessible") && Num(At(policy, "Data")) == 1) &&
-            noRdpListeners && servicesKnown && firewallKnown;
+        bool rdpDenied = Is(local, "Accessible") && Num(At(local, "Data")) == 1 &&
+            (Is(policy, "Absent") || Is(policy, "Accessible") && Num(At(policy, "Data")) == 1);
+        bool posture = rdpDenied && noRdpListeners && servicesKnown && firewallKnown;
         var s = new ProbeSnapshot {
             FeatureAccess = ParseAccess(feature), FeatureEnabled = At(feature, "Enabled") != null && Convert.ToBoolean(At(feature, "Enabled")),
             ParentSessionId = parent, ConsoleSessionId = console,
@@ -169,6 +172,12 @@ internal sealed class WindowsFeasibilityHost : IFeasibilityHost
             AccountBinding = Str(At(root, "AccountBindingHash")),
             Edition = Is(windows, "Accessible") && Str(At(windows, "Caption")) == "Microsoft Windows 11 Pro" ? "Professional" : "Unknown",
             WindowsBuild = checked((int)Num(At(windows, "BuildNumber"))), LocalRdpPostureAccepted = posture,
+            RdpPolicyDenied = rdpDenied, TermServiceStopped = servicesKnown,
+            RdpListenersAbsent = noRdpListeners,
+            FirewallObservationComplete = firewallAssessment.ProfilesAccepted && firewallAssessment.CoverageAccepted,
+            NetworkIsolationAccepted = networkAssessment.Accepted,
+            NetworkFingerprint = Digest(new object[] { At(network, "Adapters"), At(network, "IpInterfaces"),
+                At(network, "IpAddresses"), At(network, "Routes") }),
             ChildAccess = ParseAccess(child), ChildApiErrorCode = checked((int)Num(At(child, "ErrorCode"))),
             IndependentNoUnexpectedSessions = independent,
             SessionInventoryFingerprint = Digest(enumerated),
