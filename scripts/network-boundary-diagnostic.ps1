@@ -36,17 +36,28 @@ $adapters = Observed {
                 MediaConnectionState = [string]$_.MediaConnectionState
                 HardwareInterface = [bool]$_.HardwareInterface
                 Virtual = [bool]$_.Virtual
+                MacAddress = [string]$_.MacAddress
+                InterfaceDescription = [string]$_.InterfaceDescription
+                PnPDeviceID = [string]$_.PnPDeviceID
+                InterfaceGuid = [string]$_.InterfaceGuid
                 # Names are emitted only as local diagnostic labels, never as allow rules.
                 Label = [string]$_.Name
-                VerifiedRole = ''
-                RoleEvidence = ''
             }
         }) }
 }
 $switches = Observed {
     [pscustomobject]@{ State = 'Accessible'; Items = @(
         Get-VMSwitch -ErrorAction Stop | ForEach-Object {
-            [pscustomobject]@{ Name = [string]$_.Name; SwitchType = [string]$_.SwitchType }
+            [pscustomobject]@{ Name = [string]$_.Name; Id = [string]$_.Id;
+                SwitchType = [string]$_.SwitchType;
+                NetAdapterInterfaceGuid = [string]$_.NetAdapterInterfaceGuid }
+        }) }
+}
+$hostPorts = Observed {
+    [pscustomobject]@{ State = 'Accessible'; Items = @(
+        Get-VMNetworkAdapter -ManagementOS -ErrorAction Stop | ForEach-Object {
+            [pscustomobject]@{ Id = [string]$_.Id; MacAddress = [string]$_.MacAddress;
+                SwitchName = [string]$_.SwitchName; SwitchId = [string]$_.SwitchId }
         }) }
 }
 $adapterCollectionConsistent = $false
@@ -66,9 +77,21 @@ $vms = Observed {
             [pscustomobject]@{ Name = [string]$_.Name; State = [string]$_.State }
         }) }
 }
+$vmPorts = Observed {
+    [pscustomobject]@{ State = 'Accessible'; Items = @(
+        Get-VMNetworkAdapter -VMName '*' -ErrorAction Stop | ForEach-Object {
+            [pscustomobject]@{ Id = [string]$_.Id; VMName = [string]$_.VMName;
+                SwitchName = [string]$_.SwitchName; SwitchId = [string]$_.SwitchId }
+        }) }
+}
 $hns = Observed {
     [pscustomobject]@{ State = 'Accessible'; Items = @(
-        Get-HnsNetwork -ErrorAction Stop | Select-Object Name,Type,NetworkAdapterName
+        Get-HnsNetwork -ErrorAction Stop | Select-Object ID,Name,Type,NetworkAdapterName
+    ) }
+}
+$hnsEndpoints = Observed {
+    [pscustomobject]@{ State = 'Accessible'; Items = @(
+        Get-HnsEndpoint -ErrorAction Stop | Select-Object ID,VirtualNetwork,VirtualNetworkName,State
     ) }
 }
 $netNat = Observed {
@@ -77,19 +100,50 @@ $netNat = Observed {
     ) }
 }
 $portProxy = Observed {
-    $lines = @(netsh interface portproxy show all)
-    if ($LASTEXITCODE -ne 0) { throw 'Portproxy inventory failed.' }
-    [pscustomobject]@{ State = 'Accessible'; Items = @($lines | Where-Object { $_.Trim() }) }
+    $root = 'HKLM:\SYSTEM\CurrentControlSet\Services\PortProxy'
+    $items = foreach ($family in @('v4tov4','v4tov6','v6tov4','v6tov6')) {
+        $path = Join-Path $root "$family\tcp"
+        if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) { continue }
+        $key = Get-Item -LiteralPath $path -ErrorAction Stop
+        foreach ($name in $key.GetValueNames()) {
+            [pscustomobject]@{ Family = $family; Listen = $name;
+                Connect = [string]$key.GetValue($name) }
+        }
+    }
+    [pscustomobject]@{ State = 'Accessible'; Items = @($items) }
+}
+$bridgeBindings = Observed {
+    [pscustomobject]@{ State = 'Accessible'; Items = @(
+        Get-NetAdapterBinding -Name '*' -IncludeHidden -AllBindings -ComponentID ms_bridge -ErrorAction Stop |
+            Select-Object Name,Enabled,ComponentID
+    ) }
+}
+$ipForwarding = Observed {
+    [pscustomobject]@{ State = 'Accessible'; Items = @(
+        Get-NetIPInterface -PolicyStore ActiveStore -IncludeAllCompartments -ErrorAction Stop |
+            Select-Object InterfaceIndex,CompartmentId,AddressFamily,Forwarding
+    ) }
 }
 $forwarding = [pscustomobject]@{
     HnsState = $hns.State; NetNatState = $netNat.State; PortProxyState = $portProxy.State
+    HnsEndpointState = $hnsEndpoints.State; HnsEndpointCount = @($hnsEndpoints.Items).Count
+    BridgeBindingState = $bridgeBindings.State
+    EnabledBridgeBindingCount = @($bridgeBindings.Items | Where-Object Enabled -eq $true).Count
+    IpForwardingState = $ipForwarding.State
+    EnabledIpForwardingCount = @($ipForwarding.Items | Where-Object Forwarding -eq 'Enabled').Count
     # A bridge binding is not proof of an active or absent bridge. A future
     # privileged topology graph must map every switch, HNS and forwarding path.
-    BridgeGraphReviewed = $false
-    UnreviewedForwardingPaths = @($netNat.Items).Count + @($portProxy.Items).Count
+    BridgeGraphReviewed = $switches.State -eq 'Accessible' -and
+        $hostPorts.State -eq 'Accessible' -and $vmPorts.State -eq 'Accessible' -and
+        $hns.State -eq 'Accessible' -and $hnsEndpoints.State -eq 'Accessible' -and
+        $bridgeBindings.State -eq 'Accessible' -and $ipForwarding.State -eq 'Accessible'
+    UnreviewedForwardingPaths = @($portProxy.Items).Count +
+        @($bridgeBindings.Items | Where-Object Enabled -eq $true).Count +
+        @($ipForwarding.Items | Where-Object Forwarding -eq 'Enabled').Count +
+        @($hns.Items | Where-Object { [string]$_.Type -notin @('NAT','ICS') }).Count
 }
 $wsl = Observed {
-    $lines = @(wsl --list --verbose | ForEach-Object { $_ -replace [char]0, '' })
+    $lines = @(wsl --list --verbose 2>$null | ForEach-Object { $_ -replace [char]0, '' })
     if ($LASTEXITCODE -ne 0 -or -not ($lines -match '\bNAME\s+STATE\s+VERSION\b')) {
         throw 'WSL distribution listing was not parseable.'
     }
@@ -106,7 +160,7 @@ $wsl = Observed {
         Mode = 'Unknown'; Note = 'No distro is launched to query effective WSL networking mode.' }
 }
 $docker = Observed {
-    $lines = @(docker ps --format '{{json .}}')
+    $lines = @(docker ps --format '{{json .}}' 2>$null)
     if ($LASTEXITCODE -ne 0) { throw 'Docker container listing failed.' }
     $bindings = @()
     foreach ($line in $lines) {
@@ -118,6 +172,12 @@ $docker = Observed {
     }
     [pscustomobject]@{ State = 'Accessible'; RunningContainerCount = @($lines | Where-Object { $_ }).Count;
         PublishedBindings = @($bindings) }
+}
+$dockerProcesses = Observed {
+    [pscustomobject]@{ State = 'Accessible'; Items = @(
+        Get-Process -Name 'Docker Desktop','com.docker.backend','dockerd' -ErrorAction SilentlyContinue |
+            Select-Object ProcessName,Id
+    ) }
 }
 
 $rdp = [pscustomobject]@{ State = 'Inaccessible'; PolicyDenied = $null;
@@ -139,41 +199,43 @@ if ($null -ne $inventory.Rdp) {
     }
 }
 
-$fingerprint = $null
-if ($null -ne $network -and $network.Adapters.State -eq 'Accessible' -and
-    $network.IpInterfaces.State -eq 'Accessible' -and $network.IpAddresses.State -eq 'Accessible' -and
-    $network.Routes.State -eq 'Accessible') {
-    $canonical = foreach ($section in @('Adapters', 'IpInterfaces', 'IpAddresses', 'Routes')) {
-        $items = @($network.$section.Items | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 12 } | Sort-Object -CaseSensitive)
-        "$section=$($items -join '|')"
-    }
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try { $fingerprint = [Convert]::ToHexString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical -join "`n"))).ToLowerInvariant() }
-    finally { $sha.Dispose() }
-}
-
 $observation = [pscustomobject]@{
     Adapters = $adapters
     IpInterfaces = $network.IpInterfaces
     IpAddresses = $network.IpAddresses
     Routes = $network.Routes
     Switches = $switches
+    HostPorts = $hostPorts
     VirtualMachines = $vms
+    VmPorts = $vmPorts
+    Hns = $hns
+    HnsEndpoints = $hnsEndpoints
+    NetNat = $netNat
+    PortProxy = $portProxy
+    BridgeBindings = $bridgeBindings
+    IpForwarding = $ipForwarding
     Wsl = $wsl
     Docker = $docker
+    DockerProcesses = $dockerProcesses
     Rdp = $rdp
+    RdpEvidence = $inventory.Rdp
     Forwarding = $forwarding
     AdapterCollectionConsistent = $adapterCollectionConsistent
     OperatorPhysicalSeveranceConfirmed = [bool]$OperatorConfirmedPhysicalSeverance
-    CurrentNetworkFingerprint = $fingerprint
+    CurrentNetworkFingerprint = $null
     ExpectedNetworkFingerprint = $ExpectedNetworkFingerprint
 }
+$fingerprint = Get-ChildStreamBoundaryFingerprint -Observation $observation
+$observation.CurrentNetworkFingerprint = $fingerprint
 $report = Get-ChildStreamNetworkBoundaryDiagnostic -Observation $observation
 $report | Add-Member -NotePropertyName CurrentNetworkFingerprint -NotePropertyValue $fingerprint
 $report | Add-Member -NotePropertyName Collection -NotePropertyValue ([pscustomobject]@{
     Inventory = if ($null -ne $inventory.Schema) { 'Accessible' } else { 'Inaccessible' }
     HyperVSwitches = $switches.State; HyperVVirtualMachines = $vms.State
+    HyperVHostPorts = $hostPorts.State; HyperVVmPorts = $vmPorts.State
     Wsl = $wsl.State; Docker = $docker.State; Hns = $hns.State
-    NetNat = $netNat.State; PortProxy = $portProxy.State
+    HnsEndpoints = $hnsEndpoints.State; NetNat = $netNat.State; PortProxy = $portProxy.State
+    BridgeBindings = $bridgeBindings.State; IpForwarding = $ipForwarding.State
+    DockerProcesses = $dockerProcesses.State
 })
 $report | ConvertTo-Json -Depth 8

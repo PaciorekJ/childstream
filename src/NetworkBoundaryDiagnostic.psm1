@@ -18,6 +18,64 @@ function New-Predicate([string]$Id, [string]$Condition, [string]$Verdict, [strin
     [pscustomobject]@{ Id = $Id; Condition = $Condition; Verdict = $Verdict; Evidence = @($Evidence) }
 }
 
+function Normalize-Mac($Value) {
+    $digits = ([string]$Value) -replace '[^0-9a-fA-F]', ''
+    if ($digits.Length -ne 12 -or $digits -eq '000000000000') { return '' }
+    return $digits.ToUpperInvariant()
+}
+
+function ConvertTo-ChildStreamCanonicalText($Value) {
+    if ($null -eq $Value) { return 'null' }
+    if ($Value -is [string]) { return ConvertTo-Json -InputObject $Value -Compress }
+    if ($Value -is [bool]) { return ([string]$Value).ToLowerInvariant() }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $parts = foreach ($key in @($Value.Keys | Sort-Object -CaseSensitive)) {
+            (ConvertTo-ChildStreamCanonicalText ([string]$key)) + ':' +
+                (ConvertTo-ChildStreamCanonicalText $Value[$key])
+        }
+        return '{' + ($parts -join ',') + '}'
+    }
+    if ($Value -is [pscustomobject]) {
+        $parts = foreach ($property in @($Value.PSObject.Properties | Sort-Object Name -CaseSensitive)) {
+            (ConvertTo-ChildStreamCanonicalText $property.Name) + ':' +
+                (ConvertTo-ChildStreamCanonicalText $property.Value)
+        }
+        return '{' + ($parts -join ',') + '}'
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $parts = @($Value | ForEach-Object { ConvertTo-ChildStreamCanonicalText $_ } | Sort-Object -CaseSensitive)
+        return '[' + ($parts -join ',') + ']'
+    }
+    return [string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0}', $Value)
+}
+
+function Get-ChildStreamBoundaryFingerprint {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Observation)
+    $sources = [ordered]@{}
+    foreach ($name in @('Adapters','IpInterfaces','IpAddresses','Routes','Switches','HostPorts',
+        'VirtualMachines','VmPorts','Hns','HnsEndpoints','NetNat','PortProxy',
+        'BridgeBindings','IpForwarding','Wsl','Docker','DockerProcesses','Rdp')) {
+        $section = Read-Field $Observation $name
+        if ((Read-Field $section 'State') -ne 'Accessible') { return $null }
+        $sources[$name] = $section
+    }
+    $sources['AdapterCollectionConsistent'] = Read-Field $Observation 'AdapterCollectionConsistent'
+    $sources['Forwarding'] = Read-Field $Observation 'Forwarding'
+    $sources['OperatorPhysicalSeveranceConfirmed'] = Read-Field $Observation 'OperatorPhysicalSeveranceConfirmed'
+    $sources['RdpEvidence'] = Read-Field $Observation 'RdpEvidence'
+    if ($sources['AdapterCollectionConsistent'] -ne $true -or $null -eq $sources['Forwarding'] -or
+        $null -eq $sources['OperatorPhysicalSeveranceConfirmed'] -or $null -eq $sources['RdpEvidence']) { return $null }
+    foreach ($name in @('Firewall','FirewallProfiles','LocalDenyConnections','Services','TcpListener','UdpEndpoint')) {
+        if ((Read-Field (Read-Field $sources['RdpEvidence'] $name) 'State') -ne 'Accessible') { return $null }
+    }
+    if ((Read-Field (Read-Field $sources['RdpEvidence'] 'PolicyDenyConnections') 'State') -notin @('Accessible','Absent')) { return $null }
+    $canonical = ConvertTo-ChildStreamCanonicalText $sources
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return [Convert]::ToHexString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical))).ToLowerInvariant() }
+    finally { $sha.Dispose() }
+}
+
 function Get-ChildStreamNetworkBoundaryDiagnostic {
     [CmdletBinding()]
     param([Parameter(Mandatory)]$Observation)
@@ -28,9 +86,14 @@ function Get-ChildStreamNetworkBoundaryDiagnostic {
     $addresses = Read-Field $Observation 'IpAddresses'
     $routes = Read-Field $Observation 'Routes'
     $switches = Read-Field $Observation 'Switches'
+    $hostPorts = Read-Field $Observation 'HostPorts'
     $vms = Read-Field $Observation 'VirtualMachines'
+    $vmPorts = Read-Field $Observation 'VmPorts'
+    $hns = Read-Field $Observation 'Hns'
+    $hnsEndpoints = Read-Field $Observation 'HnsEndpoints'
     $wsl = Read-Field $Observation 'Wsl'
     $docker = Read-Field $Observation 'Docker'
+    $dockerProcesses = Read-Field $Observation 'DockerProcesses'
     $rdp = Read-Field $Observation 'Rdp'
     $forwarding = Read-Field $Observation 'Forwarding'
 
@@ -108,39 +171,85 @@ function Get-ChildStreamNetworkBoundaryDiagnostic {
         $_ -ne '1' -and -not $adapterIndices.ContainsKey($_)
     })
     $unclassifiedVirtual = @()
+    $hostPortGraphKnown = (Read-Field $hostPorts 'State') -eq 'Accessible' -and
+        $switchState -eq 'Accessible' -and (Read-Field $vmPorts 'State') -eq 'Accessible'
+    $hostPortGraphConflicts = @()
+    $hostPortByMac = @{}
+    $adapterMacCounts = @{}
+    foreach ($adapter in (Read-Items $adapters)) {
+        $mac = Normalize-Mac (Read-Field $adapter 'MacAddress')
+        if ($mac) { $adapterMacCounts[$mac] = 1 + [int]$adapterMacCounts[$mac] }
+    }
+    foreach ($port in (Read-Items $hostPorts)) {
+        $mac = Normalize-Mac (Read-Field $port 'MacAddress')
+        $switchName = [string](Read-Field $port 'SwitchName')
+        $switchId = [string](Read-Field $port 'SwitchId')
+        $matches = @(Read-Items $switches | Where-Object {
+            if ($switchId) { [string](Read-Field $_ 'Id') -eq $switchId }
+            else { [string](Read-Field $_ 'Name') -ceq $switchName }
+        })
+        if (-not $mac -or $hostPortByMac.ContainsKey($mac) -or
+            $adapterMacCounts[$mac] -ne 1 -or $matches.Count -ne 1 -or
+            $matches[0].SwitchType -notin @('Internal','Private')) {
+            $hostPortGraphConflicts += "host port with MAC=$mac has ambiguous adapter or switch identity"
+            continue
+        }
+        $hostPortByMac[$mac] = $port
+    }
+    if (-not $hostPortGraphKnown) { $hostPortGraphConflicts += 'Hyper-V host/guest port or switch inventory is inaccessible.' }
+    $graphVerdict = if ($hostPortGraphConflicts.Count) { 'Unknown' } else { 'Pass' }
+    $predicates.Add((New-Predicate 'hyperv-host-port-graph' 'External' $graphVerdict @($hostPortGraphConflicts)))
     foreach ($adapter in (Read-Items $adapters)) {
         if ((Read-Field $adapter 'HardwareInterface') -eq $true -or (Read-Field $adapter 'Status') -ne 'Up') { continue }
         $index = [string](Read-Field $adapter 'InterfaceIndex')
-        $role = [string](Read-Field $adapter 'VerifiedRole')
-        $source = [string](Read-Field $adapter 'RoleEvidence')
-        if (($role -eq 'InternalSwitchHost' -and $source -eq 'HyperVPortGraph') -or
-            ($role -eq 'TunnelWithoutUnderlay' -and $source -eq 'UnderlayGraph')) { continue }
-        if ($role -eq 'UnaddressedMiniport' -and $source -eq 'DriverAndPathGraph' -and
-            -not $addressIndices.ContainsKey($index) -and -not $routeIndices.ContainsKey($index)) { continue }
-        $unclassifiedVirtual += "ifIndex=$index role=$role evidence=$source address=$($addressIndices.ContainsKey($index)) route=$($routeIndices.ContainsKey($index))"
+        $mac = Normalize-Mac (Read-Field $adapter 'MacAddress')
+        $pnp = [string](Read-Field $adapter 'PnPDeviceID')
+        $isHostPort = $hostPortGraphKnown -and $mac -and $hostPortByMac.ContainsKey($mac) -and
+            (Read-Field $adapter 'Virtual') -eq $true -and
+            [string](Read-Field $adapter 'InterfaceDescription') -eq 'Hyper-V Virtual Ethernet Adapter' -and
+            $pnp -match '(?i)\\VMS_MP(?:\\|$)'
+        if ($isHostPort) { continue }
+        if ((Read-Field $adapter 'Virtual') -eq $true -and $pnp -and
+            -not $addressIndices.ContainsKey($index) -and -not $routeIndices.ContainsKey($index) -and
+            (Read-Field $forwarding 'BridgeBindingState') -eq 'Accessible' -and
+            [int](Read-Field $forwarding 'EnabledBridgeBindingCount') -eq 0) { continue }
+        $unclassifiedVirtual += "ifIndex=$index active nonphysical path lacks verified host-port identity or is addressed"
     }
-    $virtualVerdict = if (-not $networkKnown -or $unclassifiedVirtual.Count -or $orphanPaths.Count) { 'Unknown' } else { 'Pass' }
+    $virtualVerdict = if (-not $networkKnown -or $graphVerdict -ne 'Pass' -or
+        $unclassifiedVirtual.Count -or $orphanPaths.Count) { 'Unknown' } else { 'Pass' }
     $predicates.Add((New-Predicate 'virtual-paths-attributed' 'External' $virtualVerdict @(
         $unclassifiedVirtual
         $orphanPaths | ForEach-Object { "ifIndex=$_ has an address or route but no adapter record." })))
     $forwardingKnown = (Read-Field $forwarding 'HnsState') -eq 'Accessible' -and
         (Read-Field $forwarding 'NetNatState') -eq 'Accessible' -and
         (Read-Field $forwarding 'PortProxyState') -eq 'Accessible' -and
+        (Read-Field $forwarding 'HnsEndpointState') -eq 'Accessible' -and
+        (Read-Field $forwarding 'BridgeBindingState') -eq 'Accessible' -and
+        (Read-Field $forwarding 'IpForwardingState') -eq 'Accessible' -and
         (Read-Field $forwarding 'BridgeGraphReviewed') -eq $true
     $forwardingPaths = [int](Read-Field $forwarding 'UnreviewedForwardingPaths')
     $forwardingVerdict = if ($forwardingPaths -gt 0) { 'Fail' } elseif ($forwardingKnown) { 'Pass' } else { 'Unknown' }
     $predicates.Add((New-Predicate 'nat-bridge-forwarding-mapped' 'External' $forwardingVerdict @(
-        "HNS=$((Read-Field $forwarding 'HnsState')); NetNat=$((Read-Field $forwarding 'NetNatState')); portproxy=$((Read-Field $forwarding 'PortProxyState')); bridge-graph-reviewed=$((Read-Field $forwarding 'BridgeGraphReviewed')); unreviewed-paths=$forwardingPaths")))
+        "HNS=$((Read-Field $forwarding 'HnsState')); endpoints=$((Read-Field $forwarding 'HnsEndpointState')); NetNat=$((Read-Field $forwarding 'NetNatState')); portproxy=$((Read-Field $forwarding 'PortProxyState')); bridge=$((Read-Field $forwarding 'BridgeBindingState')); IP-forwarding=$((Read-Field $forwarding 'IpForwardingState')); graph-reviewed=$((Read-Field $forwarding 'BridgeGraphReviewed')); unreviewed-paths=$forwardingPaths")))
+
+    $endpointCount = @(Read-Items $hnsEndpoints).Count
+    $endpointVerdict = if ($endpointCount) { 'Fail' }
+        elseif ((Read-Field $hnsEndpoints 'State') -eq 'Accessible') { 'Pass' } else { 'Unknown' }
+    $predicates.Add((New-Predicate 'hns-endpoints-quiescent' 'GuestPath' $endpointVerdict @(
+        "HNS-endpoint-inventory=$((Read-Field $hnsEndpoints 'State')); count=$endpointCount")))
 
     $runningVms = @(Read-Items $vms | Where-Object { (Read-Field $_ 'State') -ne 'Off' })
     $runningWsl = @((Read-Field $wsl 'RunningDistributions')) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) }
     $runningDocker = Read-Field $docker 'RunningContainerCount'
     $guestKnown = (Read-Field $vms 'State') -eq 'Accessible' -and (Read-Field $wsl 'State') -eq 'Accessible' -and
-        (Read-Field $docker 'State') -eq 'Accessible' -and $null -ne $runningDocker
-    $guestPresent = $runningVms.Count -gt 0 -or @($runningWsl).Count -gt 0 -or [int]$runningDocker -gt 0
+        (Read-Field $docker 'State') -eq 'Accessible' -and $null -ne $runningDocker -and
+        (Read-Field $dockerProcesses 'State') -eq 'Accessible' -and
+        (Read-Field $vmPorts 'State') -eq 'Accessible' -and (Read-Field $hns 'State') -eq 'Accessible'
+    $guestPresent = $runningVms.Count -gt 0 -or @($runningWsl).Count -gt 0 -or [int]$runningDocker -gt 0 -or
+        @(Read-Items $dockerProcesses).Count -gt 0 -or $endpointCount -gt 0
     $guestVerdict = if ($guestPresent) { 'Fail' } elseif ($guestKnown) { 'Pass' } else { 'Unknown' }
     $predicates.Add((New-Predicate 'internal-guests-quiescent' 'GuestPath' $guestVerdict @(
-        "VMs=$($runningVms.Count) VM-inventory=$((Read-Field $vms 'State')); WSL-running=$(@($runningWsl).Count) WSL-mode=$((Read-Field $wsl 'Mode')); Docker-containers=$runningDocker Docker-inventory=$((Read-Field $docker 'State'))")))
+        "VMs=$($runningVms.Count) VM-inventory=$((Read-Field $vms 'State')); WSL-running=$(@($runningWsl).Count) WSL-mode=$((Read-Field $wsl 'Mode')); Docker-containers=$runningDocker Docker-inventory=$((Read-Field $docker 'State')); Docker-processes=$(@(Read-Items $dockerProcesses).Count); HNS-endpoints=$endpointCount")))
 
     $published = @((Read-Field $docker 'PublishedBindings')) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) }
     $forwardVerdict = if ((Read-Field $docker 'State') -ne 'Accessible') { 'Unknown' } elseif (@($published).Count) { 'Fail' } else { 'Pass' }
@@ -185,4 +294,4 @@ function Get-ChildStreamNetworkBoundaryDiagnostic {
     }
 }
 
-Export-ModuleMember -Function Get-ChildStreamNetworkBoundaryDiagnostic
+Export-ModuleMember -Function Get-ChildStreamNetworkBoundaryDiagnostic,Get-ChildStreamBoundaryFingerprint
