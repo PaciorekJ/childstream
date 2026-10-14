@@ -84,16 +84,22 @@ $vmPorts = Observed {
                 SwitchName = [string]$_.SwitchName; SwitchId = [string]$_.SwitchId }
         }) }
 }
-$hns = Observed {
-    [pscustomobject]@{ State = 'Accessible'; Items = @(
-        Get-HnsNetwork -ErrorAction Stop | Select-Object ID,Name,Type,NetworkAdapterName
-    ) }
+$hnsRead = Observed {
+    $json = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File (Join-Path $PSScriptRoot 'hns-readonly.ps1') 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $json) { throw 'Read-only HNS inventory failed.' }
+    $value = ($json -join "`n") | ConvertFrom-Json -ErrorAction Stop
+    if ($value.Schema -ne 'ChildStream.HnsReadOnly.v1' -or $value.HostMutation -ne $false -or
+        $null -eq $value.Networks -or $null -eq $value.Endpoints) {
+        throw 'Unexpected HNS read-only inventory schema.'
+    }
+    [pscustomobject]@{ State = 'Accessible'; Value = $value }
 }
-$hnsEndpoints = Observed {
-    [pscustomobject]@{ State = 'Accessible'; Items = @(
-        Get-HnsEndpoint -ErrorAction Stop | Select-Object ID,VirtualNetwork,VirtualNetworkName,State
-    ) }
-}
+$hns = if ($hnsRead.State -eq 'Accessible') {
+    [pscustomobject]@{ State = 'Accessible'; Items = @($hnsRead.Value.Networks) }
+} else { [pscustomobject]@{ State = 'Inaccessible'; Items = @(); ErrorType = $hnsRead.ErrorType } }
+$hnsEndpoints = if ($hnsRead.State -eq 'Accessible') {
+    [pscustomobject]@{ State = 'Accessible'; Items = @($hnsRead.Value.Endpoints) }
+} else { [pscustomobject]@{ State = 'Inaccessible'; Items = @(); ErrorType = $hnsRead.ErrorType } }
 $netNat = Observed {
     [pscustomobject]@{ State = 'Accessible'; Items = @(
         Get-NetNat -ErrorAction Stop | Select-Object Name,InternalIPInterfaceAddressPrefix,ExternalIPInterfaceAddressPrefix
