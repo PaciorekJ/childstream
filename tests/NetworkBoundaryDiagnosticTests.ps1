@@ -127,6 +127,9 @@ $unknown = Clone $baseline
 $unknown.VirtualMachines.State = 'Inaccessible'
 Check ((Predicate (Get-ChildStreamNetworkBoundaryDiagnostic -Observation $unknown) 'internal-guests-quiescent') -eq 'Unknown') 'Inaccessible VM inventory cannot prove guest absence.'
 $unknown = Clone $baseline
+$unknown.DockerProcesses.State = 'Inaccessible'
+Check ((Predicate (Get-ChildStreamNetworkBoundaryDiagnostic -Observation $unknown) 'internal-guests-quiescent') -eq 'Unknown') 'A failed process query cannot prove Docker is absent.'
+$unknown = Clone $baseline
 $unknown.Forwarding.HnsState = 'Inaccessible'
 Check ((Predicate (Get-ChildStreamNetworkBoundaryDiagnostic -Observation $unknown) 'nat-bridge-forwarding-mapped') -eq 'Unknown') 'HNS denial cannot prove an empty forwarding graph.'
 $unknown = Clone $baseline

@@ -176,8 +176,10 @@ $docker = Observed {
 }
 $dockerProcesses = Observed {
     [pscustomobject]@{ State = 'Accessible'; Items = @(
-        Get-Process -Name 'Docker Desktop','com.docker.backend','dockerd' -ErrorAction SilentlyContinue |
-            Select-Object ProcessName,Id
+        # A filtered CIM query can succeed with zero rows. Get-Process with
+        # SilentlyContinue could hide a provider/access error as zero peers.
+        Get-CimInstance -ClassName Win32_Process -Filter "Name='Docker Desktop.exe' OR Name='com.docker.backend.exe' OR Name='dockerd.exe'" -ErrorAction Stop |
+            Select-Object @{Name='ProcessName';Expression={$_.Name}},@{Name='Id';Expression={$_.ProcessId}}
     ) }
 }
 
