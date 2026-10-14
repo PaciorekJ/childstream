@@ -512,13 +512,15 @@ internal static class FeasibilityProbeTests
                 rule["ProgramState"] = "Any"; rule["ProgramHash"] = null;
                 rule["PackageState"] = "Any"; rule["PackageHash"] = null;
                 rule["OwnerKind"] = "AppPackage";
+                if (i == 19) rule["LocalAddress"] = new object[] { "192.0.2.10" };
+                if (i == 20) rule["LocalAddress"] = new object[] { "2001:db8::10" };
                 rules[i] = rule;
             }
             firewall["Items"] = rules;
             firewall["SelectedInboundAllowCount"] = 20;
             firewall["BroadInboundAllowCount"] = 20;
         }).LocalRdpPostureAccepted,
-            "twenty app-named or owner-tagged rules with Any traffic scope still block");
+            "twenty app-named or owner-tagged rules, including two specific local addresses, still block");
         Check(FirewallSnapshot(d => {
             var rule = SunshineRule(d);
             rule["ProgramState"] = "Any"; rule["ProgramHash"] = null;
