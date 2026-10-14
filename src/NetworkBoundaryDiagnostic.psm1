@@ -24,6 +24,95 @@ function Normalize-Mac($Value) {
     return $digits.ToUpperInvariant()
 }
 
+function Read-ExceptionStatus($Exception) {
+    if ($null -eq $Exception) { return $null }
+    $property = $Exception.PSObject.Properties['StatusCode']
+    if ($null -eq $property) { return $null }
+    return [string]$property.Value
+}
+
+function Get-ChildStreamBridgeBindingObservation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Adapters,
+        [Parameter(Mandatory)]$Addresses,
+        [Parameter(Mandatory)]$Routes,
+        [scriptblock]$QueryBinding = {
+            param($Adapter)
+            # Query all bindings: a filtered ms_bridge query returning nothing
+            # cannot distinguish absence from an unsupported adapter/provider.
+            $exactName = [System.Management.Automation.WildcardPattern]::Escape([string]$Adapter.Label)
+            @(Get-NetAdapterBinding -Name $exactName -IncludeHidden -AllBindings -ErrorAction Stop)
+        }
+    )
+    if ((Read-Field $Adapters 'State') -ne 'Accessible' -or
+        (Read-Field $Addresses 'State') -ne 'Accessible' -or
+        (Read-Field $Routes 'State') -ne 'Accessible') {
+        return [pscustomobject]@{ State = 'Inaccessible'; QueryMode = 'PerRelevantAdapter';
+            Items = @(); Queried = @(); Failures = @([pscustomobject]@{
+                InterfaceIndex = $null; ErrorType = 'SourceInventoryInaccessible';
+                ErrorId = 'SourceInventoryInaccessible'; HResult = $null;
+                InnerErrorType = $null; InnerHResult = $null; CimStatus = $null;
+                InnerCimStatus = $null }) }
+    }
+    $pathIndices = @{}
+    foreach ($item in (@(Read-Items $Addresses) + @(Read-Items $Routes))) {
+        $pathIndices[[string](Read-Field $item 'InterfaceIndex')] = $true
+    }
+    $items = [System.Collections.Generic.List[object]]::new()
+    $queried = [System.Collections.Generic.List[object]]::new()
+    $failures = [System.Collections.Generic.List[object]]::new()
+    foreach ($adapter in (Read-Items $Adapters)) {
+        $index = Read-Field $adapter 'InterfaceIndex'
+        $relevant = (Read-Field $adapter 'HardwareInterface') -eq $true -or
+            [string](Read-Field $adapter 'Status') -eq 'Up' -or
+            $pathIndices.ContainsKey([string]$index)
+        if (-not $relevant) { continue }
+        $name = [string](Read-Field $adapter 'Label')
+        if ($null -eq $index -or [int]$index -lt 1 -or [string]::IsNullOrWhiteSpace($name)) {
+            $failures.Add([pscustomobject]@{ InterfaceIndex = $index; ErrorType = 'MissingAdapterIdentity';
+                ErrorId = 'MissingAdapterIdentity'; HResult = $null;
+                InnerErrorType = $null; InnerHResult = $null; CimStatus = $null;
+                InnerCimStatus = $null })
+            continue
+        }
+        $queried.Add([pscustomobject]@{ InterfaceIndex = [int]$index })
+        try {
+            $all = @(& $QueryBinding $adapter)
+            if ($all.Count -eq 0 -or @($all | Where-Object {
+                [string](Read-Field $_ 'Name') -cne $name -or
+                [string]::IsNullOrWhiteSpace([string](Read-Field $_ 'ComponentID')) -or
+                $null -eq (Read-Field $_ 'Enabled')
+            }).Count -gt 0) {
+                $failures.Add([pscustomobject]@{ InterfaceIndex = [int]$index;
+                    ErrorType = 'IncompleteBindingResult'; ErrorId = 'IncompleteBindingResult'; HResult = $null;
+                    InnerErrorType = $null; InnerHResult = $null; CimStatus = $null;
+                    InnerCimStatus = $null })
+                continue
+            }
+            foreach ($binding in ($all | Where-Object { [string](Read-Field $_ 'ComponentID') -ieq 'ms_bridge' })) {
+                $items.Add([pscustomobject]@{ InterfaceIndex = [int]$index;
+                    ComponentID = 'ms_bridge'; Enabled = [bool](Read-Field $binding 'Enabled') })
+            }
+        }
+        catch {
+            $exception = $_.Exception
+            $inner = $exception.InnerException
+            $failures.Add([pscustomobject]@{ InterfaceIndex = [int]$index;
+                ErrorType = $exception.GetType().Name;
+                ErrorId = [string]$_.FullyQualifiedErrorId;
+                HResult = $exception.HResult;
+                InnerErrorType = if ($null -ne $inner) { $inner.GetType().Name } else { $null };
+                InnerHResult = if ($null -ne $inner) { $inner.HResult } else { $null };
+                CimStatus = Read-ExceptionStatus $exception;
+                InnerCimStatus = Read-ExceptionStatus $inner })
+        }
+    }
+    [pscustomobject]@{ State = if ($failures.Count) { 'Inaccessible' } else { 'Accessible' };
+        QueryMode = 'PerRelevantAdapter'; Items = @($items); Queried = @($queried);
+        Failures = @($failures) }
+}
+
 function ConvertTo-ChildStreamCanonicalText($Value) {
     if ($null -eq $Value) { return 'null' }
     if ($Value -is [string]) { return ConvertTo-Json -InputObject $Value -Compress }
@@ -162,9 +251,9 @@ function Get-ChildStreamNetworkBoundaryDiagnostic {
         ($addressIndices.ContainsKey($_) -or $routeIndices.ContainsKey($_)) })
     $predicates.Add((New-Predicate 'physical-route-link-corroboration' 'External' $(
         if (-not $networkKnown) { 'Unknown' } elseif ($activePhysical.Count) { 'Fail' }
-        elseif ($retainedPhysicalPaths.Count) { 'Unknown' } else { 'Pass' }) @(
+        elseif ($ambiguousPhysical.Count) { 'Unknown' } else { 'Pass' }) @(
         $activePhysicalIndices | ForEach-Object { "ifIndex=$_ has an active physical link; local-subnet reachability matters without a default route." }
-        $retainedPhysicalPaths | ForEach-Object { "ifIndex=$_ has retained address or route with physical link down; reachability not inferred." })))
+        $retainedPhysicalPaths | ForEach-Object { "ifIndex=$_ has a retained address or route; its physical link is observed down and must remain so." })))
     $adapterIndices = @{}
     foreach ($adapter in (Read-Items $adapters)) { $adapterIndices[[string](Read-Field $adapter 'InterfaceIndex')] = $true }
     $orphanPaths = @($addressIndices.Keys + $routeIndices.Keys | Sort-Object -Unique | Where-Object {
@@ -176,24 +265,30 @@ function Get-ChildStreamNetworkBoundaryDiagnostic {
     $hostPortGraphConflicts = @()
     $hostPortByMac = @{}
     $adapterMacCounts = @{}
+    $portIds = @{}
     foreach ($adapter in (Read-Items $adapters)) {
         $mac = Normalize-Mac (Read-Field $adapter 'MacAddress')
         if ($mac) { $adapterMacCounts[$mac] = 1 + [int]$adapterMacCounts[$mac] }
     }
     foreach ($port in (Read-Items $hostPorts)) {
         $mac = Normalize-Mac (Read-Field $port 'MacAddress')
+        $portId = [string](Read-Field $port 'Id')
         $switchName = [string](Read-Field $port 'SwitchName')
         $switchId = [string](Read-Field $port 'SwitchId')
         $matches = @(Read-Items $switches | Where-Object {
             if ($switchId) { [string](Read-Field $_ 'Id') -eq $switchId }
             else { [string](Read-Field $_ 'Name') -ceq $switchName }
         })
-        if (-not $mac -or $hostPortByMac.ContainsKey($mac) -or
+        if (-not $portId -or $portIds.ContainsKey($portId) -or
+            -not $switchName -or -not $switchId -or
+            -not $mac -or $hostPortByMac.ContainsKey($mac) -or
             $adapterMacCounts[$mac] -ne 1 -or $matches.Count -ne 1 -or
+            [string](Read-Field $matches[0] 'Name') -cne $switchName -or
             $matches[0].SwitchType -notin @('Internal','Private')) {
             $hostPortGraphConflicts += "host port with MAC=$mac has ambiguous adapter or switch identity"
             continue
         }
+        $portIds[$portId] = $true
         $hostPortByMac[$mac] = $port
     }
     if (-not $hostPortGraphKnown) { $hostPortGraphConflicts += 'Hyper-V host/guest port or switch inventory is inaccessible.' }
@@ -203,13 +298,11 @@ function Get-ChildStreamNetworkBoundaryDiagnostic {
         if ((Read-Field $adapter 'HardwareInterface') -eq $true -or (Read-Field $adapter 'Status') -ne 'Up') { continue }
         $index = [string](Read-Field $adapter 'InterfaceIndex')
         $mac = Normalize-Mac (Read-Field $adapter 'MacAddress')
-        $pnp = [string](Read-Field $adapter 'PnPDeviceID')
         $isHostPort = $hostPortGraphKnown -and $mac -and $hostPortByMac.ContainsKey($mac) -and
             (Read-Field $adapter 'Virtual') -eq $true -and
-            [string](Read-Field $adapter 'InterfaceDescription') -eq 'Hyper-V Virtual Ethernet Adapter' -and
-            $pnp -match '(?i)\\VMS_MP(?:\\|$)'
+            [string](Read-Field $adapter 'InterfaceDescription') -eq 'Hyper-V Virtual Ethernet Adapter'
         if ($isHostPort) { continue }
-        if ((Read-Field $adapter 'Virtual') -eq $true -and $pnp -and
+        if ((Read-Field $adapter 'Virtual') -eq $true -and
             -not $addressIndices.ContainsKey($index) -and -not $routeIndices.ContainsKey($index) -and
             (Read-Field $forwarding 'BridgeBindingState') -eq 'Accessible' -and
             [int](Read-Field $forwarding 'EnabledBridgeBindingCount') -eq 0) { continue }
@@ -237,6 +330,29 @@ function Get-ChildStreamNetworkBoundaryDiagnostic {
         elseif ((Read-Field $hnsEndpoints 'State') -eq 'Accessible') { 'Pass' } else { 'Unknown' }
     $predicates.Add((New-Predicate 'hns-endpoints-quiescent' 'GuestPath' $endpointVerdict @(
         "HNS-endpoint-inventory=$((Read-Field $hnsEndpoints 'State')); count=$endpointCount")))
+
+    $hnsGraphProblems = @()
+    if ((Read-Field $hns 'State') -eq 'Accessible' -and
+        (Read-Field $hnsEndpoints 'State') -eq 'Accessible') {
+        $networkIds = @{}
+        foreach ($entry in (Read-Items $hns)) {
+            $id = ([string](Read-Field $entry 'ID')).Trim('{}').ToUpperInvariant()
+            if (-not $id -or $networkIds.ContainsKey($id)) {
+                $hnsGraphProblems += 'HNS network has absent or duplicate identity.'
+            } else { $networkIds[$id] = $true }
+        }
+        foreach ($entry in (Read-Items $hnsEndpoints)) {
+            $id = ([string](Read-Field $entry 'VirtualNetwork')).Trim('{}').ToUpperInvariant()
+            if (-not $id -or -not $networkIds.ContainsKey($id)) {
+                $hnsGraphProblems += 'HNS endpoint has no unique network identity.'
+            }
+        }
+    }
+    $hnsGraphVerdict = if ((Read-Field $hns 'State') -ne 'Accessible' -or
+        (Read-Field $hnsEndpoints 'State') -ne 'Accessible' -or $hnsGraphProblems.Count) {
+        'Unknown'
+    } else { 'Pass' }
+    $predicates.Add((New-Predicate 'hns-endpoint-network-graph' 'GuestPath' $hnsGraphVerdict @($hnsGraphProblems)))
 
     $runningVms = @(Read-Items $vms | Where-Object { (Read-Field $_ 'State') -ne 'Off' })
     $runningWsl = @((Read-Field $wsl 'RunningDistributions')) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) }
@@ -283,15 +399,26 @@ function Get-ChildStreamNetworkBoundaryDiagnostic {
         $groups[$condition] = if (@($items | Where-Object Verdict -eq 'Fail').Count) { 'Fail' }
             elseif (@($items | Where-Object Verdict -eq 'Unknown').Count) { 'Unknown' } else { 'Pass' }
     }
+    $preapprovalIds = @('physical-severance-confirmed','fresh-logon-network-unchanged')
+    $blockers = [pscustomobject]@{
+        CurrentState = @($predicates | Where-Object { $_.Verdict -eq 'Fail' } | ForEach-Object Id)
+        EvidenceGaps = @($predicates | Where-Object {
+            $_.Verdict -eq 'Unknown' -and $_.Id -notin $preapprovalIds
+        } | ForEach-Object Id)
+        FutureBoundaryChecks = @($predicates | Where-Object {
+            $_.Verdict -eq 'Unknown' -and $_.Id -in $preapprovalIds
+        } | ForEach-Object Id)
+    }
     [pscustomobject]@{
         Schema = 'ChildStream.NetworkBoundaryDiagnostic.v1'
         HostMutation = $false
         DiagnosticOnly = $true
         Conditions = $groups
         Predicates = @($predicates)
+        BlockingFindings = $blockers
         # Existing Stage A enforcement remains the stricter, unchanged gate.
         StageAPlanAuthorized = $false
     }
 }
 
-Export-ModuleMember -Function Get-ChildStreamNetworkBoundaryDiagnostic,Get-ChildStreamBoundaryFingerprint
+Export-ModuleMember -Function Get-ChildStreamNetworkBoundaryDiagnostic,Get-ChildStreamBoundaryFingerprint,Get-ChildStreamBridgeBindingObservation

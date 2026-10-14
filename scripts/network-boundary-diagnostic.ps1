@@ -118,12 +118,7 @@ $portProxy = Observed {
     }
     [pscustomobject]@{ State = 'Accessible'; Items = @($items) }
 }
-$bridgeBindings = Observed {
-    [pscustomobject]@{ State = 'Accessible'; Items = @(
-        Get-NetAdapterBinding -Name '*' -IncludeHidden -AllBindings -ComponentID ms_bridge -ErrorAction Stop |
-            Select-Object Name,Enabled,ComponentID
-    ) }
-}
+$bridgeBindings = Get-ChildStreamBridgeBindingObservation -Adapters $adapters -Addresses $network.IpAddresses -Routes $network.Routes
 $ipForwarding = Observed {
     [pscustomobject]@{ State = 'Accessible'; Items = @(
         Get-NetIPInterface -PolicyStore ActiveStore -IncludeAllCompartments -ErrorAction Stop |
@@ -235,6 +230,12 @@ $fingerprint = Get-ChildStreamBoundaryFingerprint -Observation $observation
 $observation.CurrentNetworkFingerprint = $fingerprint
 $report = Get-ChildStreamNetworkBoundaryDiagnostic -Observation $observation
 $report | Add-Member -NotePropertyName CurrentNetworkFingerprint -NotePropertyValue $fingerprint
+$report | Add-Member -NotePropertyName BridgeBindingDiagnostic -NotePropertyValue ([pscustomobject]@{
+    QueryMode = $bridgeBindings.QueryMode
+    QueriedCount = @($bridgeBindings.Queried).Count
+    FailureCount = @($bridgeBindings.Failures).Count
+    Failures = @($bridgeBindings.Failures)
+})
 $report | Add-Member -NotePropertyName Collection -NotePropertyValue ([pscustomobject]@{
     Inventory = if ($null -ne $inventory.Schema) { 'Accessible' } else { 'Inaccessible' }
     HyperVSwitches = $switches.State; HyperVVirtualMachines = $vms.State
