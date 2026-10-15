@@ -518,18 +518,41 @@ internal static class ProbeActiveX
             ((IProbeRdpExtendedSettings)box.Ocx).put_Property("ConnectToChildSession", ref child);
             ocx.Connect(); // asynchronous: a successful return is not authentication evidence
             DateTime deadline = DateTime.UtcNow.AddSeconds(45);
-            while (DateTime.UtcNow < deadline && (int)ocx.Connected == 0)
-            { Application.DoEvents(); System.Threading.Thread.Sleep(100); }
-            uint id;
-            if ((int)ocx.Connected != 0 && native.GetChildId(out id) && id != uint.MaxValue)
+            ProbeConnectionResult observed = null;
+            while (DateTime.UtcNow < deadline && !form.IsDisposed)
             {
-                long? generation = native.LogonTime(id);
-                if (generation.HasValue)
-                    return new ProbeConnectionResult { Outcome = ProbeConnectOutcome.AutomaticLogon,
-                        Identity = new ChildSessionIdentity(id, generation.Value) };
+                Application.DoEvents();
+                if (form.IsDisposed) break;
+                if ((int)ocx.Connected == 1)
+                {
+                    uint id;
+                    if (native.GetChildId(out id) && id != uint.MaxValue)
+                    {
+                        long? generation = native.LogonTime(id);
+                        if (generation.HasValue && generation.Value > 0)
+                        {
+                            observed = new ProbeConnectionResult { Outcome = ProbeConnectOutcome.AutomaticLogon,
+                                Identity = new ChildSessionIdentity(id, generation.Value) };
+                            break;
+                        }
+                    }
+                }
+                System.Threading.Thread.Sleep(100);
             }
-            return new ProbeConnectionResult { Outcome = ProbeConnectOutcome.Unknown,
-                ErrorCode = native.LastError };
+            if (observed == null)
+                return new ProbeConnectionResult { Outcome = ProbeConnectOutcome.Unknown,
+                    ErrorCode = native.LastError };
+
+            // Keep the authenticated viewer alive for the operator's independent
+            // desktop and focus checks. Closing this window disconnects the viewer;
+            // it does not sign out the child. The probe journals the observed
+            // identity only after the window closes and the host is rechecked.
+            if (!form.IsDisposed)
+            {
+                form.Text = "ChildStream test viewer - close after interaction checks";
+                Application.Run(form);
+            }
+            return observed;
         }
     }
 }

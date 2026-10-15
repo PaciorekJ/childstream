@@ -13,6 +13,7 @@ internal static class FeasibilityProbeTests
             FailLogoffAfterChild, CredentialPrompt, LoseNetworkAfterFeature, StartRdpAfterFeature,
             LoseBoundaryAfterFeature, FailBoundaryCapture;
         internal int FeatureWrites, Connections, Logoffs;
+        internal Action OnConnectionAttempt;
         internal ChildSessionIdentity TestChild = new ChildSessionIdentity(31, 200);
         public bool HasAdministratorPrivilege { get { return Admin; } }
         public ProbeSnapshot Capture() { return Clone(State); }
@@ -46,6 +47,7 @@ internal static class FeasibilityProbeTests
         }
         public ProbeConnectionResult ConnectWithoutPassword()
         {
+            if (OnConnectionAttempt != null) OnConnectionAttempt();
             Connections++; State.ChildAccess = ResourceAccess.Accessible; State.AssociatedChild = TestChild;
             if (FailConnectAfterChild) throw new IOException("After connection");
             return new ProbeConnectionResult { Outcome = CredentialPrompt ? ProbeConnectOutcome.CredentialPrompt : ProbeConnectOutcome.AutomaticLogon,
@@ -226,6 +228,19 @@ internal static class FeasibilityProbeTests
 
     private static void FreshLogonAndConnection()
     {
+        using (var f = new Fixture())
+        {
+            f.Ready();
+            f.Host.OnConnectionAttempt = () =>
+            {
+                ProbeJournal pending = f.Store.Load();
+                Check(pending.Stage == ProbeStage.Connecting && pending.ConnectionAttempted &&
+                    !pending.PositiveChild.HasValue,
+                    "connection remains durably pending during viewer interaction");
+            };
+            Check(f.Probe.ConnectOnce().Stage == ProbeStage.Connected,
+                "observed child is committed only after viewer returns");
+        }
         using (var f = new Fixture())
         {
             f.Begin(); f.Probe.PrepareFeature();
