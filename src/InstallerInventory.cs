@@ -140,7 +140,7 @@ internal interface IExecutableSignerVerifier
 // before extraction into the dedicated portable root. No network call occurs here.
 internal sealed class PortableSunshinePackage
 {
-    internal string Version, SourceUrl, Sha256, ExecutableSignerThumbprint, PortableRoot, ConfigRoot;
+    internal string Version, SourceUrl, Sha256, ExecutableSha256, ExecutableSignerThumbprint, PortableRoot, ConfigRoot;
 
     internal void Validate(string ownedRoot)
     {
@@ -153,8 +153,10 @@ internal sealed class PortableSunshinePackage
             uri.Query.Length != 0 || uri.Fragment.Length != 0)
             throw new InvalidDataException("Sunshine source must be an exact official versioned release URL.");
         if (Sha256 == null || Sha256.Length != 64 || !IsHex(Sha256) ||
-            ExecutableSignerThumbprint == null || ExecutableSignerThumbprint.Length < 40 || !IsHex(ExecutableSignerThumbprint))
-            throw new InvalidDataException("Package digest and signer pin are required.");
+            ((ExecutableSignerThumbprint == null || ExecutableSignerThumbprint.Length < 40 ||
+              !IsHex(ExecutableSignerThumbprint)) &&
+             (ExecutableSha256 == null || ExecutableSha256.Length != 64 || !IsHex(ExecutableSha256))))
+            throw new InvalidDataException("Package digest and executable signer or digest pin are required.");
         string root = Path.GetFullPath(ownedRoot).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
         string portable = InstallerPolicy.ValidateCanonicalFilePath(PortableRoot, true).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
         string config = InstallerPolicy.ValidateCanonicalFilePath(ConfigRoot, true).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
@@ -179,7 +181,8 @@ internal sealed class PortableSunshinePackage
 
     internal FileStream Admit(string packagePath, IPackageProvenanceVerifier verifier)
     {
-        var package = new FileStream(packagePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        InstallerPolicy.ValidateCanonicalFilePath(packagePath);
+        var package = new FileStream(packagePath, FileMode.Open, FileAccess.Read, FileShare.None);
         try
         {
             VerifyBytes(package);
@@ -196,9 +199,21 @@ internal sealed class PortableSunshinePackage
     internal void VerifyExtractedExecutable(string executablePath, IExecutableSignerVerifier verifier)
     {
         string root = InstallerPolicy.ValidateCanonicalFilePath(PortableRoot, true).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        if (!InstallerPolicy.ValidateCanonicalFilePath(executablePath).StartsWith(root, StringComparison.OrdinalIgnoreCase) ||
-            verifier == null || !verifier.VerifyTrustedExecutable(executablePath, ExecutableSignerThumbprint))
-            throw new InvalidDataException("Portable Sunshine executable signer or scope verification failed.");
+        if (!InstallerPolicy.ValidateCanonicalFilePath(executablePath).StartsWith(root, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("Portable Sunshine executable is outside the owned root.");
+        if (!String.IsNullOrEmpty(ExecutableSha256))
+        {
+            using (var file = new FileStream(executablePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+            using (var sha = SHA256.Create())
+            {
+                string actual = BitConverter.ToString(sha.ComputeHash(file)).Replace("-", "").ToLowerInvariant();
+                if (!String.Equals(actual, ExecutableSha256, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("Portable Sunshine executable digest mismatch.");
+            }
+        }
+        if (!String.IsNullOrEmpty(ExecutableSignerThumbprint) &&
+            (verifier == null || !verifier.VerifyTrustedExecutable(executablePath, ExecutableSignerThumbprint)))
+            throw new InvalidDataException("Portable Sunshine executable signer verification failed.");
     }
 
     private static bool IsHex(string value)

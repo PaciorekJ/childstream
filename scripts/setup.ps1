@@ -20,4 +20,4 @@ if ($Mode -eq 'Validate') {
     return
 }
 
-throw "ChildStream $Mode is blocked: the transaction engine is offline-tested, but no Windows mutation adapter or live rollback validation exists. See docs/installer-foundation.md and docs/live-acceptance.md. No host changes were made."
+throw "ChildStream $Mode is blocked: the owned-file and archive adapters are candidate source only. Child bootstrap, streaming posture and live rollback acceptance remain unverified. See docs/product-integration.md and docs/live-acceptance.md. No host changes were made."
