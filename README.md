@@ -27,7 +27,7 @@ An explicit **End session** action checks the parent-associated child ID and its
 - `src/SessionSignOutGuard.cs`: durable, credential-free sign-out intent and explicit absence reconciliation.
 - `src/LegacyCredentialCleanup.cs`: explicit, path-scoped legacy credential cleanup.
 - `src/InstallerFoundation.cs` and `src/InstallerInventory.cs`: offline transaction engine, typed inventory, and portable package admission contracts.
-- `src/PortableSunshine.cs`, `src/PortableExtractionTransaction.cs`, `src/ProductIntegration.cs`, `src/ProductAcceptance.cs`, and `src/WindowsOwnedInstallerHost.cs`: pinned Sunshine package, exact-child configuration and process/collision guards, archive and owned-file recovery candidates, and physical acceptance gates.
+- `src/PortableSunshine.cs`, `src/PortableExtractionTransaction.cs`, `src/ProductIntegration.cs`, `src/WindowsAudioEndpoints.cs`, `src/ProductAcceptance.cs`, and `src/WindowsOwnedInstallerHost.cs`: pinned Sunshine package, exact-child configuration, process/collision and audio selection guards, archive and owned-file recovery candidates, and physical acceptance gates.
 - `scripts/build-candidate.ps1`: repeatable unsigned, uninstalled candidate package with source and file hashes; no Sunshine binary or hardware acceptance claim.
 - `src/FeasibilityProbe.cs`, `src/WindowsFeasibilityHost.cs`, and `src/FeasibilityProbeProgram.cs`: gated one-session experiment, narrow Windows adapter, and console commands; live execution requires separate approval.
 - `scripts/feasibility-inventory.ps1`: read-only, typed Windows 11 Pro feasibility inventory.

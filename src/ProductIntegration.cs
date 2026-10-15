@@ -16,7 +16,8 @@ internal sealed class ChildProductOptions
     internal uint ParentSessionId;
     internal ChildSessionIdentity Child;
     internal string OwnedInstallationRoot, OwnedRoot, DisplayDeviceId, AudioEndpointId;
-    internal bool DisplayActiveInChild, AudioEndpointVisibleInChild, ViGEmBusPresent;
+    internal bool DisplayActiveInChild, ViGEmBusPresent;
+    internal ChildAudioEndpointInventory AudioInventory;
     internal CaptureBackend Capture;
     internal int Port = 47989;
     internal string BindAddress = "127.0.0.1";
@@ -57,9 +58,11 @@ internal static class ChildProductConfiguration
         Guid displayGuid;
         if (!option.DisplayActiveInChild || !Guid.TryParse(SafeValue(option.DisplayDeviceId, "Child display"), out displayGuid))
             throw new InvalidDataException("An active, child-observed Sunshine display GUID is required.");
-        if (!option.AudioEndpointVisibleInChild)
-            throw new InvalidDataException("The selected audio endpoint is not observed in the child session.");
         SafeValue(option.AudioEndpointId, "Child audio endpoint");
+        if (option.AudioInventory == null || !option.AudioInventory.Complete ||
+            option.AudioInventory.SessionId != option.Child.SessionId ||
+            !option.AudioInventory.ActiveRenderIds.Contains(option.AudioEndpointId))
+            throw new InvalidDataException("The selected audio endpoint is not independently observed in the child session.");
         if (option.BindAddress != "127.0.0.1")
             throw new InvalidDataException("Non-loopback streaming requires a separately validated LAN security posture.");
         if (option.Port != 47989)
@@ -132,11 +135,19 @@ internal sealed class ChildOwnedProcess
     internal ProductProcessIdentity Identity { get { return owned; } }
 
     internal ChildOwnedProcess(IProductProcessHost host, ChildSessionIdentity child, string executable, string digest)
-    { this.host = host; this.child = child; this.executable = Path.GetFullPath(executable); this.digest = digest; }
+    {
+        if (host == null || child.SessionId == 0 || child.SessionId == uint.MaxValue || child.LogonTime <= 0 ||
+            String.IsNullOrWhiteSpace(executable) || !Path.IsPathRooted(executable) ||
+            String.IsNullOrEmpty(digest) || digest.Length != 64 ||
+            !System.Text.RegularExpressions.Regex.IsMatch(digest, "\\A[0-9a-fA-F]{64}\\z"))
+            throw new InvalidDataException("An exact child, absolute executable and SHA-256 digest are required.");
+        this.host = host; this.child = child; this.executable = Path.GetFullPath(executable); this.digest = digest;
+    }
 
     private bool Same(ProductProcessIdentity actual)
     {
-        return actual != null && actual.Pid == owned.Pid && actual.SessionId == (int)child.SessionId &&
+        return actual != null && owned != null && actual.Pid > 0 && actual.Pid == owned.Pid &&
+            actual.SessionId == (int)child.SessionId && owned.StartTimeUtcTicks > 0 &&
             actual.StartTimeUtcTicks == owned.StartTimeUtcTicks &&
             String.Equals(Path.GetFullPath(actual.ExecutablePath), executable, StringComparison.OrdinalIgnoreCase) &&
             String.Equals(actual.ExecutableSha256, digest, StringComparison.OrdinalIgnoreCase);
@@ -155,11 +166,27 @@ internal sealed class ChildOwnedProcess
         }
     }
 
+    internal void Attach(ProductProcessIdentity observed)
+    {
+        if (owned != null) throw new InvalidOperationException("This child-owned process already has an identity.");
+        if (host.CurrentSessionId != (int)child.SessionId || child.LogonTime <= 0 ||
+            observed == null || observed.Pid <= 0 || observed.StartTimeUtcTicks <= 0)
+            throw new InvalidOperationException("An exact child process observation is required.");
+        owned = observed;
+        bool matches;
+        try { matches = Same(host.Read(observed.Pid)); }
+        catch { owned = null; throw; }
+        if (!matches)
+        {
+            owned = null;
+            throw new InvalidOperationException("Observed process identity changed before attachment.");
+        }
+    }
+
     internal bool VerifyRunning()
     {
         if (owned == null) return false;
-        try { return Same(host.Read(owned.Pid)); }
-        catch { return false; }
+        return Same(host.Read(owned.Pid)); // inaccessible is not evidence of absence
     }
 
     internal void Stop(int gracefulTimeoutMs)
@@ -382,5 +409,91 @@ internal static class SteamChildPolicy
             return "An existing Steam instance may own the singleton or game session; no child launch is allowed.";
         if (childSteamRunning) return "The child already has Steam; reconcile its exact process identity before launch.";
         return null;
+    }
+}
+
+internal enum SteamChildStage { NotStarted, BigPictureStarted, GameRequested, GameObserved, GameEnded, Ended, Conflict }
+
+internal sealed class SteamChildRuntime
+{
+    private readonly IProductProcessHost host;
+    private readonly ChildSessionIdentity child;
+    private readonly string steamPath, steamDigest, gamePath, gameDigest;
+    private ChildOwnedProcess steam, game;
+    internal SteamChildStage Stage { get; private set; }
+    internal string Failure { get; private set; }
+
+    internal SteamChildRuntime(IProductProcessHost host, ChildSessionIdentity child,
+        string steamPath, string steamDigest, string gamePath, string gameDigest)
+    {
+        this.host = host; this.child = child;
+        this.steamPath = Path.GetFullPath(steamPath); this.steamDigest = steamDigest;
+        this.gamePath = Path.GetFullPath(gamePath); this.gameDigest = gameDigest;
+        Stage = SteamChildStage.NotStarted;
+    }
+
+    internal void StartBigPicture(bool observationComplete, bool parentSteam,
+        bool unrelatedSteam, bool childSteam)
+    {
+        if (Stage != SteamChildStage.NotStarted)
+            throw new InvalidOperationException("Steam has already been started or has an unresolved outcome.");
+        string conflict = SteamChildPolicy.Check(observationComplete, parentSteam, unrelatedSteam, childSteam);
+        if (conflict != null) throw new InvalidOperationException(conflict);
+        steam = new ChildOwnedProcess(host, child, steamPath, steamDigest);
+        try
+        {
+            steam.Start("-bigpicture");
+            if (!steam.VerifyRunning()) throw new InvalidOperationException("The child Steam process is not running.");
+            Stage = SteamChildStage.BigPictureStarted;
+        }
+        catch (Exception ex) { Failure = ex.Message; Stage = SteamChildStage.Conflict; throw; }
+    }
+
+    internal void RequestMinecraftDungeons(bool observationComplete, bool parentSteam,
+        bool unrelatedSteam)
+    {
+        if (Stage != SteamChildStage.BigPictureStarted || steam == null || !steam.VerifyRunning())
+            throw new InvalidOperationException("Verified child Steam is required before game launch.");
+        if (!observationComplete || parentSteam || unrelatedSteam)
+            throw new InvalidOperationException("Steam process ownership changed before the game request.");
+        // Steam may hand this request to an existing singleton. A returned
+        // steam.exe PID is not proof that the game started or belongs to child.
+        Stage = SteamChildStage.GameRequested;
+        try
+        {
+            ProductProcessIdentity request = host.Start(steamPath,
+                "-applaunch " + SteamChildPolicy.MinecraftDungeonsAppId, Path.GetDirectoryName(steamPath));
+            if (request == null || request.SessionId != (int)child.SessionId ||
+                !String.Equals(Path.GetFullPath(request.ExecutablePath), steamPath, StringComparison.OrdinalIgnoreCase) ||
+                !String.Equals(request.ExecutableSha256, steamDigest, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("Steam launch request was not owned by the child session.");
+        }
+        catch (Exception ex) { Failure = ex.Message; Stage = SteamChildStage.Conflict; throw; }
+    }
+
+    internal void ObserveGame(ProductProcessIdentity observed)
+    {
+        if (Stage != SteamChildStage.GameRequested)
+            throw new InvalidOperationException("No child game launch request is pending.");
+        game = new ChildOwnedProcess(host, child, gamePath, gameDigest);
+        try { game.Attach(observed); Stage = SteamChildStage.GameObserved; }
+        catch (Exception ex) { game = null; Failure = ex.Message; Stage = SteamChildStage.Conflict; throw; }
+    }
+
+    internal void StopGame(int timeoutMs)
+    {
+        if (Stage != SteamChildStage.GameObserved || game == null)
+            throw new InvalidOperationException("No exact owned child game was observed.");
+        try { game.Stop(timeoutMs); Stage = SteamChildStage.GameEnded; }
+        catch (Exception ex) { Failure = ex.Message; Stage = SteamChildStage.Conflict; throw; }
+    }
+
+    internal void StopSteam(int timeoutMs)
+    {
+        if (steam == null || (Stage != SteamChildStage.BigPictureStarted &&
+            Stage != SteamChildStage.GameEnded))
+            throw new InvalidOperationException("Steam cannot stop until the child game outcome is resolved.");
+        try { steam.Stop(timeoutMs); Stage = SteamChildStage.Ended; }
+        catch (Exception ex) { Failure = ex.Message; Stage = SteamChildStage.Conflict; throw; }
     }
 }

@@ -7,6 +7,9 @@ using System.Text;
 internal static class ProductIntegrationTests
 {
     private static int assertions;
+    private static readonly string SunshineDigest = new string('a', 64);
+    private static readonly string SteamDigest = new string('b', 64);
+    private static readonly string GameDigest = new string('c', 64);
     private static void Check(bool truth, string label)
     { assertions++; if (!truth) throw new Exception(label); }
     private static void Reject(Action action, string label)
@@ -18,9 +21,11 @@ internal static class ProductIntegrationTests
     {
         internal ProductProcessIdentity Current;
         internal bool CloseCalled, KillCalled, Exit;
+        internal string LastArguments;
         public int CurrentSessionId { get; set; }
         public ProductProcessIdentity Read(int pid) { return Current; }
-        public ProductProcessIdentity Start(string path, string args, string dir) { return Current; }
+        public ProductProcessIdentity Start(string path, string args, string dir)
+        { LastArguments = args; return Current; }
         public bool RequestClose(int pid) { CloseCalled = true; return true; }
         public bool WaitForExit(int pid, int ms) { return Exit; }
         public void Kill(int pid) { KillCalled = true; Exit = true; }
@@ -39,11 +44,13 @@ internal static class ProductIntegrationTests
     private static void Configuration(string root)
     {
         string installed = Path.Combine(root, "ChildStream");
+        var audio = new ChildAudioEndpointInventory { SessionId = 2, Complete = true };
+        audio.ActiveRenderIds.Add("{audio-endpoint}");
         var option = new ChildProductOptions { ParentSessionId = 1, Child = new ChildSessionIdentity(2, 123),
             OwnedInstallationRoot = installed, OwnedRoot = Path.Combine(installed, "sessions", "2-123"),
             DisplayDeviceId = Guid.NewGuid().ToString(),
             AudioEndpointId = "{audio-endpoint}", DisplayActiveInChild = true,
-            AudioEndpointVisibleInChild = true, Capture = CaptureBackend.WindowsGraphicsCapture };
+            AudioInventory = audio, Capture = CaptureBackend.WindowsGraphicsCapture };
         string config = ChildProductConfiguration.BuildSunshine(option);
         Check(config.Contains("bind_address = 127.0.0.1") && config.Contains("upnp = disabled") &&
             config.Contains("origin_web_ui_allowed = pc"), "loopback-only posture");
@@ -61,7 +68,11 @@ internal static class ProductIntegrationTests
         Reject(() => ChildProductConfiguration.BuildSunshine(option), "unverified port offset blocked");
         option.Port = 47989; option.AudioEndpointId = "bad\ninjection = enabled";
         Reject(() => ChildProductConfiguration.BuildSunshine(option), "config injection blocked");
-        option.AudioEndpointId = "{audio-endpoint}"; option.DisplayActiveInChild = false;
+        option.AudioEndpointId = "{audio-endpoint}"; audio.Complete = false;
+        Reject(() => ChildProductConfiguration.BuildSunshine(option), "incomplete child audio inventory blocked");
+        audio.Complete = true; audio.SessionId = 1;
+        Reject(() => ChildProductConfiguration.BuildSunshine(option), "parent audio inventory cannot qualify child");
+        audio.SessionId = 2; option.DisplayActiveInChild = false;
         Reject(() => ChildProductConfiguration.BuildSunshine(option), "parent or inactive display rejected");
         option.DisplayActiveInChild = true; option.Child = new ChildSessionIdentity(1, 123);
         Reject(() => ChildProductConfiguration.BuildSunshine(option), "parent session cannot be child");
@@ -75,12 +86,14 @@ internal static class ProductIntegrationTests
         string path = Path.Combine(root, "sunshine.exe");
         var fake = new FakeProcesses { CurrentSessionId = 2,
             Current = new ProductProcessIdentity { Pid = 42, SessionId = 2, StartTimeUtcTicks = 123,
-                ExecutablePath = path, ExecutableSha256 = "hash" } };
-        var owned = new ChildOwnedProcess(fake, new ChildSessionIdentity(2, 123), path, "hash");
+                ExecutablePath = path, ExecutableSha256 = SunshineDigest } };
+        Reject(() => new ChildOwnedProcess(fake, new ChildSessionIdentity(2, 123), path, "hash"),
+            "non-digest process pin rejected");
+        var owned = new ChildOwnedProcess(fake, new ChildSessionIdentity(2, 123), path, SunshineDigest);
         owned.Start("config");
         Check(owned.VerifyRunning(), "owned child process verified");
         fake.Current = new ProductProcessIdentity { Pid = 42, SessionId = 1, StartTimeUtcTicks = 123,
-            ExecutablePath = path, ExecutableSha256 = "hash" };
+            ExecutablePath = path, ExecutableSha256 = SunshineDigest };
         Check(!owned.VerifyRunning(), "session drift detected");
         Reject(() => owned.Stop(100), "unrelated process preserved");
         Check(!fake.KillCalled && !fake.CloseCalled, "no stop attempted on wrong session");
@@ -90,7 +103,7 @@ internal static class ProductIntegrationTests
         owned.Stop(100);
         Check(fake.CloseCalled && fake.KillCalled, "owned process graceful then bounded termination");
         fake.CurrentSessionId = 1;
-        Reject(() => new ChildOwnedProcess(fake, new ChildSessionIdentity(2, 123), path, "hash").Start(""),
+        Reject(() => new ChildOwnedProcess(fake, new ChildSessionIdentity(2, 123), path, SunshineDigest).Start(""),
             "parent cannot launch child-owned process");
     }
 
@@ -283,6 +296,48 @@ internal static class ProductIntegrationTests
             "fully populated physical-evidence model satisfies deterministic gates only");
     }
 
+    private static void Steam(string root)
+    {
+        string steamPath = Path.Combine(root, "steam.exe");
+        string gamePath = Path.Combine(root, "game.exe");
+        var fake = new FakeProcesses { CurrentSessionId = 2,
+            Current = new ProductProcessIdentity { Pid = 21, SessionId = 2,
+                StartTimeUtcTicks = 10, ExecutablePath = steamPath, ExecutableSha256 = SteamDigest } };
+        var runtime = new SteamChildRuntime(fake, new ChildSessionIdentity(2, 123),
+            steamPath, SteamDigest, gamePath, GameDigest);
+        Reject(() => runtime.StartBigPicture(true, true, false, false), "parent Steam preserved");
+        runtime.StartBigPicture(true, false, false, false);
+        Check(runtime.Stage == SteamChildStage.BigPictureStarted && fake.LastArguments == "-bigpicture",
+            "Steam Big Picture starts only in observed child");
+        Reject(() => runtime.RequestMinecraftDungeons(false, false, false), "unknown Steam ownership blocks game request");
+        runtime.RequestMinecraftDungeons(true, false, false);
+        Check(runtime.Stage == SteamChildStage.GameRequested &&
+            fake.LastArguments == "-applaunch 1672970", "game launch request uses exact app ID");
+        Reject(() => runtime.StopGame(100), "request is not game process evidence");
+        fake.Current = new ProductProcessIdentity { Pid = 31, SessionId = 1,
+            StartTimeUtcTicks = 11, ExecutablePath = gamePath, ExecutableSha256 = GameDigest };
+        Reject(() => runtime.ObserveGame(fake.Current), "parent game cannot be attached");
+        Check(runtime.Stage == SteamChildStage.Conflict, "wrong-session game ends in conflict");
+        fake.Current = new ProductProcessIdentity { Pid = 22, SessionId = 2,
+            StartTimeUtcTicks = 12, ExecutablePath = steamPath, ExecutableSha256 = SteamDigest };
+        runtime = new SteamChildRuntime(fake, new ChildSessionIdentity(2, 123),
+            steamPath, SteamDigest, gamePath, GameDigest);
+        runtime.StartBigPicture(true, false, false, false);
+        runtime.RequestMinecraftDungeons(true, false, false);
+        fake.Current = new ProductProcessIdentity { Pid = 32, SessionId = 2,
+            StartTimeUtcTicks = 13, ExecutablePath = gamePath, ExecutableSha256 = GameDigest };
+        runtime.ObserveGame(fake.Current);
+        Check(runtime.Stage == SteamChildStage.GameObserved, "exact child game observed");
+        Reject(() => runtime.StopSteam(100), "Steam cannot stop before running game");
+        runtime.StopGame(100);
+        Check(fake.CloseCalled && fake.KillCalled && runtime.Stage == SteamChildStage.GameEnded,
+            "only observed child game stopped");
+        fake.Current = new ProductProcessIdentity { Pid = 22, SessionId = 2,
+            StartTimeUtcTicks = 12, ExecutablePath = steamPath, ExecutableSha256 = SteamDigest };
+        runtime.StopSteam(100);
+        Check(runtime.Stage == SteamChildStage.Ended, "verified child Steam stopped after game");
+    }
+
     internal static int Main(string[] args)
     {
         string root = Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
@@ -290,7 +345,7 @@ internal static class ProductIntegrationTests
         try
         {
             Configuration(root); Processes(root); Archives(); Extraction(root); ExtractionRecovery(root);
-            Conflicts(); OwnedFileTransaction(root); Acceptance();
+            Conflicts(); OwnedFileTransaction(root); Acceptance(); Steam(root);
             if (args.Length == 1) PinnedArchive(args[0]);
             Console.WriteLine("Product integration offline assertions passed: " + assertions);
             return 0;
