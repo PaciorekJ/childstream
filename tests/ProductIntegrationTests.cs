@@ -23,6 +23,8 @@ internal static class ProductIntegrationTests
         internal bool CloseCalled, KillCalled, Exit;
         internal string LastArguments;
         public int CurrentSessionId { get; set; }
+        internal long? SessionLogonTime = 123;
+        public long? ReadSessionLogonTime(int sessionId) { return SessionLogonTime; }
         public ProductProcessIdentity Read(int pid) { return Current; }
         public ProductProcessIdentity Start(string path, string args, string dir)
         { LastArguments = args; return Current; }
@@ -100,11 +102,18 @@ internal static class ProductIntegrationTests
         fake.Current.SessionId = 2; fake.Current.StartTimeUtcTicks = 124;
         Reject(() => owned.Stop(100), "PID reuse preserved");
         fake.Current.StartTimeUtcTicks = 123;
+        fake.SessionLogonTime = 124;
+        Reject(() => owned.Stop(100), "child session generation drift preserves process");
+        Check(!fake.KillCalled && !fake.CloseCalled, "generation drift caused no stop");
+        fake.SessionLogonTime = 123;
         owned.Stop(100);
         Check(fake.CloseCalled && fake.KillCalled, "owned process graceful then bounded termination");
         fake.CurrentSessionId = 1;
         Reject(() => new ChildOwnedProcess(fake, new ChildSessionIdentity(2, 123), path, SunshineDigest).Start(""),
             "parent cannot launch child-owned process");
+        fake.CurrentSessionId = 2; fake.SessionLogonTime = null;
+        Reject(() => new ChildOwnedProcess(fake, new ChildSessionIdentity(2, 123), path, SunshineDigest).Start(""),
+            "unobserved child generation cannot launch process");
     }
 
     private static void Archives()

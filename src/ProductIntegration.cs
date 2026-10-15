@@ -7,6 +7,7 @@ using System.Management;
 using System.Security.Cryptography;
 using System.Text;
 using System.ServiceProcess;
+using System.Runtime.InteropServices;
 #pragma warning disable 0649 // Runtime observation records are populated by child-side adapters and tests.
 
 internal enum CaptureBackend { DesktopDuplication, WindowsGraphicsCapture }
@@ -117,6 +118,7 @@ internal sealed class ProductProcessIdentity
 internal interface IProductProcessHost
 {
     int CurrentSessionId { get; }
+    long? ReadSessionLogonTime(int sessionId);
     ProductProcessIdentity Read(int pid);
     ProductProcessIdentity Start(string executable, string arguments, string workingDirectory);
     bool RequestClose(int pid);
@@ -153,12 +155,19 @@ internal sealed class ChildOwnedProcess
             String.Equals(actual.ExecutableSha256, digest, StringComparison.OrdinalIgnoreCase);
     }
 
+    private void RequireExactChildGeneration()
+    {
+        if (host.CurrentSessionId != (int)child.SessionId ||
+            host.ReadSessionLogonTime((int)child.SessionId) != child.LogonTime)
+            throw new InvalidOperationException("The current process is not in the exact child logon generation.");
+    }
+
     internal void Start(string arguments)
     {
         if (owned != null) throw new InvalidOperationException("This child-owned process already has a start outcome.");
-        if (host.CurrentSessionId != (int)child.SessionId || child.LogonTime <= 0)
-            throw new InvalidOperationException("The process launcher is not running in the exact child session.");
+        RequireExactChildGeneration();
         owned = host.Start(executable, arguments, Path.GetDirectoryName(executable));
+        RequireExactChildGeneration();
         if (owned == null || !Same(owned))
         {
             Failure = "Started process identity or session did not match the approved child.";
@@ -169,12 +178,12 @@ internal sealed class ChildOwnedProcess
     internal void Attach(ProductProcessIdentity observed)
     {
         if (owned != null) throw new InvalidOperationException("This child-owned process already has an identity.");
-        if (host.CurrentSessionId != (int)child.SessionId || child.LogonTime <= 0 ||
-            observed == null || observed.Pid <= 0 || observed.StartTimeUtcTicks <= 0)
+        RequireExactChildGeneration();
+        if (observed == null || observed.Pid <= 0 || observed.StartTimeUtcTicks <= 0)
             throw new InvalidOperationException("An exact child process observation is required.");
         owned = observed;
         bool matches;
-        try { matches = Same(host.Read(observed.Pid)); }
+        try { matches = Same(host.Read(observed.Pid)); RequireExactChildGeneration(); }
         catch { owned = null; throw; }
         if (!matches)
         {
@@ -186,6 +195,7 @@ internal sealed class ChildOwnedProcess
     internal bool VerifyRunning()
     {
         if (owned == null) return false;
+        RequireExactChildGeneration();
         return Same(host.Read(owned.Pid)); // inaccessible is not evidence of absence
     }
 
@@ -193,11 +203,13 @@ internal sealed class ChildOwnedProcess
     {
         if (owned == null || gracefulTimeoutMs < 0 || gracefulTimeoutMs > 30000)
             throw new InvalidOperationException("No owned process or invalid shutdown timeout.");
+        RequireExactChildGeneration();
         ProductProcessIdentity current = host.Read(owned.Pid);
         if (current == null) return; // Verified absent. Inaccessible remains an error.
         if (!Same(current)) throw new InvalidOperationException("Process identity changed; refusing to stop an unrelated process.");
         host.RequestClose(owned.Pid);
         if (host.WaitForExit(owned.Pid, gracefulTimeoutMs)) return;
+        RequireExactChildGeneration();
         current = host.Read(owned.Pid);
         if (!Same(current)) throw new InvalidOperationException("Process changed during shutdown; refusing termination.");
         host.Kill(owned.Pid);
@@ -209,6 +221,36 @@ internal sealed class ChildOwnedProcess
 internal sealed class WindowsProductProcessHost : IProductProcessHost
 {
     public int CurrentSessionId { get { return Process.GetCurrentProcess().SessionId; } }
+
+    [DllImport("wtsapi32.dll", EntryPoint = "WTSQuerySessionInformationW", SetLastError = true)]
+    private static extern bool WtsQuery(IntPtr server, uint sessionId, int infoClass, out IntPtr data, out int bytes);
+    [DllImport("wtsapi32.dll")] private static extern void WTSFreeMemory(IntPtr data);
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct WtsLevel1
+    {
+        public uint SessionId; public int State; public int Flags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 33)] public string Station;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 21)] public string User;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 18)] public string Domain;
+        public long LogonTime;
+    }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct WtsInfoEx { public uint Level; public WtsLevel1 Data; }
+
+    public long? ReadSessionLogonTime(int sessionId)
+    {
+        if (sessionId <= 0) return null;
+        IntPtr data; int bytes;
+        if (!WtsQuery(IntPtr.Zero, (uint)sessionId, 25, out data, out bytes)) return null;
+        try
+        {
+            if (data == IntPtr.Zero || bytes < Marshal.SizeOf(typeof(WtsInfoEx))) return null;
+            WtsInfoEx info = (WtsInfoEx)Marshal.PtrToStructure(data, typeof(WtsInfoEx));
+            return info.Level == 1 && info.Data.SessionId == (uint)sessionId && info.Data.LogonTime > 0
+                ? (long?)info.Data.LogonTime : null;
+        }
+        finally { if (data != IntPtr.Zero) WTSFreeMemory(data); }
+    }
 
     public ProductProcessIdentity Read(int pid)
     {
