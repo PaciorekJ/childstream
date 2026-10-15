@@ -66,24 +66,38 @@ internal sealed class ProbeNative : IProbeNative
 }
 
 internal interface IProbeInventory { string ReadJson(); }
-internal sealed class ScriptProbeInventory : IProbeInventory
+internal interface IProbeBoundaryInventory { string ReadBoundaryJson(bool operatorConfirmedPhysicalSeverance); }
+internal sealed class ScriptProbeInventory : IProbeInventory, IProbeBoundaryInventory
 {
     private readonly string script;
     internal ScriptProbeInventory(string scriptPath) { script = Path.GetFullPath(scriptPath); }
-    public string ReadJson()
+    private static string Run(string path, string arguments, string description)
     {
-        if (!File.Exists(script)) throw new FileNotFoundException("Reviewed inventory script is missing.", script);
-        var start = new ProcessStartInfo("pwsh.exe", "-NoProfile -NonInteractive -File \"" + script + "\"")
+        if (!File.Exists(path)) throw new FileNotFoundException("Reviewed read-only script is missing.", path);
+        var start = new ProcessStartInfo("pwsh.exe", "-NoProfile -NonInteractive -File \"" + path + "\"" + arguments)
         { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
         using (Process process = Process.Start(start))
         {
             var errorRead = process.StandardError.ReadToEndAsync();
-            string output = process.StandardOutput.ReadToEnd();
-            if (!process.WaitForExit(180000)) { process.Kill(); throw new TimeoutException("Read-only inventory timed out."); }
-            if (process.ExitCode != 0) throw new InvalidOperationException("Read-only inventory failed: " + errorRead.Result);
-            if (output.Length > 4 * 1024 * 1024) throw new InvalidDataException("Inventory exceeds size limit.");
+            var outputRead = process.StandardOutput.ReadToEndAsync();
+            if (!process.WaitForExit(180000))
+            {
+                try { process.Kill(); } catch (InvalidOperationException) { }
+                throw new TimeoutException(description + " timed out.");
+            }
+            string output = outputRead.GetAwaiter().GetResult();
+            if (process.ExitCode != 0) throw new InvalidOperationException(description + " failed: " + errorRead.GetAwaiter().GetResult());
+            if (output.Length > 8 * 1024 * 1024) throw new InvalidDataException(description + " exceeds size limit.");
             return output;
         }
+    }
+    public string ReadJson() { return Run(script, "", "Read-only inventory"); }
+    public string ReadBoundaryJson(bool operatorConfirmedPhysicalSeverance)
+    {
+        string boundary = Path.Combine(Path.GetDirectoryName(script), "network-boundary-diagnostic.ps1");
+        return Run(boundary, " -IncludeInventory" +
+            (operatorConfirmedPhysicalSeverance ? " -OperatorConfirmedPhysicalSeverance" : ""),
+            "Read-only boundary capture");
     }
 }
 
@@ -129,6 +143,139 @@ internal sealed class WindowsFeasibilityHost : IFeasibilityHost
     }
     private static string Digest(object value)
     { return ProbeCodec.Hash(Encoding.UTF8.GetBytes(Canonical(value))); }
+
+    internal static ProbeSnapshot ParseBoundaryCapture(string json)
+    {
+        var parser = new JavaScriptSerializer { MaxJsonLength = 8 * 1024 * 1024 };
+        object capture = parser.DeserializeObject(json);
+        if (Str(At(capture, "Schema")) != "ChildStream.BoundaryCapture.v1" ||
+            !(At(capture, "HostMutation") is bool) || (bool)At(capture, "HostMutation"))
+            throw new InvalidDataException("Unexpected boundary capture schema or mutation marker.");
+        object original = At(capture, "Inventory"), boundary = At(capture, "Boundary"),
+            observation = At(capture, "Observation");
+        if (original == null || boundary == null || observation == null ||
+            Str(At(boundary, "Schema")) != "ChildStream.NetworkBoundaryDiagnostic.v1" ||
+            !(At(boundary, "HostMutation") is bool) || (bool)At(boundary, "HostMutation") ||
+            !(At(boundary, "DiagnosticOnly") is bool) || !(bool)At(boundary, "DiagnosticOnly") ||
+            !(At(boundary, "StageAPlanAuthorized") is bool) || (bool)At(boundary, "StageAPlanAuthorized"))
+            throw new InvalidDataException("Boundary diagnostic provenance is incomplete.");
+
+        string[] requiredSources = { "Inventory", "HyperVSwitches", "HyperVVirtualMachines",
+            "HyperVHostPorts", "HyperVVmPorts", "Wsl", "Docker", "Hns", "HnsEndpoints",
+            "NetNat", "PortProxy", "BridgeBindings", "IpForwarding", "DockerProcesses" };
+        object collection = At(boundary, "Collection");
+        bool collectionComplete = requiredSources.All(name => Str(At(collection, name)) == "Accessible");
+        object bridge = At(boundary, "BridgeBindingDiagnostic");
+        object[] adapters = Items(At(observation, "Adapters"));
+        var pathIndices = new HashSet<long>(Items(At(observation, "IpAddresses"))
+            .Concat(Items(At(observation, "Routes"))).Select(x => Num(At(x, "InterfaceIndex"))));
+        var relevant = new HashSet<long>();
+        bool relevantIdentified = adapters.Length > 0 &&
+            adapters.Select(x => Num(At(x, "InterfaceIndex"))).Distinct().Count() == adapters.Length;
+        foreach (object adapter in adapters)
+        {
+            long index = Num(At(adapter, "InterfaceIndex"));
+            if (index < 1) { relevantIdentified = false; continue; }
+            if (At(adapter, "HardwareInterface") is bool && (bool)At(adapter, "HardwareInterface") ||
+                Str(At(adapter, "Status")) == "Up" || pathIndices.Contains(index))
+                if (!relevant.Add(index)) relevantIdentified = false;
+        }
+        object bridgeObservation = At(observation, "BridgeBindings");
+        object[] queried = At(bridgeObservation, "Queried") as object[];
+        object[] failures = At(bridgeObservation, "Failures") as object[];
+        var queriedIndices = queried == null ? new long[0] : queried.Select(x => Num(At(x, "InterfaceIndex"))).ToArray();
+        bool bridgeComplete = relevantIdentified && relevant.Count > 0 &&
+            Str(At(bridge, "QueryMode")) == "PerRelevantAdapter" &&
+            Str(At(bridgeObservation, "QueryMode")) == "PerRelevantAdapter" &&
+            Num(At(bridge, "QueriedCount")) == relevant.Count &&
+            Num(At(bridge, "FailureCount")) == 0 &&
+            queried != null && failures != null && failures.Length == 0 &&
+            queriedIndices.Length == relevant.Count && queriedIndices.Distinct().Count() == relevant.Count &&
+            queriedIndices.All(relevant.Contains);
+
+        object conditions = At(boundary, "Conditions");
+        string[] requiredPredicates = { "network-inventory-complete", "physical-uplinks-down",
+            "physical-severance-confirmed", "switches-have-no-external-bridge",
+            "physical-route-link-corroboration", "hyperv-host-port-graph",
+            "virtual-paths-attributed", "nat-bridge-forwarding-mapped",
+            "hns-endpoints-quiescent", "hns-endpoint-network-graph",
+            "internal-guests-quiescent", "docker-host-forwarding-absent",
+            "rdp-baseline-closed", "guest-to-host-rdp-exposure-excluded",
+            "fresh-logon-network-unchanged" };
+        object[] predicates = At(boundary, "Predicates") as object[];
+        if (predicates == null || predicates.Length != requiredPredicates.Length ||
+            predicates.Select(x => Str(At(x, "Id"))).Distinct(StringComparer.Ordinal).Count() != requiredPredicates.Length ||
+            requiredPredicates.Any(id => predicates.Count(x => Str(At(x, "Id")) == id &&
+                new[] { "Pass", "Fail", "Unknown" }.Contains(Str(At(x, "Verdict")))) != 1) ||
+            requiredPredicates.Select((id, index) => new { id, index }).Any(required =>
+                Str(At(predicates.Single(x => Str(At(x, "Id")) == required.id), "Condition")) !=
+                (required.index < 8 ? "External" : required.index < 12 ? "GuestPath" :
+                 required.index < 14 ? "RdpExposure" : "Continuity")))
+            throw new InvalidDataException("Boundary predicate coverage is incomplete.");
+
+        bool externalAndGuestPass = Str(At(conditions, "External")) == "Pass" &&
+            Str(At(conditions, "GuestPath")) == "Pass" &&
+            predicates.Where(x => Str(At(x, "Condition")) == "External" ||
+                Str(At(x, "Condition")) == "GuestPath").All(x => Str(At(x, "Verdict")) == "Pass");
+        if (Str(At(conditions, "Continuity")) != "Unknown" ||
+            predicates.Count(x => Str(At(x, "Id")) == "fresh-logon-network-unchanged" &&
+                Str(At(x, "Verdict")) == "Unknown") != 1)
+            throw new InvalidDataException("Boundary continuity capture is inconsistent.");
+
+        object network = At(original, "Network");
+        object[] originalAdapters = Items(At(network, "Adapters"));
+        Func<object, string> adapterState = entry => Num(At(entry, "InterfaceIndex")) + "|" +
+            Str(At(entry, "Status")) + "|" + Str(At(entry, "MediaConnectionState"));
+        if (network == null || At(original, "Rdp") == null ||
+            !Is(At(network, "Adapters"), "Accessible") ||
+            !Is(At(network, "IpInterfaces"), "Accessible") ||
+            !Is(At(network, "IpAddresses"), "Accessible") ||
+            !Is(At(network, "Routes"), "Accessible") ||
+            originalAdapters.Length != adapters.Length ||
+            !originalAdapters.Select(adapterState).OrderBy(x => x, StringComparer.Ordinal)
+                .SequenceEqual(adapters.Select(adapterState).OrderBy(x => x, StringComparer.Ordinal)) ||
+            Canonical(At(observation, "IpInterfaces")) != Canonical(At(network, "IpInterfaces")) ||
+            Canonical(At(observation, "IpAddresses")) != Canonical(At(network, "IpAddresses")) ||
+            Canonical(At(observation, "Routes")) != Canonical(At(network, "Routes")) ||
+            Canonical(At(observation, "RdpEvidence")) != Canonical(At(original, "Rdp")))
+            throw new InvalidDataException("Boundary observation does not match its Windows inventory.");
+        string[] observedSources = { "Adapters", "IpInterfaces", "IpAddresses", "Routes", "Switches",
+            "HostPorts", "VirtualMachines", "VmPorts", "Hns", "HnsEndpoints", "NetNat", "PortProxy",
+            "BridgeBindings", "IpForwarding", "Wsl", "Docker", "DockerProcesses", "Rdp" };
+        bool observedComplete = observedSources.All(name => Str(At(At(observation, name), "State")) == "Accessible");
+        string reported = Str(At(boundary, "CurrentNetworkFingerprint"));
+        bool fingerprintComplete = !String.IsNullOrEmpty(reported) && reported.Length == 64 &&
+            reported.All(c => c >= '0' && c <= '9' || c >= 'a' && c <= 'f') &&
+            reported == Str(At(observation, "CurrentNetworkFingerprint"));
+
+        ProbeSnapshot snapshot = ParseInventory(parser.Serialize(original));
+        object observedRdp = At(observation, "Rdp");
+        if (!(At(observedRdp, "PolicyDenied") is bool) ||
+            (bool)At(observedRdp, "PolicyDenied") != snapshot.RdpPolicyDenied ||
+            !(At(observedRdp, "TermServiceStopped") is bool) ||
+            (bool)At(observedRdp, "TermServiceStopped") != snapshot.TermServiceStopped ||
+            Num(At(observedRdp, "TcpListenerCount")) < 0 ||
+            Num(At(observedRdp, "UdpEndpointCount")) < 0 ||
+            ((Num(At(observedRdp, "TcpListenerCount")) == 0 &&
+              Num(At(observedRdp, "UdpEndpointCount")) == 0) != snapshot.RdpListenersAbsent))
+            throw new InvalidDataException("Boundary RDP observation conflicts with Windows inventory.");
+        snapshot.BoundaryAccepted = collectionComplete && bridgeComplete && externalAndGuestPass &&
+            observedComplete && fingerprintComplete &&
+            At(observation, "OperatorPhysicalSeveranceConfirmed") is bool &&
+            (bool)At(observation, "OperatorPhysicalSeveranceConfirmed") &&
+            At(observation, "AdapterCollectionConsistent") is bool &&
+            (bool)At(observation, "AdapterCollectionConsistent") &&
+            At(At(observation, "Forwarding"), "BridgeGraphReviewed") is bool &&
+            (bool)At(At(observation, "Forwarding"), "BridgeGraphReviewed") &&
+            Num(At(At(observation, "Forwarding"), "UnreviewedForwardingPaths")) == 0;
+        snapshot.BoundaryRdpAccepted = Str(At(conditions, "RdpExposure")) == "Pass" &&
+            predicates.Where(x => Str(At(x, "Condition")) == "RdpExposure")
+                .All(x => Str(At(x, "Verdict")) == "Pass");
+        // Bind the complete private source observation, not merely a verdict or
+        // a digest supplied by the diagnostic script.
+        snapshot.NetworkFingerprint = Digest(observation);
+        return snapshot;
+    }
 
     internal static ProbeSnapshot ParseInventory(string json)
     {
@@ -208,6 +355,12 @@ internal sealed class WindowsFeasibilityHost : IFeasibilityHost
         }
     }
     public ProbeSnapshot Capture() { return ParseInventory(inventory.ReadJson()); }
+    public ProbeSnapshot CaptureBoundary(bool operatorConfirmedPhysicalSeverance)
+    {
+        var boundary = inventory as IProbeBoundaryInventory;
+        if (boundary == null) throw new InvalidOperationException("Read-only boundary inventory is unavailable.");
+        return ParseBoundaryCapture(boundary.ReadBoundaryJson(operatorConfirmedPhysicalSeverance));
+    }
     public bool CompareExchangeChildFeature(bool expected, bool desired)
     {
         if (!HasAdministratorPrivilege) throw new InvalidOperationException("Already elevated Administrator token required.");

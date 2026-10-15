@@ -72,6 +72,7 @@ internal static class FeasibilityProbeProgram
     {
         Console.WriteLine("Connected posture: plan | begin HASH | prepare-a | verify-a | restore | restore-reviewed");
         Console.WriteLine("Isolated Stage A: plan-isolated CONFIRM | begin-isolated HASH CONFIRM | prepare-isolated CONFIRM | verify-isolated CONFIRM | restore-isolated CONFIRM | restore-isolated-reviewed CONFIRM | reconnect-check CONFIRM");
+        Console.WriteLine("External-boundary Stage A: plan-boundary CONFIRM | begin-boundary HASH CONFIRM | prepare-boundary CONFIRM | verify-boundary CONFIRM | restore-boundary CONFIRM | restore-boundary-reviewed CONFIRM | reconnect-boundary-check CONFIRM");
         Console.WriteLine("CONFIRM is the literal " + IsolationConfirmation + ". Other commands: status | approve-b HASH | connect-once | confirm-console | end-child ID:LOGON | repair-journal");
         Console.WriteLine("All commands must run at the physical console. No automatic elevation or sign-out is performed.");
     }
@@ -87,6 +88,12 @@ internal static class FeasibilityProbeProgram
             " NetworkRecoveryReviewed=" + journal.NetworkRecoveryReviewed +
             " DeviationReason=" + journal.NetworkDeviationReason +
             " Auth=" + journal.AuthenticationOutcome + " Error=" + journal.ErrorCode);
+    }
+    private static void RequirePosture(IProbeStore store, ProbeNetworkPosture expected)
+    {
+        ProbeJournal existing = store.Load();
+        if (existing == null || existing.Plan.Original.NetworkPosture != expected)
+            throw new InvalidOperationException("This command requires the matching probe posture and journal.");
     }
     [STAThread]
     public static int Main(string[] args)
@@ -110,18 +117,21 @@ internal static class FeasibilityProbeProgram
                     " LocalRdpPostureAccepted=" + readOnly.Original.LocalRdpPostureAccepted);
                 return 0;
             }
-            if (command == "plan-isolated")
+            if (command == "plan-isolated" || command == "plan-boundary")
             {
                 if (!Confirmed(args, 1)) throw new ArgumentException("Explicit physical isolation confirmation is required.");
+                ProbeNetworkPosture requested = command == "plan-isolated"
+                    ? ProbeNetworkPosture.NetworkIsolated : ProbeNetworkPosture.ExternalNetworkIsolated;
                 var readOnly = new FeasibilityProbe(host, null, null).Plan(
-                    ProbeNetworkPosture.NetworkIsolated, true);
-                Console.WriteLine("Plan=" + readOnly.Hash + " Posture=NetworkIsolated" +
-                    " NetworkIsolationAccepted=" + readOnly.Original.NetworkIsolationAccepted +
+                    requested, true);
+                Console.WriteLine("Plan=" + readOnly.Hash + " Posture=" + requested +
+                    " NetworkIsolationAccepted=" + (requested == ProbeNetworkPosture.NetworkIsolated
+                        ? readOnly.Original.NetworkIsolationAccepted : readOnly.Original.BoundaryAccepted) +
                     " RdpPolicyDenied=" + readOnly.Original.RdpPolicyDenied +
                     " Parent=" + readOnly.Original.ParentSessionId + ":" + readOnly.Original.ParentLogonTime);
                 return 0;
             }
-            ProbePrivateState.Verify(command == "begin" || command == "begin-isolated");
+            ProbePrivateState.Verify(command == "begin" || command == "begin-isolated" || command == "begin-boundary");
             string dir = ProbePrivateState.DirectoryPath;
             var store = new FileProbeStore(Path.Combine(dir, "probe.journal"));
             var probe = new FeasibilityProbe(host, store,
@@ -137,13 +147,32 @@ internal static class FeasibilityProbeProgram
                         throw new ArgumentException("Use begin-isolated with the reviewed hash and physical isolation confirmation.");
                     var isolatedPlan = probe.Plan(ProbeNetworkPosture.NetworkIsolated, true);
                     result = probe.Begin(isolatedPlan, args[1], true); break;
-                case "prepare-a": result = probe.PrepareFeature(); break;
+                case "begin-boundary":
+                    if (args.Length != 3 || !Confirmed(args, 2))
+                        throw new ArgumentException("Use begin-boundary with the reviewed hash and physical isolation confirmation.");
+                    var boundaryPlan = probe.Plan(ProbeNetworkPosture.ExternalNetworkIsolated, true);
+                    result = probe.Begin(boundaryPlan, args[1], true); break;
+                case "prepare-a":
+                    RequirePosture(store, ProbeNetworkPosture.ConnectedRdpGuard);
+                    result = probe.PrepareFeature(); break;
                 case "prepare-isolated":
                     if (!Confirmed(args, 1)) throw new ArgumentException("Physical isolation confirmation is required.");
+                    RequirePosture(store, ProbeNetworkPosture.NetworkIsolated);
                     result = probe.PrepareFeature(true); break;
-                case "verify-a": result = probe.ResumeAfterFreshLogon(); break;
+                case "prepare-boundary":
+                    if (!Confirmed(args, 1)) throw new ArgumentException("Physical isolation confirmation is required.");
+                    RequirePosture(store, ProbeNetworkPosture.ExternalNetworkIsolated);
+                    result = probe.PrepareFeature(true); break;
+                case "verify-a":
+                    RequirePosture(store, ProbeNetworkPosture.ConnectedRdpGuard);
+                    result = probe.ResumeAfterFreshLogon(); break;
                 case "verify-isolated":
                     if (!Confirmed(args, 1)) throw new ArgumentException("Physical isolation confirmation is required.");
+                    RequirePosture(store, ProbeNetworkPosture.NetworkIsolated);
+                    result = probe.ResumeAfterFreshLogon(true); break;
+                case "verify-boundary":
+                    if (!Confirmed(args, 1)) throw new ArgumentException("Physical isolation confirmation is required.");
+                    RequirePosture(store, ProbeNetworkPosture.ExternalNetworkIsolated);
                     result = probe.ResumeAfterFreshLogon(true); break;
                 case "approve-b":
                     if (args.Length != 2) throw new ArgumentException("Use approve-b with the reviewed exact plan hash.");
@@ -157,8 +186,12 @@ internal static class FeasibilityProbeProgram
                         args[1] != existing.PositiveChild.Value.SessionId + ":" + existing.PositiveChild.Value.LogonTime)
                         throw new InvalidOperationException("Exact child ID and generation approval does not match the journal.");
                     result = probe.EndPositiveChild(true); break;
-                case "restore": result = probe.RestoreOriginal(); break;
-                case "restore-reviewed": result = probe.RestoreOriginal(true); break;
+                case "restore":
+                    RequirePosture(store, ProbeNetworkPosture.ConnectedRdpGuard);
+                    result = probe.RestoreOriginal(); break;
+                case "restore-reviewed":
+                    RequirePosture(store, ProbeNetworkPosture.ConnectedRdpGuard);
+                    result = probe.RestoreOriginal(true); break;
                 case "restore-isolated":
                     if (!Confirmed(args, 1)) throw new ArgumentException("Physical isolation confirmation is required.");
                     var isolatedRestore = store.Load();
@@ -173,8 +206,22 @@ internal static class FeasibilityProbeProgram
                         reviewedRestore.Plan.Original.NetworkPosture != ProbeNetworkPosture.NetworkIsolated)
                         throw new InvalidOperationException("This command requires an isolated probe journal.");
                     result = probe.RestoreOriginal(true, true, true); break;
+                case "restore-boundary":
+                    if (!Confirmed(args, 1)) throw new ArgumentException("Physical isolation confirmation is required.");
+                    RequirePosture(store, ProbeNetworkPosture.ExternalNetworkIsolated);
+                    result = probe.RestoreOriginal(false, false, true); break;
+                case "restore-boundary-reviewed":
+                    if (!Confirmed(args, 1)) throw new ArgumentException("Physical isolation confirmation is required.");
+                    RequirePosture(store, ProbeNetworkPosture.ExternalNetworkIsolated);
+                    result = probe.RestoreOriginal(true, true, true); break;
                 case "reconnect-check":
                     if (!Confirmed(args, 1)) throw new ArgumentException("Physical isolation confirmation is required.");
+                    RequirePosture(store, ProbeNetworkPosture.NetworkIsolated);
+                    goto case "reconnect-boundary-check";
+                case "reconnect-boundary-check":
+                    if (!Confirmed(args, 1)) throw new ArgumentException("Physical isolation confirmation is required.");
+                    if (command == "reconnect-boundary-check")
+                        RequirePosture(store, ProbeNetworkPosture.ExternalNetworkIsolated);
                     var assessment = probe.AssessReconnect(true);
                     Console.WriteLine("ReconnectReady=" + assessment.Ready +
                         " FeatureRestored=" + assessment.FeatureRestored +

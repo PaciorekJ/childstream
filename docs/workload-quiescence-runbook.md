@@ -1,6 +1,6 @@
 # Proposed operator-controlled WSL and Docker pause for Stage A
 
-**Preparation only.** No command in this document has been approved or executed on the physical host. The read-only network diagnostic cannot stop workloads. Stage A remains No-Go until the bridge/topology collector, a new versioned plan and journal, and a complete physically isolated snapshot are reviewed. Keep the record below private and available offline.
+**Preparation only.** No command in this document has been approved or executed on the physical host. The read-only network diagnostic cannot stop workloads. The version 5 plan/journal is implemented and offline-tested, but the connected-host evidence remains No-Go. A complete offline, quiescent snapshot and separate operator approval are still required. Keep the record below private and available offline.
 
 ## Record the original state while connected
 
@@ -16,7 +16,7 @@ Before any workload pause, list `wsl --list --verbose`, `docker ps --format '{{j
 4. After saving Ubuntu work, use `wsl --terminate Ubuntu`. Recheck `wsl --list --verbose`. If `docker-desktop` remains Running after Docker Desktop has quit, review its owner/state before a separately approved `wsl --terminate docker-desktop`. Do not run `wsl --shutdown` unless all distributions and their work are included in the approval.
 5. Ensure the recorded Docker Desktop sign-in option and any workload restart path will not relaunch a guest at the fresh parent logon. If preventing auto-start would require changing a setting, capture its exact old value and obtain separate approval for that reversible change. A pause that cannot survive fresh logon is No-Go. Verify no other VM or guest endpoint is active.
 
-The operator then performs the separately authorized physical disconnection, with a second local observer checking Ethernet, Wi-Fi, Bluetooth PAN, cellular/USB tether, VPN underlays and any other uplink. The read-only diagnostic must show complete sources and independent `External`, `GuestPath` and `RdpExposure` acceptance. A connected-network firewall failure remains a connected-network blocker; do not edit its rules. A physical isolation observation is not a plan hash. The future versioned plan must bind the complete private snapshot and recheck it before the feature write, after the API call, after the fresh console logon, throughout recovery and before reconnect assessment.
+The operator then performs the separately authorized physical disconnection, with a second local observer checking Ethernet, Wi-Fi, Bluetooth PAN, cellular/USB tether, VPN underlays and any other uplink. The read-only diagnostic must show complete sources and independent `External`, `GuestPath` and `RdpExposure` acceptance. A connected-network firewall failure remains a connected-network blocker; do not edit its rules. The v5 `plan-boundary` command binds the complete private snapshot to an exact approval hash and journal, then rechecks it before the feature write, after the API call, after the fresh console logon, throughout recovery and before reconnect assessment. See [external-boundary-stage-a.md](external-boundary-stage-a.md).
 
 ## Stop, recovery and resumption
 

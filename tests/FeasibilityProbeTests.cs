@@ -10,17 +10,26 @@ internal static class FeasibilityProbeTests
     {
         internal ProbeSnapshot State = Base();
         internal bool Admin = true, FailBeforeFeature, FailAfterFeature, FailRestore, FailConnectAfterChild,
-            FailLogoffAfterChild, CredentialPrompt, LoseNetworkAfterFeature, StartRdpAfterFeature;
+            FailLogoffAfterChild, CredentialPrompt, LoseNetworkAfterFeature, StartRdpAfterFeature,
+            LoseBoundaryAfterFeature, FailBoundaryCapture;
         internal int FeatureWrites, Connections, Logoffs;
         internal ChildSessionIdentity TestChild = new ChildSessionIdentity(31, 200);
         public bool HasAdministratorPrivilege { get { return Admin; } }
         public ProbeSnapshot Capture() { return Clone(State); }
+        public ProbeSnapshot CaptureBoundary(bool operatorConfirmedPhysicalSeverance)
+        {
+            if (FailBoundaryCapture) throw new IOException("Boundary source failed");
+            ProbeSnapshot snapshot = Clone(State);
+            if (!operatorConfirmedPhysicalSeverance) snapshot.BoundaryAccepted = false;
+            return snapshot;
+        }
         public bool CompareExchangeChildFeature(bool expected, bool desired)
         {
             if (State.FeatureEnabled != expected) return false;
             if (FailBeforeFeature || (FailRestore && !desired)) throw new IOException("Before feature write");
             FeatureWrites++; State.FeatureEnabled = desired;
             if (desired && LoseNetworkAfterFeature) State.NetworkIsolationAccepted = false;
+            if (desired && LoseBoundaryAfterFeature) State.BoundaryAccepted = false;
             if (desired && StartRdpAfterFeature)
             {
                 State.TermServiceStopped = false;
@@ -75,6 +84,7 @@ internal static class FeasibilityProbeTests
             RdpListenersAbsent = x.RdpListenersAbsent,
             FirewallObservationComplete = x.FirewallObservationComplete,
             NetworkIsolationAccepted = x.NetworkIsolationAccepted, NetworkFingerprint = x.NetworkFingerprint,
+            BoundaryAccepted = x.BoundaryAccepted, BoundaryRdpAccepted = x.BoundaryRdpAccepted,
             RdpRegistryFingerprint = x.RdpRegistryFingerprint, ListenerFingerprint = x.ListenerFingerprint,
             FirewallFingerprint = x.FirewallFingerprint, DisplayFingerprint = x.DisplayFingerprint,
             NativeResourceFingerprint = x.NativeResourceFingerprint, AssociatedChild = x.AssociatedChild };
@@ -106,6 +116,19 @@ internal static class FeasibilityProbeTests
         {
             SetIsolated();
             ProbePlan plan = Probe.Plan(ProbeNetworkPosture.NetworkIsolated, true);
+            return Probe.Begin(plan, plan.Hash, true);
+        }
+        internal void SetBoundary()
+        {
+            SetIsolated();
+            Host.State.NetworkIsolationAccepted = false;
+            Host.State.BoundaryAccepted = true;
+            Host.State.BoundaryRdpAccepted = true;
+        }
+        internal ProbeJournal BeginBoundary()
+        {
+            SetBoundary();
+            ProbePlan plan = Probe.Plan(ProbeNetworkPosture.ExternalNetworkIsolated, true);
             return Probe.Begin(plan, plan.Hash, true);
         }
         internal ProbeJournal Ready()
@@ -863,13 +886,236 @@ internal static class FeasibilityProbeTests
         }
     }
 
+    private static void ExternalBoundaryLifecycle()
+    {
+        using (var f = new Fixture())
+        {
+            f.SetBoundary();
+            Throws<InvalidOperationException>(() => f.Probe.Plan(ProbeNetworkPosture.ExternalNetworkIsolated, false),
+                "v5 boundary requires operator confirmation");
+            ProbePlan plan = f.Probe.Plan(ProbeNetworkPosture.ExternalNetworkIsolated, true);
+            Check(plan.Original.FormatVersion == 5 &&
+                plan.Original.NetworkPosture == ProbeNetworkPosture.ExternalNetworkIsolated &&
+                !plan.Original.NetworkIsolationAccepted && plan.Original.BoundaryAccepted,
+                "v5 accepts reviewed external boundary without false full isolation");
+            Check(ProbeCodec.ReadPlan(ProbeCodec.PlanBytes(plan.Original)).BoundaryRdpAccepted,
+                "v5 plan round trip retains independent RDP exposure gate");
+            f.Host.State.NetworkFingerprint = "changed";
+            Throws<InvalidOperationException>(() => f.Probe.Begin(plan, plan.Hash, true),
+                "v5 exact approval expires on topology drift");
+        }
+        using (var f = new Fixture())
+        {
+            f.BeginBoundary();
+            f.Host.State.BoundaryAccepted = false;
+            Throws<InvalidOperationException>(() => f.Probe.PrepareFeature(true),
+                "external boundary loss blocks feature write");
+            Check(f.Host.FeatureWrites == 0 && f.Store.Load().NetworkDeviationObserved,
+                "external boundary deviation is durable before mutation");
+            f.Host.State.BoundaryAccepted = true;
+            Throws<InvalidOperationException>(() => f.Probe.PrepareFeature(true),
+                "restored boundary never silently resumes Stage A");
+            Check(f.Probe.RestoreOriginal(false, true, true).Stage == ProbeStage.Restored,
+                "reviewed recovery closes the premutation journal");
+        }
+        using (var f = new Fixture())
+        {
+            f.BeginBoundary(); f.Probe.PrepareFeature(true);
+            f.Host.State.ParentLogonTime = 101;
+            Check(f.Probe.ResumeAfterFreshLogon(true).Stage == ProbeStage.StageAValidated,
+                "v5 Stage A validates a fresh parent without creating a child");
+            Throws<InvalidOperationException>(() => f.Probe.ApproveStageB(f.Store.Load().Plan.Hash, true),
+                "v5 cannot approve Stage B");
+            Check(f.Probe.RestoreOriginal(false, false, true).Stage == ProbeStage.Restored &&
+                f.Probe.AssessReconnect(true).Ready,
+                "v5 restores original feature and checks reconnect safety");
+        }
+        using (var f = new Fixture())
+        {
+            f.BeginBoundary(); f.Host.LoseBoundaryAfterFeature = true;
+            Throws<InvalidOperationException>(() => f.Probe.PrepareFeature(true),
+                "loss after non-atomic feature enable stops progression");
+            Check(f.Host.FeatureWrites == 1 && f.Store.Load().NetworkDeviationObserved,
+                "postwrite boundary deviation retains enable intent");
+            Throws<InvalidOperationException>(() => f.Probe.RestoreOriginal(true, true, true),
+                "lost boundary prohibits further feature mutation");
+            Check(f.Host.FeatureWrites == 1, "feature is not restored through a lost boundary");
+            f.Host.State.BoundaryAccepted = true;
+            Check(f.Probe.RestoreOriginal(true, true, true).Stage == ProbeStage.Restored &&
+                f.Probe.AssessReconnect(true).Ready,
+                "reviewed re-isolation restores and verifies original feature");
+        }
+        using (var f = new Fixture())
+        {
+            f.BeginBoundary(); f.Host.FailBoundaryCapture = true;
+            Throws<IOException>(() => f.Probe.PrepareFeature(true),
+                "read-only boundary capture failure blocks mutation");
+            Check(f.Store.Load().NetworkDeviationObserved && f.Host.FeatureWrites == 0,
+                "capture failure is recorded as a network deviation");
+            f.Host.FailBoundaryCapture = false;
+            Check(f.Probe.RestoreOriginal(false, true, true).Stage == ProbeStage.Restored,
+                "reviewed recovery handles inaccessible boundary source");
+        }
+        using (var f = new Fixture())
+        {
+            f.BeginBoundary(); f.Host.StartRdpAfterFeature = true;
+            Throws<InvalidOperationException>(() => f.Probe.PrepareFeature(true),
+                "unexpected RDP listener blocks Stage A after feature enablement");
+            Throws<InvalidOperationException>(() => f.Probe.RestoreOriginal(true, false, true),
+                "feature restoration exposes unresolved RDP listener as conflict");
+            Check(!f.Host.State.FeatureEnabled && f.Store.Load().Stage == ProbeStage.Conflict &&
+                !f.Probe.AssessReconnect(true).Ready,
+                "reconnection stays blocked despite restored feature");
+        }
+        using (var f = new Fixture())
+        {
+            f.BeginBoundary(); f.Host.FailBeforeFeature = true;
+            Throws<IOException>(() => f.Probe.PrepareFeature(true),
+                "v5 failed enable leaves the intent durable");
+            Check(f.Store.Load().Stage == ProbeStage.PreparedEnable && f.Host.FeatureWrites == 0,
+                "failed enable cannot be mistaken for a completed feature write");
+            Check(f.Probe.RestoreOriginal(false, false, true).Stage == ProbeStage.Restored,
+                "verified unchanged feature closes failed enable intent");
+        }
+        using (var f = new Fixture())
+        {
+            f.BeginBoundary(); f.Probe.PrepareFeature(true);
+            f.Host.FailRestore = true;
+            Throws<IOException>(() => f.Probe.RestoreOriginal(false, false, true),
+                "v5 incomplete restoration remains unresolved");
+            Check(f.Store.Load().Stage == ProbeStage.Restoring &&
+                !f.Probe.AssessReconnect(true).Ready,
+                "v5 cannot reconnect with an enabled feature and restoring journal");
+        }
+        using (var f = new Fixture())
+        {
+            f.SetBoundary(); f.Host.State.ChildAccess = ResourceAccess.Unknown;
+            f.Host.State.ChildApiErrorCode = 1168;
+            ProbePlan plan = f.Probe.Plan(ProbeNetworkPosture.ExternalNetworkIsolated, true);
+            f.Probe.Begin(plan, plan.Hash, true); f.Probe.PrepareFeature(true);
+            f.Host.State.ParentLogonTime = 101;
+            Check(f.Probe.ResumeAfterFreshLogon(true).Stage == ProbeStage.StageAQueryUnknown,
+                "persistent 1168 remains unknown in v5");
+            Check(f.Probe.RestoreOriginal(false, false, true).Stage == ProbeStage.Restored,
+                "unknown child lookup can restore feature while child absence is independently proven");
+        }
+        using (var f = new Fixture())
+        {
+            f.BeginBoundary(); f.Probe.PrepareFeature(true);
+            f.Host.State.ParentLogonTime = 101; f.Host.State.NetworkFingerprint = "fresh-logon-drift";
+            Throws<InvalidOperationException>(() => f.Probe.ResumeAfterFreshLogon(true),
+                "fresh logon topology drift prevents acceptance");
+            Check(f.Store.Load().NetworkDeviationObserved && f.Store.Load().Stage == ProbeStage.AwaitFreshParent,
+                "fresh logon deviation leaves durable journal");
+            f.Host.State.NetworkFingerprint = "network-1";
+            Check(f.Probe.RestoreOriginal(true, true, true).Stage == ProbeStage.Restored,
+                "reviewed recovery restores after fresh logon drift");
+        }
+    }
+    private static object Accessible(params object[] items)
+    { return new { State = "Accessible", Items = items }; }
+
+    private static string BoundaryCaptureSynthetic()
+    {
+        var serializer = new JavaScriptSerializer();
+        var original = (Dictionary<string, object>)serializer.DeserializeObject(SyntheticJson());
+        object adapter = new { InterfaceIndex = 7, Status = "Disconnected",
+            MediaConnectionState = "Disconnected", HardwareInterface = true,
+            Virtual = false, Label = "physical", MacAddress = "001122334455" };
+        object adapters = Accessible(adapter), empty = Accessible();
+        original["Network"] = new { Adapters = adapters, IpInterfaces = empty,
+            IpAddresses = empty, Routes = empty };
+        string[] ids = { "network-inventory-complete", "physical-uplinks-down",
+            "physical-severance-confirmed", "switches-have-no-external-bridge",
+            "physical-route-link-corroboration", "hyperv-host-port-graph",
+            "virtual-paths-attributed", "nat-bridge-forwarding-mapped",
+            "hns-endpoints-quiescent", "hns-endpoint-network-graph",
+            "internal-guests-quiescent", "docker-host-forwarding-absent",
+            "rdp-baseline-closed", "guest-to-host-rdp-exposure-excluded",
+            "fresh-logon-network-unchanged" };
+        var predicates = new object[ids.Length];
+        for (int i = 0; i < ids.Length; i++)
+            predicates[i] = new { Id = ids[i], Condition = i < 8 ? "External" :
+                i < 12 ? "GuestPath" : i < 14 ? "RdpExposure" : "Continuity",
+                Verdict = i == 14 ? "Unknown" : "Pass" };
+        string[] sources = { "Inventory", "HyperVSwitches", "HyperVVirtualMachines",
+            "HyperVHostPorts", "HyperVVmPorts", "Wsl", "Docker", "Hns", "HnsEndpoints",
+            "NetNat", "PortProxy", "BridgeBindings", "IpForwarding", "DockerProcesses" };
+        var collection = new Dictionary<string, object>();
+        foreach (string source in sources) collection[source] = "Accessible";
+        string fingerprint = new string('a', 64);
+        var observation = new Dictionary<string, object> {
+            { "Adapters", adapters }, { "IpInterfaces", empty }, { "IpAddresses", empty },
+            { "Routes", empty }, { "Switches", empty }, { "HostPorts", empty },
+            { "VirtualMachines", empty }, { "VmPorts", empty }, { "Hns", empty },
+            { "HnsEndpoints", empty }, { "NetNat", empty }, { "PortProxy", empty },
+            { "BridgeBindings", new { State = "Accessible", QueryMode = "PerRelevantAdapter",
+                Items = new object[0], Queried = new object[] { new { InterfaceIndex = 7 } },
+                Failures = new object[0] } },
+            { "IpForwarding", empty }, { "Wsl", empty }, { "Docker", empty },
+            { "DockerProcesses", empty },
+            { "Rdp", new { State = "Accessible", PolicyDenied = true, TermServiceStopped = true,
+                TcpListenerCount = 0, UdpEndpointCount = 0 } },
+            { "RdpEvidence", original["Rdp"] },
+            { "OperatorPhysicalSeveranceConfirmed", true },
+            { "AdapterCollectionConsistent", true },
+            { "Forwarding", new { BridgeGraphReviewed = true, UnreviewedForwardingPaths = 0 } },
+            { "CurrentNetworkFingerprint", fingerprint }
+        };
+        var boundary = new Dictionary<string, object> {
+            { "Schema", "ChildStream.NetworkBoundaryDiagnostic.v1" },
+            { "HostMutation", false }, { "DiagnosticOnly", true },
+            { "StageAPlanAuthorized", false },
+            { "Collection", collection }, { "Predicates", predicates },
+            { "Conditions", new { External = "Pass", GuestPath = "Pass",
+                RdpExposure = "Pass", Continuity = "Unknown" } },
+            { "BridgeBindingDiagnostic", new { QueryMode = "PerRelevantAdapter",
+                QueriedCount = 1, FailureCount = 0 } },
+            { "CurrentNetworkFingerprint", fingerprint }
+        };
+        return serializer.Serialize(new { Schema = "ChildStream.BoundaryCapture.v1",
+            HostMutation = false, Inventory = original, Boundary = boundary, Observation = observation });
+    }
+    private static void BoundaryCaptureParser()
+    {
+        var serializer = new JavaScriptSerializer();
+        string json = BoundaryCaptureSynthetic();
+        ProbeSnapshot accepted = WindowsFeasibilityHost.ParseBoundaryCapture(json);
+        Check(accepted.BoundaryAccepted && accepted.BoundaryRdpAccepted &&
+            accepted.NetworkFingerprint.Length == 64,
+            "one private capture binds complete external, guest and RDP evidence");
+        var root = (Dictionary<string, object>)serializer.DeserializeObject(json);
+        var boundary = (Dictionary<string, object>)root["Boundary"];
+        boundary["BridgeBindingDiagnostic"] = new { QueryMode = "PerRelevantAdapter",
+            QueriedCount = 0, FailureCount = 0 };
+        Check(!WindowsFeasibilityHost.ParseBoundaryCapture(serializer.Serialize(root)).BoundaryAccepted,
+            "unqueried relevant physical adapter cannot pass bridge coverage");
+        root = (Dictionary<string, object>)serializer.DeserializeObject(json);
+        var observation = (Dictionary<string, object>)root["Observation"];
+        var bridge = (Dictionary<string, object>)observation["BridgeBindings"];
+        bridge["Queried"] = new object[0];
+        Check(!WindowsFeasibilityHost.ParseBoundaryCapture(serializer.Serialize(root)).BoundaryAccepted,
+            "reported bridge count cannot hide a missing per-adapter query");
+        root = (Dictionary<string, object>)serializer.DeserializeObject(json);
+        observation = (Dictionary<string, object>)root["Observation"];
+        observation["Rdp"] = new { State = "Accessible", PolicyDenied = false,
+            TermServiceStopped = true, TcpListenerCount = 0, UdpEndpointCount = 0 };
+        Throws<InvalidDataException>(() => WindowsFeasibilityHost.ParseBoundaryCapture(serializer.Serialize(root)),
+            "contradictory RDP observation is rejected");
+        root = (Dictionary<string, object>)serializer.DeserializeObject(json);
+        var original = (Dictionary<string, object>)root["Inventory"];
+        original.Remove("Network");
+        Throws<InvalidDataException>(() => WindowsFeasibilityHost.ParseBoundaryCapture(serializer.Serialize(root)),
+            "missing independent network inventory is rejected");
+    }
+
     public static int Main()
     {
         try
         {
             PlanningAndApproval(); FeatureFailureAndRecovery(); FreshLogonAndConnection(); TeardownAndRollback();
             JournalAndOwnership(); ObservedHostBoundary(); WindowsAdapterSynthetic(); FirewallGateSynthetic();
-            NetworkGateSynthetic(); IsolatedLifecycle(); PrivateStateSynthetic();
+            NetworkGateSynthetic(); IsolatedLifecycle(); ExternalBoundaryLifecycle(); BoundaryCaptureParser(); PrivateStateSynthetic();
             Console.WriteLine("Feasibility probe: " + assertions + " offline assertions passed."); return 0;
         }
         catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }

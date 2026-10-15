@@ -9,7 +9,7 @@ internal enum ProbeStage
   ReadyConnect, Connecting, Connected,
   OutcomeUnknown, TeardownPrepared, ChildEnded, Restoring, Restored, Conflict }
 internal enum ProbeConnectOutcome { AutomaticLogon, CredentialPrompt, Failed, Unknown }
-internal enum ProbeNetworkPosture { ConnectedRdpGuard, NetworkIsolated }
+internal enum ProbeNetworkPosture { ConnectedRdpGuard, NetworkIsolated, ExternalNetworkIsolated }
 
 internal sealed class ProbeSnapshot
 {
@@ -26,7 +26,7 @@ internal sealed class ProbeSnapshot
     internal int WindowsBuild;
     internal bool LocalRdpPostureAccepted;
     internal bool RdpPolicyDenied, TermServiceStopped, RdpListenersAbsent,
-        FirewallObservationComplete, NetworkIsolationAccepted;
+        FirewallObservationComplete, NetworkIsolationAccepted, BoundaryAccepted, BoundaryRdpAccepted;
     internal string NetworkFingerprint;
     internal ResourceAccess ChildAccess;
     internal int ChildApiErrorCode;
@@ -81,6 +81,7 @@ internal sealed class ProbeReconnectAssessment
 internal interface IFeasibilityHost
 {
     ProbeSnapshot Capture();
+    ProbeSnapshot CaptureBoundary(bool operatorConfirmedPhysicalSeverance);
     bool CompareExchangeChildFeature(bool expected, bool desired);
     ProbeConnectionResult ConnectWithoutPassword();
     bool LogoffExact(ChildSessionIdentity expected);
@@ -117,12 +118,14 @@ internal static class ProbeCodec
             writer.Write(snapshot.RdpRegistryFingerprint); writer.Write(snapshot.ListenerFingerprint);
             writer.Write(snapshot.FirewallFingerprint); writer.Write(snapshot.DisplayFingerprint);
             writer.Write(snapshot.NativeResourceFingerprint);
-            if (snapshot.FormatVersion == 4)
+            if (snapshot.FormatVersion == 4 || snapshot.FormatVersion == 5)
             {
                 writer.Write((int)snapshot.NetworkPosture); writer.Write(snapshot.OperatorConfirmedIsolation);
                 writer.Write(snapshot.RdpPolicyDenied); writer.Write(snapshot.TermServiceStopped);
                 writer.Write(snapshot.RdpListenersAbsent); writer.Write(snapshot.FirewallObservationComplete);
                 writer.Write(snapshot.NetworkIsolationAccepted); writer.Write(snapshot.NetworkFingerprint ?? "");
+                if (snapshot.FormatVersion == 5)
+                { writer.Write(snapshot.BoundaryAccepted); writer.Write(snapshot.BoundaryRdpAccepted); }
             }
             else if (snapshot.FormatVersion != 3) throw new InvalidDataException("Unsupported probe plan version.");
             writer.Flush(); return stream.ToArray();
@@ -141,7 +144,7 @@ internal static class ProbeCodec
         using (var reader = new BinaryReader(stream, Encoding.UTF8))
         {
             int version = reader.ReadInt32();
-            if (version != 3 && version != 4) throw new InvalidDataException("Unsupported probe plan version.");
+            if (version != 3 && version != 4 && version != 5) throw new InvalidDataException("Unsupported probe plan version.");
             var s = new ProbeSnapshot();
             s.FormatVersion = version;
             s.FeatureAccess = (ResourceAccess)reader.ReadInt32(); s.FeatureEnabled = reader.ReadBoolean();
@@ -155,13 +158,15 @@ internal static class ProbeCodec
             s.RdpRegistryFingerprint = reader.ReadString(); s.ListenerFingerprint = reader.ReadString();
             s.FirewallFingerprint = reader.ReadString(); s.DisplayFingerprint = reader.ReadString();
             s.NativeResourceFingerprint = reader.ReadString();
-            if (version == 4)
+            if (version == 4 || version == 5)
             {
                 s.NetworkPosture = (ProbeNetworkPosture)reader.ReadInt32();
                 s.OperatorConfirmedIsolation = reader.ReadBoolean();
                 s.RdpPolicyDenied = reader.ReadBoolean(); s.TermServiceStopped = reader.ReadBoolean();
                 s.RdpListenersAbsent = reader.ReadBoolean(); s.FirewallObservationComplete = reader.ReadBoolean();
                 s.NetworkIsolationAccepted = reader.ReadBoolean(); s.NetworkFingerprint = reader.ReadString();
+                if (version == 5)
+                { s.BoundaryAccepted = reader.ReadBoolean(); s.BoundaryRdpAccepted = reader.ReadBoolean(); }
             }
             if (stream.Position != stream.Length) throw new InvalidDataException("Trailing probe plan data.");
             if (s.FeatureAccess != ResourceAccess.Accessible || s.ParentSessionId == uint.MaxValue ||
@@ -170,6 +175,10 @@ internal static class ProbeCodec
                 (version == 3 && !s.LocalRdpPostureAccepted) ||
                 (version == 4 && (s.NetworkPosture != ProbeNetworkPosture.NetworkIsolated ||
                     !s.OperatorConfirmedIsolation || !s.NetworkIsolationAccepted || !s.RdpPolicyDenied ||
+                    !s.TermServiceStopped || !s.RdpListenersAbsent || !s.FirewallObservationComplete ||
+                    String.IsNullOrEmpty(s.NetworkFingerprint))) ||
+                (version == 5 && (s.NetworkPosture != ProbeNetworkPosture.ExternalNetworkIsolated ||
+                    !s.OperatorConfirmedIsolation || !s.BoundaryAccepted || !s.BoundaryRdpAccepted || !s.RdpPolicyDenied ||
                     !s.TermServiceStopped || !s.RdpListenersAbsent || !s.FirewallObservationComplete ||
                     String.IsNullOrEmpty(s.NetworkFingerprint))) ||
                 String.IsNullOrEmpty(s.AccountBinding) || String.IsNullOrEmpty(s.RdpRegistryFingerprint) ||
@@ -193,7 +202,7 @@ internal static class ProbeCodec
             writer.Write(journal.ConsoleConfirmed); writer.Write(journal.ConnectionAttempted);
             writer.Write(journal.AuthenticationOutcome);
             writer.Write(journal.ErrorCode);
-            if (journal.Plan.Original.FormatVersion == 4)
+            if (journal.Plan.Original.FormatVersion >= 4)
             {
                 writer.Write(journal.NetworkDeviationObserved);
                 writer.Write(journal.NetworkDeviationFingerprint ?? "");
@@ -218,7 +227,7 @@ internal static class ProbeCodec
             journal.ConsoleConfirmed = reader.ReadBoolean(); journal.ConnectionAttempted = reader.ReadBoolean();
             journal.AuthenticationOutcome = reader.ReadString();
             journal.ErrorCode = reader.ReadInt32();
-            if (journal.Plan.Original.FormatVersion == 4)
+            if (journal.Plan.Original.FormatVersion >= 4)
             {
                 journal.NetworkDeviationObserved = reader.ReadBoolean();
                 journal.NetworkDeviationFingerprint = reader.ReadString();
@@ -263,7 +272,8 @@ internal sealed class FileProbeStore : IProbeStore
         InstallOperation op = raw.Entries[0].Operation;
         if (op.Original.Access != ResourceAccess.Accessible || op.Desired.Access != ResourceAccess.Accessible ||
             !(op.Original.ValueType == "ProbePlanV3" && op.Desired.ValueType == "ProbeProgressV3" ||
-              op.Original.ValueType == "ProbePlanV4" && op.Desired.ValueType == "ProbeProgressV4") ||
+              op.Original.ValueType == "ProbePlanV4" && op.Desired.ValueType == "ProbeProgressV4" ||
+              op.Original.ValueType == "ProbePlanV5" && op.Desired.ValueType == "ProbeProgressV5") ||
             raw.PlanHash != ProbeCodec.Hash(op.Original.Data))
             throw new InvalidDataException("Probe plan integrity failed.");
         var plan = new ProbePlan { Original = ProbeCodec.ReadPlan(op.Original.Data), Hash = raw.PlanHash };
@@ -303,6 +313,17 @@ internal sealed class FeasibilityProbe
     private static void Require(bool condition, string reason)
     { if (!condition) throw new InvalidOperationException(reason); }
 
+    private static bool IsIsolated(ProbeNetworkPosture posture)
+    { return posture == ProbeNetworkPosture.NetworkIsolated || posture == ProbeNetworkPosture.ExternalNetworkIsolated; }
+
+    private static bool IsolationAccepted(ProbeSnapshot snapshot, ProbeNetworkPosture posture)
+    { return snapshot != null && (posture == ProbeNetworkPosture.NetworkIsolated
+        ? snapshot.NetworkIsolationAccepted : posture == ProbeNetworkPosture.ExternalNetworkIsolated && snapshot.BoundaryAccepted); }
+
+    private ProbeSnapshot CaptureFor(ProbeNetworkPosture posture, bool confirmation)
+    { return posture == ProbeNetworkPosture.ExternalNetworkIsolated
+        ? host.CaptureBoundary(confirmation) : host.Capture(); }
+
     private static void ValidateInitial(ProbeSnapshot s, ProbeNetworkPosture posture, bool isolationConfirmed)
     {
         Require(s != null && s.FeatureAccess == ResourceAccess.Accessible && s.ParentSessionId != uint.MaxValue &&
@@ -318,8 +339,10 @@ internal sealed class FeasibilityProbe
             Require(s.LocalRdpPostureAccepted,
                 "Observed local RDP posture is not acceptable: a listener, service, policy, firewall rule, or required reading blocks the plan.");
         else
-            Require(posture == ProbeNetworkPosture.NetworkIsolated && isolationConfirmed &&
-                !s.FeatureEnabled && s.NetworkIsolationAccepted && !String.IsNullOrEmpty(s.NetworkFingerprint) &&
+            Require(IsIsolated(posture) && isolationConfirmed &&
+                !s.FeatureEnabled && IsolationAccepted(s, posture) &&
+                (posture != ProbeNetworkPosture.ExternalNetworkIsolated || s.BoundaryRdpAccepted) &&
+                !String.IsNullOrEmpty(s.NetworkFingerprint) &&
                 s.RdpPolicyDenied && s.TermServiceStopped && s.RdpListenersAbsent &&
                 s.FirewallObservationComplete,
                 "Physical isolation confirmation, independent network isolation, or the unchanged RDP baseline is missing.");
@@ -334,11 +357,22 @@ internal sealed class FeasibilityProbe
         store.Save(journal);
     }
 
+    private ProbeSnapshot CaptureForJournal(ProbeJournal journal, bool confirmation)
+    {
+        try { return CaptureFor(journal.Plan.Original.NetworkPosture, confirmation); }
+        catch (Exception ex)
+        {
+            if (IsIsolated(journal.Plan.Original.NetworkPosture))
+                RecordNetworkDeviation(journal, null, "BoundaryCaptureFailed:" + ex.GetType().Name);
+            throw;
+        }
+    }
+
     private void ValidateUnchanged(ProbeJournal journal, ProbeSnapshot current)
     {
-        if (journal.Plan.Original.NetworkPosture == ProbeNetworkPosture.NetworkIsolated)
+        if (IsIsolated(journal.Plan.Original.NetworkPosture))
         {
-            bool isolated = current != null && current.NetworkIsolationAccepted;
+            bool isolated = IsolationAccepted(current, journal.Plan.Original.NetworkPosture);
             bool same = isolated && current.NetworkFingerprint == journal.Plan.Original.NetworkFingerprint;
             if (!same)
             {
@@ -351,6 +385,7 @@ internal sealed class FeasibilityProbe
             Require(current.FeatureAccess == ResourceAccess.Accessible &&
                 current.ParentSessionId == current.ConsoleSessionId &&
                 current.RdpPolicyDenied && current.TermServiceStopped && current.RdpListenersAbsent &&
+                (journal.Plan.Original.NetworkPosture != ProbeNetworkPosture.ExternalNetworkIsolated || current.BoundaryRdpAccepted) &&
                 current.FirewallObservationComplete && current.AccountBinding == journal.Plan.Original.AccountBinding &&
                 current.ParentProtocolType == 0 &&
                 current.InfrastructureFingerprint() == journal.Plan.Original.InfrastructureFingerprint(),
@@ -367,10 +402,12 @@ internal sealed class FeasibilityProbe
         bool operatorConfirmedIsolation = false)
     {
         // Planning must leave no lock file or journal on the host.
-        ProbeSnapshot s = host.Capture(); ValidateInitial(s, posture, operatorConfirmedIsolation);
-        if (posture == ProbeNetworkPosture.NetworkIsolated)
+        ProbeSnapshot s = CaptureFor(posture, operatorConfirmedIsolation);
+        ValidateInitial(s, posture, operatorConfirmedIsolation);
+        if (IsIsolated(posture))
         {
-            s.FormatVersion = 4; s.NetworkPosture = posture;
+            s.FormatVersion = posture == ProbeNetworkPosture.NetworkIsolated ? 4 : 5;
+            s.NetworkPosture = posture;
             s.OperatorConfirmedIsolation = operatorConfirmedIsolation;
         }
         return new ProbePlan { Original = s, Hash = ProbeCodec.Hash(ProbeCodec.PlanBytes(s)) };
@@ -383,11 +420,12 @@ internal sealed class FeasibilityProbe
             Require(explicitConsent && plan != null && plan.Hash == approvedHash &&
                 plan.Hash == ProbeCodec.Hash(ProbeCodec.PlanBytes(plan.Original)), "Explicit approval for the exact probe plan is required.");
             Require(store.Load() == null, "A probe journal already exists; recover it before starting again.");
-            ProbeSnapshot current = host.Capture();
+            ProbeSnapshot current = CaptureFor(plan.Original.NetworkPosture, plan.Original.OperatorConfirmedIsolation);
             ValidateInitial(current, plan.Original.NetworkPosture, plan.Original.OperatorConfirmedIsolation);
-            if (plan.Original.NetworkPosture == ProbeNetworkPosture.NetworkIsolated)
+            if (IsIsolated(plan.Original.NetworkPosture))
             {
-                current.FormatVersion = 4; current.NetworkPosture = ProbeNetworkPosture.NetworkIsolated;
+                current.FormatVersion = plan.Original.FormatVersion;
+                current.NetworkPosture = plan.Original.NetworkPosture;
                 current.OperatorConfirmedIsolation = plan.Original.OperatorConfirmedIsolation;
             }
             Require(ProbeCodec.Hash(ProbeCodec.PlanBytes(current)) == plan.Hash, "The approved probe inventory is stale.");
@@ -402,9 +440,9 @@ internal sealed class FeasibilityProbe
         using (owner.Acquire())
         {
             ProbeJournal j = RequiredJournal(); Require(j.Stage == ProbeStage.Captured, "Feature preparation is not available in this stage.");
-            Require(j.Plan.Original.NetworkPosture != ProbeNetworkPosture.NetworkIsolated || operatorConfirmedIsolation,
+            Require(!IsIsolated(j.Plan.Original.NetworkPosture) || operatorConfirmedIsolation,
                 "Isolated feature enablement requires renewed physical isolation confirmation.");
-            ProbeSnapshot s = host.Capture(); ValidateUnchanged(j, s);
+            ProbeSnapshot s = CaptureForJournal(j, operatorConfirmedIsolation); ValidateUnchanged(j, s);
             Require(s.ParentSessionId == j.ActiveParentId && s.ParentLogonTime == j.ActiveParentLogonTime &&
                 ProbeCodec.PreFeatureChildGate(s) && s.SessionInventoryFingerprint == j.Plan.Original.SessionInventoryFingerprint &&
                 s.FeatureEnabled == j.Plan.Original.FeatureEnabled,
@@ -414,7 +452,7 @@ internal sealed class FeasibilityProbe
                 Require(host.HasAdministratorPrivilege, "Administrator privilege is required for child-feature change; no escalation is attempted.");
                 j.Stage = ProbeStage.PreparedEnable; store.Save(j);
                 Require(host.CompareExchangeChildFeature(false, true), "Child-feature enablement did not match the recorded original.");
-                ProbeSnapshot verified = host.Capture(); ValidateUnchanged(j, verified);
+                ProbeSnapshot verified = CaptureForJournal(j, operatorConfirmedIsolation); ValidateUnchanged(j, verified);
                 Require(verified.FeatureEnabled && verified.IndependentNoUnexpectedSessions &&
                     !verified.AssociatedChild.HasValue &&
                     verified.ParentSessionId == j.ActiveParentId && verified.ParentLogonTime == j.ActiveParentLogonTime,
@@ -429,9 +467,9 @@ internal sealed class FeasibilityProbe
         using (owner.Acquire())
         {
             ProbeJournal j = RequiredJournal(); Require(j.Stage == ProbeStage.AwaitFreshParent, "No fresh-parent boundary is pending.");
-            Require(j.Plan.Original.NetworkPosture != ProbeNetworkPosture.NetworkIsolated || operatorConfirmedIsolation,
+            Require(!IsIsolated(j.Plan.Original.NetworkPosture) || operatorConfirmedIsolation,
                 "Isolated fresh-logon verification requires renewed physical isolation confirmation.");
-            ProbeSnapshot s = host.Capture(); ValidateUnchanged(j, s);
+            ProbeSnapshot s = CaptureForJournal(j, operatorConfirmedIsolation); ValidateUnchanged(j, s);
             Require(s.ParentSessionId == s.ConsoleSessionId && s.ParentLogonTime != j.Plan.Original.ParentLogonTime &&
                 s.ParentLogonTime > 0 && s.FeatureEnabled && s.IndependentNoUnexpectedSessions && !s.AssociatedChild.HasValue,
                 "A fresh parent console logon without an unexpected session is required.");
@@ -545,12 +583,12 @@ internal sealed class FeasibilityProbe
         using (owner.Acquire())
         {
             ProbeJournal j = RequiredJournal();
-            ProbeSnapshot s = host.Capture();
-            if (j.Plan.Original.NetworkPosture == ProbeNetworkPosture.NetworkIsolated)
+            ProbeSnapshot s = CaptureForJournal(j, operatorConfirmedIsolation);
+            if (IsIsolated(j.Plan.Original.NetworkPosture))
             {
                 Require(operatorConfirmedIsolation,
                     "Isolated restoration requires renewed physical isolation confirmation.");
-                bool isolated = s != null && s.NetworkIsolationAccepted;
+                bool isolated = IsolationAccepted(s, j.Plan.Original.NetworkPosture);
                 if (!isolated || s.NetworkFingerprint != j.Plan.Original.NetworkFingerprint)
                     RecordNetworkDeviation(j, s,
                         isolated ? "NetworkFingerprintDrift" : "NetworkIsolationLostOrUnknown");
@@ -583,13 +621,13 @@ internal sealed class FeasibilityProbe
                     "Feature state drifted or Administrator privilege is missing; no escalation is attempted.");
                 j.Stage = ProbeStage.Restoring; store.Save(j);
                 Require(host.CompareExchangeChildFeature(true, false), "Child-feature restoration did not match expected state.");
-                s = host.Capture();
+                s = CaptureForJournal(j, operatorConfirmedIsolation);
                 Require(RecoveryCanExcludeChild(j, s) && !s.FeatureEnabled,
                     "Child-feature restoration or session absence was not verified.");
             }
-            if (j.Plan.Original.NetworkPosture == ProbeNetworkPosture.NetworkIsolated &&
-                (!s.NetworkIsolationAccepted || s.NetworkFingerprint != j.Plan.Original.NetworkFingerprint))
-                RecordNetworkDeviation(j, s, s.NetworkIsolationAccepted ?
+            if (IsIsolated(j.Plan.Original.NetworkPosture) &&
+                (!IsolationAccepted(s, j.Plan.Original.NetworkPosture) || s.NetworkFingerprint != j.Plan.Original.NetworkFingerprint))
+                RecordNetworkDeviation(j, s, IsolationAccepted(s, j.Plan.Original.NetworkPosture) ?
                     "NetworkFingerprintDriftAfterRestore" : "NetworkIsolationLostAfterRestore");
             j.Stage = InfrastructureUnchanged(j, s) ? ProbeStage.Restored : ProbeStage.Conflict;
             store.Save(j);
@@ -602,9 +640,11 @@ internal sealed class FeasibilityProbe
     private static bool InfrastructureUnchanged(ProbeJournal j, ProbeSnapshot s)
     {
         if (s == null || s.InfrastructureFingerprint() != j.Plan.Original.InfrastructureFingerprint()) return false;
-        if (j.Plan.Original.NetworkPosture == ProbeNetworkPosture.NetworkIsolated)
-            return s.NetworkIsolationAccepted && s.NetworkFingerprint == j.Plan.Original.NetworkFingerprint &&
+        if (IsIsolated(j.Plan.Original.NetworkPosture))
+            return IsolationAccepted(s, j.Plan.Original.NetworkPosture) &&
+                s.NetworkFingerprint == j.Plan.Original.NetworkFingerprint &&
                 s.RdpPolicyDenied && s.TermServiceStopped && s.RdpListenersAbsent &&
+                (j.Plan.Original.NetworkPosture != ProbeNetworkPosture.ExternalNetworkIsolated || s.BoundaryRdpAccepted) &&
                 s.FirewallObservationComplete;
         return s.LocalRdpPostureAccepted;
     }
@@ -614,15 +654,15 @@ internal sealed class FeasibilityProbe
         using (owner.Acquire())
         {
             ProbeJournal j = RequiredJournal();
-            Require(j.Plan.Original.NetworkPosture == ProbeNetworkPosture.NetworkIsolated,
+            Require(IsIsolated(j.Plan.Original.NetworkPosture),
                 "Reconnect assessment applies only to an isolated Stage A plan.");
             Require(operatorConfirmedIsolation,
                 "Reconnect assessment requires renewed physical isolation confirmation.");
-            ProbeSnapshot s = host.Capture();
-            bool sameNetwork = s != null && s.NetworkIsolationAccepted &&
+            ProbeSnapshot s = CaptureForJournal(j, operatorConfirmedIsolation);
+            bool sameNetwork = IsolationAccepted(s, j.Plan.Original.NetworkPosture) &&
                 s.NetworkFingerprint == j.Plan.Original.NetworkFingerprint;
             if (!sameNetwork)
-                RecordNetworkDeviation(j, s, s != null && s.NetworkIsolationAccepted ?
+                RecordNetworkDeviation(j, s, IsolationAccepted(s, j.Plan.Original.NetworkPosture) ?
                     "NetworkFingerprintDriftAtReconnectCheck" : "NetworkIsolationLostAtReconnectCheck");
             var result = new ProbeReconnectAssessment {
                 FeatureRestored = s != null && s.FeatureAccess == ResourceAccess.Accessible &&

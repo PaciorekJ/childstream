@@ -9,6 +9,7 @@
 [CmdletBinding()]
 param(
     [switch]$OperatorConfirmedPhysicalSeverance,
+    [switch]$IncludeInventory,
     [string]$ExpectedNetworkFingerprint
 )
 
@@ -247,4 +248,12 @@ $report | Add-Member -NotePropertyName Collection -NotePropertyValue ([pscustomo
     BridgeBindings = $bridgeBindings.State; IpForwarding = $ipForwarding.State
     DockerProcesses = $dockerProcesses.State
 })
-$report | ConvertTo-Json -Depth 8
+if ($IncludeInventory) {
+    # One read-only capture supplies both the probe baseline and the topology
+    # decision. This contains private host inventory and must never be uploaded.
+    [pscustomobject]@{ Schema = 'ChildStream.BoundaryCapture.v1'; HostMutation = $false;
+        Inventory = $inventory; Boundary = $report; Observation = $observation } |
+        ConvertTo-Json -Depth 32 -Compress
+} else {
+    $report | ConvertTo-Json -Depth 8
+}
