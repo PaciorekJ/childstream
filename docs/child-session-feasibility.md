@@ -1,6 +1,6 @@
 # One-session Windows feasibility experiment
 
-This branch provides an operator-controlled experiment harness, not approval to run it. No Stage A or B command has been executed on the physical host. Synthetic tests establish code behavior, not Windows build 26200 behavior.
+This branch provides an operator-controlled experiment harness, not approval to run it. No Stage A or B command has been executed on a live Windows target. The protected workstation is blocked by the permanent [scope boundary](scope-boundary.md); do not use any command in this document there as a reason to inspect or interrupt unrelated work. Use an [independent Windows target](stage-ab-physical-window.md). Synthetic tests establish code behavior, not Windows build 26200 behavior.
 
 The separate [network-isolated Stage A runbook](network-isolated-stage-a.md) describes an offline-only posture that can tolerate the existing 20 potentially RDP-permissive and six unknown rules **only while independent network isolation is verified**. The connected-network gate below remains unchanged. A version 4 isolated plan remains Stage A only. The version 5 external/guest boundary can continue from a validated Stage A to [one separately approved local Stage B interaction test](isolated-stage-b.md) under the same journal and physical isolation. No physical network isolation, feature change or child connection has been executed by this work.
 

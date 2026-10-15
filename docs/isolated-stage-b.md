@@ -1,6 +1,6 @@
 # One isolated local Stage B interaction test
 
-**Prepared in source; no physical Stage B test is authorized or reported as passed.** This path continues the *same* version 5 `ExternalNetworkIsolated` journal after a positive `StageAValidated` result. Keep external links physically severed, Docker/WSL and other guest paths quiescent, and the second local observer present. Do not restore the child feature, reconnect the PC, or restart workloads between Stage A and this separately approved test. The version 4 strict-isolation plan remains Stage A only. The connected-network RDP gate is unchanged.
+**Prepared in source; no live Stage B test is authorized or reported as passed.** The protected workstation is [outside this execution path](scope-boundary.md); do not pause Docker/WSL/Tailscale, disconnect its network or sign it out for ChildStream. On a separate dedicated target whose complete version 5 `ExternalNetworkIsolated` gate actually passes, this path continues the *same* journal after a positive `StageAValidated` result. Keep that target isolated and the second local observer present. Do not restore its child feature or reconnect it between Stage A and this separately approved test. The version 4 strict-isolation plan remains Stage A only. The connected-network RDP gate is unchanged.
 
 ## Separate approval and preflight
 
@@ -37,7 +37,7 @@ After **separate approval to terminate the exact test child**, and only while th
 .\tests\.artifacts\ChildStreamFeasibilityProbe.exe reconnect-boundary-check I-CONFIRM-PHYSICAL-ISOLATION
 ```
 
-The probe rereads the parent-associated child ID and WTS generation immediately before `WTSLogoffSession`, writes `TeardownPrepared` first, and does not retry an ambiguous logoff. It verifies positive child absence and unrelated-session exclusion afterward. Restoration changes only the journal-owned child-feature value; `ReconnectReady=True` requires the original feature, RDP policy, service/listeners, firewall, display/native-resource fingerprint and isolated boundary to be independently verified. Only after local review of that result may the operator restore the specifically recorded physical links and paused workloads. Verify their health and data separately. No command here changes ordinary RDP, firewall, Sunshine, VDD or display configuration.
+The probe rereads the parent-associated child ID and WTS generation immediately before `WTSLogoffSession`, writes `TeardownPrepared` first, and does not retry an ambiguous logoff. It verifies positive child absence and unrelated-session exclusion afterward. Restoration changes only the journal-owned child-feature value; `ReconnectReady=True` requires the original feature, RDP policy, service/listeners, firewall, display/native-resource fingerprint and isolated boundary to be independently verified. Only after local review of that result may the operator restore the dedicated target's approved network state. No command here changes ordinary RDP, firewall, Sunshine, VDD or display configuration.
 
 ## Interrupted viewer or changed boundary
 

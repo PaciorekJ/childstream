@@ -45,13 +45,7 @@ foreach ($scriptName in @('network-boundary-diagnostic.ps1','network-source-shap
     }, $true))
     if ($writes.Count -ne 0) { throw "$scriptName contains a host-mutation command: $($writes[0].GetCommandName())" }
 }
-$workloadSource = Get-Content (Join-Path $root 'scripts\workload-inventory.ps1') -Raw
-$workloadTokens = $null
-$workloadErrors = $null
-[System.Management.Automation.Language.Parser]::ParseInput($workloadSource,
-    [ref]$workloadTokens, [ref]$workloadErrors) | Out-Null
-if ($workloadErrors.Count -ne 0) { throw "Private workload inventory syntax failed: $($workloadErrors[0].Message)" }
-if ($workloadSource -match '(?im)^\s*(?:docker\s+(?:stop|start|rm|kill)|wsl\s+--(?:terminate|shutdown)|Stop-Service|Stop-Process)\b') {
-    throw 'Private workload inventory contains a workload mutation command.'
+if (Test-Path -LiteralPath (Join-Path $root 'scripts\workload-inventory.ps1')) {
+    throw 'Retired cross-project workload inventory must not be present.'
 }
 Write-Output 'Read-only network, source-shape and HNS syntax/mutation-command audit passed.'
