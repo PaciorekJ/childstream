@@ -161,9 +161,13 @@ $wsl = Observed {
     [pscustomobject]@{ State = 'Accessible'; RunningDistributions = $running;
         Mode = 'Unknown'; Note = 'No distro is launched to query effective WSL networking mode.' }
 }
-$docker = Observed {
-    $lines = @(docker ps --format '{{json .}}' 2>$null)
-    if ($LASTEXITCODE -ne 0) { throw 'Docker container listing failed.' }
+$docker = try {
+    $lines = @(docker ps --format '{{json .}}' 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        $errorText = ($lines | ForEach-Object { [string]$_ }) -join ' '
+        [pscustomobject]@{ State = 'Inaccessible'; ErrorClass = Get-ChildStreamDockerErrorClass $errorText;
+            RunningContainerCount = $null; PublishedBindings = @() }
+    } else {
     $bindings = @()
     foreach ($line in $lines) {
         if (-not $line) { continue }
@@ -174,15 +178,31 @@ $docker = Observed {
     }
     [pscustomobject]@{ State = 'Accessible'; RunningContainerCount = @($lines | Where-Object { $_ }).Count;
         PublishedBindings = @($bindings) }
+    }
+} catch {
+    [pscustomobject]@{ State = 'Inaccessible'; ErrorClass = Get-ChildStreamDockerErrorClass $_.Exception.Message;
+        RunningContainerCount = $null; PublishedBindings = @() }
 }
 $dockerProcesses = Observed {
     [pscustomobject]@{ State = 'Accessible'; Items = @(
         # A filtered CIM query can succeed with zero rows. Get-Process with
         # SilentlyContinue could hide a provider/access error as zero peers.
-        Get-CimInstance -ClassName Win32_Process -Filter "Name='Docker Desktop.exe' OR Name='com.docker.backend.exe' OR Name='dockerd.exe'" -ErrorAction Stop |
+        Get-CimInstance -ClassName Win32_Process -Filter "Name='Docker Desktop.exe' OR Name='com.docker.backend.exe' OR Name='dockerd.exe' OR Name='com.docker.proxy.exe' OR Name='vpnkit.exe'" -ErrorAction Stop |
             Select-Object @{Name='ProcessName';Expression={$_.Name}},@{Name='Id';Expression={$_.ProcessId}}
     ) }
 }
+$dockerListeners = Observed {
+    if ($dockerProcesses.State -ne 'Accessible') { throw 'Docker process inventory is inaccessible.' }
+    $processIds = @($dockerProcesses.Items | ForEach-Object { [int]$_.Id })
+    $tcp = @(Get-NetTCPConnection -State Listen -ErrorAction Stop |
+        Where-Object { [int]$_.OwningProcess -in $processIds })
+    $udp = @(Get-NetUDPEndpoint -ErrorAction Stop |
+        Where-Object { [int]$_.OwningProcess -in $processIds })
+    [pscustomobject]@{ State = 'Accessible'; DockerOwnedTcpCount = $tcp.Count;
+        DockerOwnedUdpCount = $udp.Count }
+}
+$docker = Resolve-ChildStreamDockerObservation -Docker $docker -DockerProcesses $dockerProcesses -Wsl $wsl `
+    -HnsEndpoints $hnsEndpoints -PortProxy $portProxy -Forwarding $forwarding -DockerListeners $dockerListeners
 
 $rdp = [pscustomobject]@{ State = 'Inaccessible'; PolicyDenied = $null;
     TermServiceStopped = $null; TcpListenerCount = $null; UdpEndpointCount = $null }
@@ -221,6 +241,7 @@ $observation = [pscustomobject]@{
     Wsl = $wsl
     Docker = $docker
     DockerProcesses = $dockerProcesses
+    DockerListeners = $dockerListeners
     Rdp = $rdp
     RdpEvidence = $inventory.Rdp
     Forwarding = $forwarding
@@ -246,7 +267,7 @@ $report | Add-Member -NotePropertyName Collection -NotePropertyValue ([pscustomo
     Wsl = $wsl.State; Docker = $docker.State; Hns = $hns.State
     HnsEndpoints = $hnsEndpoints.State; NetNat = $netNat.State; PortProxy = $portProxy.State
     BridgeBindings = $bridgeBindings.State; IpForwarding = $ipForwarding.State
-    DockerProcesses = $dockerProcesses.State
+    DockerProcesses = $dockerProcesses.State; DockerListeners = $dockerListeners.State
 })
 if ($IncludeInventory) {
     # One read-only capture supplies both the probe baseline and the topology

@@ -35,6 +35,11 @@ internal static class FeasibilityProbeTests
                 State.TermServiceStopped = false;
                 State.RdpListenersAbsent = false;
                 State.ListenerFingerprint = "listener-started";
+                if (State.BoundaryAccepted)
+                {
+                    State.BoundaryRdpAccepted = false;
+                    State.NetworkFingerprint = "rdp-drift";
+                }
             }
             if (FailAfterFeature) throw new IOException("After feature write");
             return true;
@@ -893,6 +898,13 @@ internal static class FeasibilityProbeTests
             f.SetBoundary();
             Throws<InvalidOperationException>(() => f.Probe.Plan(ProbeNetworkPosture.ExternalNetworkIsolated, false),
                 "v5 boundary requires operator confirmation");
+            f.Host.State.BoundaryAccepted = false;
+            Throws<InvalidOperationException>(() => f.Probe.Plan(ProbeNetworkPosture.ExternalNetworkIsolated, true),
+                "failed read-only boundary plan cannot proceed");
+            Check(!File.Exists(Path.Combine(f.Root, "probe.journal")) &&
+                !File.Exists(Path.Combine(f.Root, "probe.lock")),
+                "failed pre-begin plan creates no journal or lock and needs no transaction reconnect command");
+            f.Host.State.BoundaryAccepted = true;
             ProbePlan plan = f.Probe.Plan(ProbeNetworkPosture.ExternalNetworkIsolated, true);
             Check(plan.Original.FormatVersion == 5 &&
                 plan.Original.NetworkPosture == ProbeNetworkPosture.ExternalNetworkIsolated &&
@@ -962,10 +974,22 @@ internal static class FeasibilityProbeTests
             Throws<InvalidOperationException>(() => f.Probe.PrepareFeature(true),
                 "unexpected RDP listener blocks Stage A after feature enablement");
             Throws<InvalidOperationException>(() => f.Probe.RestoreOriginal(true, false, true),
-                "feature restoration exposes unresolved RDP listener as conflict");
+                "RDP-driven fingerprint drift requires explicit reviewed recovery");
+            Check(f.Host.State.FeatureEnabled && f.Store.Load().NetworkDeviationObserved,
+                "no feature restoration occurs before reviewed recovery of RDP drift");
+            Throws<InvalidOperationException>(() => f.Probe.RestoreOriginal(true, true, true),
+                "reviewed feature restoration still exposes unresolved RDP listener as conflict");
             Check(!f.Host.State.FeatureEnabled && f.Store.Load().Stage == ProbeStage.Conflict &&
                 !f.Probe.AssessReconnect(true).Ready,
                 "reconnection stays blocked despite restored feature");
+            f.Host.State.TermServiceStopped = true;
+            f.Host.State.RdpListenersAbsent = true;
+            f.Host.State.ListenerFingerprint = "listener-1";
+            f.Host.State.BoundaryRdpAccepted = true;
+            f.Host.State.NetworkFingerprint = "network-1";
+            Check(f.Probe.RestoreOriginal(true, true, true).Stage == ProbeStage.Restored &&
+                f.Probe.AssessReconnect(true).Ready,
+                "separately reviewed service/listener recovery can resolve conflict only after original state returns");
         }
         using (var f = new Fixture())
         {
@@ -1040,7 +1064,7 @@ internal static class FeasibilityProbeTests
                 Verdict = i == 14 ? "Unknown" : "Pass" };
         string[] sources = { "Inventory", "HyperVSwitches", "HyperVVirtualMachines",
             "HyperVHostPorts", "HyperVVmPorts", "Wsl", "Docker", "Hns", "HnsEndpoints",
-            "NetNat", "PortProxy", "BridgeBindings", "IpForwarding", "DockerProcesses" };
+            "NetNat", "PortProxy", "BridgeBindings", "IpForwarding", "DockerProcesses", "DockerListeners" };
         var collection = new Dictionary<string, object>();
         foreach (string source in sources) collection[source] = "Accessible";
         string fingerprint = new string('a', 64);
@@ -1052,14 +1076,22 @@ internal static class FeasibilityProbeTests
             { "BridgeBindings", new { State = "Accessible", QueryMode = "PerRelevantAdapter",
                 Items = new object[0], Queried = new object[] { new { InterfaceIndex = 7 } },
                 Failures = new object[0] } },
-            { "IpForwarding", empty }, { "Wsl", empty }, { "Docker", empty },
+            { "IpForwarding", empty }, { "Wsl", new { State = "Accessible",
+                RunningDistributions = new object[0], Items = new object[0] } },
+            { "Docker", new { State = "Accessible", RunningContainerCount = 0,
+                PublishedBindings = new object[0] } },
             { "DockerProcesses", empty },
+            { "DockerListeners", new { State = "Accessible", DockerOwnedTcpCount = 0,
+                DockerOwnedUdpCount = 0 } },
             { "Rdp", new { State = "Accessible", PolicyDenied = true, TermServiceStopped = true,
                 TcpListenerCount = 0, UdpEndpointCount = 0 } },
             { "RdpEvidence", original["Rdp"] },
             { "OperatorPhysicalSeveranceConfirmed", true },
             { "AdapterCollectionConsistent", true },
-            { "Forwarding", new { BridgeGraphReviewed = true, UnreviewedForwardingPaths = 0 } },
+            { "Forwarding", new { HnsState = "Accessible", NetNatState = "Accessible",
+                PortProxyState = "Accessible", BridgeBindingState = "Accessible",
+                IpForwardingState = "Accessible", BridgeGraphReviewed = true,
+                UnreviewedForwardingPaths = 0 } },
             { "CurrentNetworkFingerprint", fingerprint }
         };
         var boundary = new Dictionary<string, object> {
@@ -1084,6 +1116,19 @@ internal static class FeasibilityProbeTests
         Check(accepted.BoundaryAccepted && accepted.BoundaryRdpAccepted &&
             accepted.NetworkFingerprint.Length == 64,
             "one private capture binds complete external, guest and RDP evidence");
+        var stoppedRoot = (Dictionary<string, object>)serializer.DeserializeObject(json);
+        var stoppedObservation = (Dictionary<string, object>)stoppedRoot["Observation"];
+        var stoppedBoundary = (Dictionary<string, object>)stoppedRoot["Boundary"];
+        var stoppedCollection = (Dictionary<string, object>)stoppedBoundary["Collection"];
+        stoppedObservation["Docker"] = new { State = "VerifiedStopped", ErrorClass = "DaemonUnavailable",
+            RunningContainerCount = (int?)null, PublishedBindings = new object[0] };
+        stoppedCollection["Docker"] = "VerifiedStopped";
+        Check(WindowsFeasibilityHost.ParseBoundaryCapture(serializer.Serialize(stoppedRoot)).BoundaryAccepted,
+            "independently corroborated stopped Docker state can satisfy v5 capture");
+        stoppedObservation["DockerListeners"] = new { State = "Accessible", DockerOwnedTcpCount = 1,
+            DockerOwnedUdpCount = 0 };
+        Check(!WindowsFeasibilityHost.ParseBoundaryCapture(serializer.Serialize(stoppedRoot)).BoundaryAccepted,
+            "v5 parser rejects a stopped claim with a residual Docker listener");
         var root = (Dictionary<string, object>)serializer.DeserializeObject(json);
         var boundary = (Dictionary<string, object>)root["Boundary"];
         boundary["BridgeBindingDiagnostic"] = new { QueryMode = "PerRelevantAdapter",

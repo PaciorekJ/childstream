@@ -162,9 +162,10 @@ internal sealed class WindowsFeasibilityHost : IFeasibilityHost
 
         string[] requiredSources = { "Inventory", "HyperVSwitches", "HyperVVirtualMachines",
             "HyperVHostPorts", "HyperVVmPorts", "Wsl", "Docker", "Hns", "HnsEndpoints",
-            "NetNat", "PortProxy", "BridgeBindings", "IpForwarding", "DockerProcesses" };
+            "NetNat", "PortProxy", "BridgeBindings", "IpForwarding", "DockerProcesses", "DockerListeners" };
         object collection = At(boundary, "Collection");
-        bool collectionComplete = requiredSources.All(name => Str(At(collection, name)) == "Accessible");
+        bool collectionComplete = requiredSources.All(name => Str(At(collection, name)) == "Accessible" ||
+            name == "Docker" && Str(At(collection, name)) == "VerifiedStopped");
         object bridge = At(boundary, "BridgeBindingDiagnostic");
         object[] adapters = Items(At(observation, "Adapters"));
         var pathIndices = new HashSet<long>(Items(At(observation, "IpAddresses"))
@@ -241,8 +242,45 @@ internal sealed class WindowsFeasibilityHost : IFeasibilityHost
             throw new InvalidDataException("Boundary observation does not match its Windows inventory.");
         string[] observedSources = { "Adapters", "IpInterfaces", "IpAddresses", "Routes", "Switches",
             "HostPorts", "VirtualMachines", "VmPorts", "Hns", "HnsEndpoints", "NetNat", "PortProxy",
-            "BridgeBindings", "IpForwarding", "Wsl", "Docker", "DockerProcesses", "Rdp" };
-        bool observedComplete = observedSources.All(name => Str(At(At(observation, name), "State")) == "Accessible");
+            "BridgeBindings", "IpForwarding", "Wsl", "Docker", "DockerProcesses", "DockerListeners", "Rdp" };
+        bool observedComplete = observedSources.All(name => Str(At(At(observation, name), "State")) == "Accessible" ||
+            name == "Docker" && Str(At(At(observation, name), "State")) == "VerifiedStopped");
+        object docker = At(observation, "Docker"), dockerListeners = At(observation, "DockerListeners");
+        object forwarding = At(observation, "Forwarding");
+        bool dockerStopped = Str(At(docker, "State")) == "VerifiedStopped";
+        bool dockerObservedConsistent = Str(At(collection, "Docker")) == Str(At(docker, "State")) &&
+            (dockerStopped || Str(At(docker, "State")) == "Accessible" &&
+                Num(At(docker, "RunningContainerCount")) >= 0 &&
+                At(docker, "PublishedBindings") is object[]);
+        bool dockerStoppedCorroborated = !dockerStopped ||
+            Str(At(docker, "ErrorClass")) == "DaemonUnavailable" &&
+            At(docker, "RunningContainerCount") == null &&
+            At(docker, "PublishedBindings") is object[] &&
+            ((object[])At(docker, "PublishedBindings")).Length == 0 &&
+            Str(At(collection, "Docker")) == "VerifiedStopped" &&
+            Is(At(observation, "DockerProcesses"), "Accessible") &&
+            At(At(observation, "DockerProcesses"), "Items") is object[] &&
+            Items(At(observation, "DockerProcesses")).Length == 0 &&
+            Is(At(observation, "Wsl"), "Accessible") &&
+            At(At(observation, "Wsl"), "RunningDistributions") is object[] &&
+            ((object[])At(At(observation, "Wsl"), "RunningDistributions")).Length == 0 &&
+            Is(At(observation, "HnsEndpoints"), "Accessible") &&
+            At(At(observation, "HnsEndpoints"), "Items") is object[] &&
+            Items(At(observation, "HnsEndpoints")).Length == 0 &&
+            Is(At(observation, "PortProxy"), "Accessible") &&
+            At(At(observation, "PortProxy"), "Items") is object[] &&
+            Items(At(observation, "PortProxy")).Length == 0 &&
+            Is(dockerListeners, "Accessible") &&
+            Num(At(dockerListeners, "DockerOwnedTcpCount")) == 0 &&
+            Num(At(dockerListeners, "DockerOwnedUdpCount")) == 0 &&
+            Str(At(forwarding, "HnsState")) == "Accessible" &&
+            Str(At(forwarding, "NetNatState")) == "Accessible" &&
+            Str(At(forwarding, "PortProxyState")) == "Accessible" &&
+            Str(At(forwarding, "BridgeBindingState")) == "Accessible" &&
+            Str(At(forwarding, "IpForwardingState")) == "Accessible" &&
+            At(forwarding, "BridgeGraphReviewed") is bool &&
+            (bool)At(forwarding, "BridgeGraphReviewed") &&
+            Num(At(forwarding, "UnreviewedForwardingPaths")) == 0;
         string reported = Str(At(boundary, "CurrentNetworkFingerprint"));
         bool fingerprintComplete = !String.IsNullOrEmpty(reported) && reported.Length == 64 &&
             reported.All(c => c >= '0' && c <= '9' || c >= 'a' && c <= 'f') &&
@@ -260,7 +298,7 @@ internal sealed class WindowsFeasibilityHost : IFeasibilityHost
               Num(At(observedRdp, "UdpEndpointCount")) == 0) != snapshot.RdpListenersAbsent))
             throw new InvalidDataException("Boundary RDP observation conflicts with Windows inventory.");
         snapshot.BoundaryAccepted = collectionComplete && bridgeComplete && externalAndGuestPass &&
-            observedComplete && fingerprintComplete &&
+            observedComplete && dockerObservedConsistent && dockerStoppedCorroborated && fingerprintComplete &&
             At(observation, "OperatorPhysicalSeveranceConfirmed") is bool &&
             (bool)At(observation, "OperatorPhysicalSeveranceConfirmed") &&
             At(observation, "AdapterCollectionConsistent") is bool &&

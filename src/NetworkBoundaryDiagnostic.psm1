@@ -14,6 +14,15 @@ function Read-Items($Section) {
     return @($items)
 }
 
+function Test-ChildStreamArrayField($Object, [string]$Name) {
+    if ($null -eq $Object) { return $false }
+    if ($Object -is [System.Collections.IDictionary]) {
+        return $Object.Contains($Name) -and $Object[$Name] -is [array]
+    }
+    $property = $Object.PSObject.Properties[$Name]
+    return $null -ne $property -and $property.Value -is [array]
+}
+
 function New-Predicate([string]$Id, [string]$Condition, [string]$Verdict, [string[]]$Evidence) {
     [pscustomobject]@{ Id = $Id; Condition = $Condition; Verdict = $Verdict; Evidence = @($Evidence) }
 }
@@ -29,6 +38,60 @@ function Read-ExceptionStatus($Exception) {
     $property = $Exception.PSObject.Properties['StatusCode']
     if ($null -eq $property) { return $null }
     return [string]$property.Value
+}
+
+function Get-ChildStreamDockerErrorClass([string]$Message) {
+    if ($Message -match '(?i)permission denied|access is denied|unauthorized|forbidden') { return 'AccessDenied' }
+    if ($Message -match '(?i)cannot connect to the docker daemon|is the docker daemon running|the system cannot find the file|pipe.*not found|daemon is not running') { return 'DaemonUnavailable' }
+    return 'Unknown'
+}
+
+function Resolve-ChildStreamDockerObservation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Docker,
+        [Parameter(Mandatory)]$DockerProcesses,
+        [Parameter(Mandatory)]$Wsl,
+        [Parameter(Mandatory)]$HnsEndpoints,
+        [Parameter(Mandatory)]$PortProxy,
+        [Parameter(Mandatory)]$Forwarding,
+        [Parameter(Mandatory)]$DockerListeners
+    )
+    if ((Read-Field $Docker 'State') -eq 'Accessible') { return $Docker }
+    $corroborated = (Read-Field $Docker 'State') -eq 'Inaccessible' -and
+        (Read-Field $Docker 'ErrorClass') -eq 'DaemonUnavailable' -and
+        (Read-Field $DockerProcesses 'State') -eq 'Accessible' -and
+        (Test-ChildStreamArrayField $DockerProcesses 'Items') -and
+        @(Read-Items $DockerProcesses).Count -eq 0 -and
+        (Read-Field $Wsl 'State') -eq 'Accessible' -and
+        (Test-ChildStreamArrayField $Wsl 'RunningDistributions') -and
+        @((Read-Field $Wsl 'RunningDistributions') | Where-Object { $_ }).Count -eq 0 -and
+        (Read-Field $HnsEndpoints 'State') -eq 'Accessible' -and
+        (Test-ChildStreamArrayField $HnsEndpoints 'Items') -and
+        @(Read-Items $HnsEndpoints).Count -eq 0 -and
+        (Read-Field $PortProxy 'State') -eq 'Accessible' -and
+        (Test-ChildStreamArrayField $PortProxy 'Items') -and
+        @(Read-Items $PortProxy).Count -eq 0 -and
+        (Read-Field $DockerListeners 'State') -eq 'Accessible' -and
+        $null -ne (Read-Field $DockerListeners 'DockerOwnedTcpCount') -and
+        $null -ne (Read-Field $DockerListeners 'DockerOwnedUdpCount') -and
+        (Read-Field $DockerListeners 'DockerOwnedTcpCount') -eq 0 -and
+        (Read-Field $DockerListeners 'DockerOwnedUdpCount') -eq 0 -and
+        (Read-Field $Forwarding 'HnsState') -eq 'Accessible' -and
+        (Read-Field $Forwarding 'NetNatState') -eq 'Accessible' -and
+        (Read-Field $Forwarding 'PortProxyState') -eq 'Accessible' -and
+        (Read-Field $Forwarding 'BridgeBindingState') -eq 'Accessible' -and
+        (Read-Field $Forwarding 'IpForwardingState') -eq 'Accessible' -and
+        (Read-Field $Forwarding 'BridgeGraphReviewed') -eq $true -and
+        (Read-Field $Forwarding 'UnreviewedForwardingPaths') -eq 0
+    if (-not $corroborated) { return $Docker }
+    [pscustomobject]@{
+        State = 'VerifiedStopped'
+        RunningContainerCount = $null
+        PublishedBindings = @()
+        ErrorClass = 'DaemonUnavailable'
+        Evidence = 'No Docker process, running WSL distribution, HNS endpoint, portproxy, unreviewed forwarding path, or Docker-owned listener; all sources accessible.'
+    }
 }
 
 function Get-ChildStreamBridgeBindingObservation {
@@ -144,9 +207,10 @@ function Get-ChildStreamBoundaryFingerprint {
     $sources = [ordered]@{}
     foreach ($name in @('Adapters','IpInterfaces','IpAddresses','Routes','Switches','HostPorts',
         'VirtualMachines','VmPorts','Hns','HnsEndpoints','NetNat','PortProxy',
-        'BridgeBindings','IpForwarding','Wsl','Docker','DockerProcesses','Rdp')) {
+        'BridgeBindings','IpForwarding','Wsl','Docker','DockerProcesses','DockerListeners','Rdp')) {
         $section = Read-Field $Observation $name
-        if ((Read-Field $section 'State') -ne 'Accessible') { return $null }
+        if ((Read-Field $section 'State') -ne 'Accessible' -and
+            -not ($name -eq 'Docker' -and (Read-Field $section 'State') -eq 'VerifiedStopped')) { return $null }
         $sources[$name] = $section
     }
     $sources['AdapterCollectionConsistent'] = Read-Field $Observation 'AdapterCollectionConsistent'
@@ -183,6 +247,7 @@ function Get-ChildStreamNetworkBoundaryDiagnostic {
     $wsl = Read-Field $Observation 'Wsl'
     $docker = Read-Field $Observation 'Docker'
     $dockerProcesses = Read-Field $Observation 'DockerProcesses'
+    $dockerListeners = Read-Field $Observation 'DockerListeners'
     $rdp = Read-Field $Observation 'Rdp'
     $forwarding = Read-Field $Observation 'Forwarding'
 
@@ -356,10 +421,12 @@ function Get-ChildStreamNetworkBoundaryDiagnostic {
 
     $runningVms = @(Read-Items $vms | Where-Object { (Read-Field $_ 'State') -ne 'Off' })
     $runningWsl = @((Read-Field $wsl 'RunningDistributions')) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) }
-    $runningDocker = Read-Field $docker 'RunningContainerCount'
+    $dockerStopped = (Read-Field $docker 'State') -eq 'VerifiedStopped'
+    $runningDocker = if ($dockerStopped) { 0 } else { Read-Field $docker 'RunningContainerCount' }
     $guestKnown = (Read-Field $vms 'State') -eq 'Accessible' -and (Read-Field $wsl 'State') -eq 'Accessible' -and
-        (Read-Field $docker 'State') -eq 'Accessible' -and $null -ne $runningDocker -and
+        (Read-Field $docker 'State') -in @('Accessible','VerifiedStopped') -and $null -ne $runningDocker -and
         (Read-Field $dockerProcesses 'State') -eq 'Accessible' -and
+        (Read-Field $dockerListeners 'State') -eq 'Accessible' -and
         (Read-Field $vmPorts 'State') -eq 'Accessible' -and (Read-Field $hns 'State') -eq 'Accessible'
     $guestPresent = $runningVms.Count -gt 0 -or @($runningWsl).Count -gt 0 -or [int]$runningDocker -gt 0 -or
         @(Read-Items $dockerProcesses).Count -gt 0 -or $endpointCount -gt 0
@@ -368,7 +435,9 @@ function Get-ChildStreamNetworkBoundaryDiagnostic {
         "VMs=$($runningVms.Count) VM-inventory=$((Read-Field $vms 'State')); WSL-running=$(@($runningWsl).Count) WSL-mode=$((Read-Field $wsl 'Mode')); Docker-containers=$runningDocker Docker-inventory=$((Read-Field $docker 'State')); Docker-processes=$(@(Read-Items $dockerProcesses).Count); HNS-endpoints=$endpointCount")))
 
     $published = @((Read-Field $docker 'PublishedBindings')) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) }
-    $forwardVerdict = if ((Read-Field $docker 'State') -ne 'Accessible') { 'Unknown' } elseif (@($published).Count) { 'Fail' } else { 'Pass' }
+    $forwardVerdict = if ($dockerStopped) { 'Pass' }
+        elseif ((Read-Field $docker 'State') -ne 'Accessible') { 'Unknown' }
+        elseif (@($published).Count) { 'Fail' } else { 'Pass' }
     $predicates.Add((New-Predicate 'docker-host-forwarding-absent' 'GuestPath' $forwardVerdict @(
         $published | ForEach-Object { "Published host binding: $_" })))
 
@@ -421,4 +490,4 @@ function Get-ChildStreamNetworkBoundaryDiagnostic {
     }
 }
 
-Export-ModuleMember -Function Get-ChildStreamNetworkBoundaryDiagnostic,Get-ChildStreamBoundaryFingerprint,Get-ChildStreamBridgeBindingObservation
+Export-ModuleMember -Function Get-ChildStreamNetworkBoundaryDiagnostic,Get-ChildStreamBoundaryFingerprint,Get-ChildStreamBridgeBindingObservation,Resolve-ChildStreamDockerObservation,Get-ChildStreamDockerErrorClass

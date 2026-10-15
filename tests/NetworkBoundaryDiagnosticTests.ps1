@@ -31,6 +31,7 @@ $baseline = @{
     Wsl = @{ State = 'Accessible'; Mode = 'nat'; RunningDistributions = @() }
     Docker = @{ State = 'Accessible'; RunningContainerCount = 0; PublishedBindings = @() }
     DockerProcesses = @{ State = 'Accessible'; Items = @() }
+    DockerListeners = @{ State = 'Accessible'; DockerOwnedTcpCount = 0; DockerOwnedUdpCount = 0 }
     Forwarding = @{ HnsState = 'Accessible'; NetNatState = 'Accessible'; PortProxyState = 'Accessible';
         HnsEndpointState = 'Accessible'; BridgeBindingState = 'Accessible';
         IpForwardingState = 'Accessible'; EnabledBridgeBindingCount = 0;
@@ -82,6 +83,59 @@ Check ((Predicate $report 'internal-guests-quiescent') -eq 'Fail' -and
     (Predicate $report 'docker-host-forwarding-absent') -eq 'Fail') 'Active WSL2/Docker guests and forwarding block the internal exposure claim.'
 Check ('internal-guests-quiescent' -in $report.BlockingFindings.CurrentState -and
     'physical-severance-confirmed' -notin $report.BlockingFindings.EvidenceGaps) 'Current workload blockers and preapproval checks are reported separately.'
+
+$stopped = Clone $baseline
+Check ((Get-ChildStreamDockerErrorClass 'open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified') -eq 'DaemonUnavailable' -and
+    (Get-ChildStreamDockerErrorClass 'permission denied while trying to connect to the docker API') -eq 'AccessDenied' -and
+    (Get-ChildStreamDockerErrorClass 'unclassified Docker error') -eq 'Unknown') `
+    'Only a recognized absent-daemon error can enter independent stopped-state verification.'
+$stopped.Docker = @{ State = 'Inaccessible'; ErrorClass = 'DaemonUnavailable';
+    RunningContainerCount = $null; PublishedBindings = @() }
+$stopped.Docker = Resolve-ChildStreamDockerObservation -Docker $stopped.Docker `
+    -DockerProcesses $stopped.DockerProcesses -Wsl $stopped.Wsl -HnsEndpoints $stopped.HnsEndpoints `
+    -PortProxy $stopped.PortProxy -Forwarding $stopped.Forwarding -DockerListeners $stopped.DockerListeners
+$report = Get-ChildStreamNetworkBoundaryDiagnostic -Observation $stopped
+Check ($stopped.Docker.State -eq 'VerifiedStopped' -and $stopped.Docker.RunningContainerCount -eq $null -and
+    $report.Conditions.GuestPath -eq 'Pass' -and (Get-ChildStreamBoundaryFingerprint -Observation $stopped)) `
+    'Daemon-unavailable plus independent WSL, process, HNS, forwarding and listener evidence permits verified stopped state without inventing a container count.'
+$denied = Clone $baseline
+$denied.Docker = @{ State = 'Inaccessible'; ErrorClass = 'AccessDenied'; RunningContainerCount = $null; PublishedBindings = @() }
+$denied.Docker = Resolve-ChildStreamDockerObservation -Docker $denied.Docker `
+    -DockerProcesses $denied.DockerProcesses -Wsl $denied.Wsl -HnsEndpoints $denied.HnsEndpoints `
+    -PortProxy $denied.PortProxy -Forwarding $denied.Forwarding -DockerListeners $denied.DockerListeners
+Check ($denied.Docker.State -eq 'Inaccessible' -and
+    (Predicate (Get-ChildStreamNetworkBoundaryDiagnostic -Observation $denied) 'internal-guests-quiescent') -eq 'Unknown') `
+    'Permission denial cannot masquerade as a stopped Docker daemon.'
+foreach ($source in @('DockerProcesses','Wsl','HnsEndpoints','PortProxy','DockerListeners')) {
+    $incomplete = Clone $baseline
+    $incomplete.Docker = @{ State = 'Inaccessible'; ErrorClass = 'DaemonUnavailable'; RunningContainerCount = $null; PublishedBindings = @() }
+    $incomplete[$source].State = 'Inaccessible'
+    $incomplete.Docker = Resolve-ChildStreamDockerObservation -Docker $incomplete.Docker `
+        -DockerProcesses $incomplete.DockerProcesses -Wsl $incomplete.Wsl -HnsEndpoints $incomplete.HnsEndpoints `
+        -PortProxy $incomplete.PortProxy -Forwarding $incomplete.Forwarding -DockerListeners $incomplete.DockerListeners
+    Check ($incomplete.Docker.State -eq 'Inaccessible') "An unread $source source cannot prove Docker stopped."
+}
+$residual = Clone $baseline
+$residual.Docker = @{ State = 'Inaccessible'; ErrorClass = 'DaemonUnavailable'; RunningContainerCount = $null; PublishedBindings = @() }
+$residual.DockerListeners.DockerOwnedTcpCount = 1
+$residual.Docker = Resolve-ChildStreamDockerObservation -Docker $residual.Docker `
+    -DockerProcesses $residual.DockerProcesses -Wsl $residual.Wsl -HnsEndpoints $residual.HnsEndpoints `
+    -PortProxy $residual.PortProxy -Forwarding $residual.Forwarding -DockerListeners $residual.DockerListeners
+Check ($residual.Docker.State -eq 'Inaccessible') 'Residual Docker-owned listener prevents verified stopped state.'
+$residual = Clone $baseline
+$residual.Docker = @{ State = 'Inaccessible'; ErrorClass = 'DaemonUnavailable'; RunningContainerCount = $null; PublishedBindings = @() }
+$residual.HnsEndpoints.Items += @{ ID = 'still-attached' }
+$residual.Docker = Resolve-ChildStreamDockerObservation -Docker $residual.Docker `
+    -DockerProcesses $residual.DockerProcesses -Wsl $residual.Wsl -HnsEndpoints $residual.HnsEndpoints `
+    -PortProxy $residual.PortProxy -Forwarding $residual.Forwarding -DockerListeners $residual.DockerListeners
+Check ($residual.Docker.State -eq 'Inaccessible') 'Residual HNS endpoint prevents verified stopped state.'
+$missing = Clone $baseline
+$missing.Docker = @{ State = 'Inaccessible'; ErrorClass = 'DaemonUnavailable'; RunningContainerCount = $null; PublishedBindings = @() }
+$missing.Wsl.Remove('RunningDistributions')
+$missing.Docker = Resolve-ChildStreamDockerObservation -Docker $missing.Docker `
+    -DockerProcesses $missing.DockerProcesses -Wsl $missing.Wsl -HnsEndpoints $missing.HnsEndpoints `
+    -PortProxy $missing.PortProxy -Forwarding $missing.Forwarding -DockerListeners $missing.DockerListeners
+Check ($missing.Docker.State -eq 'Inaccessible') 'A missing WSL peer list is not a verified empty list.'
 
 $tunnel = Clone $baseline
 $tunnel.Adapters.Items += @{ InterfaceIndex = 41; Status = 'Up'; MediaConnectionState = 'Connected'; HardwareInterface = $false; Virtual = $true; PnPDeviceID = 'SWD\EXAMPLE\0001'; Label = 'Example tunnel' }
