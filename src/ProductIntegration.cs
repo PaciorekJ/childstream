@@ -1,11 +1,13 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Management;
 using System.Security.Cryptography;
 using System.Text;
 using System.ServiceProcess;
+#pragma warning disable 0649 // Runtime observation records are populated by child-side adapters and tests.
 
 internal enum CaptureBackend { DesktopDuplication, WindowsGraphicsCapture }
 
@@ -253,6 +255,8 @@ internal static class SunshineStartupGate
 
 internal static class WindowsSunshineCollisionReader
 {
+    private const string PortFilter = "LocalPort=47984 OR LocalPort=47989 OR LocalPort=47990 OR " +
+        "LocalPort=48010 OR LocalPort=47998 OR LocalPort=47999 OR LocalPort=48000 OR LocalPort=48002";
     // Read only. Each source has an independent completeness bit; an inaccessible
     // WMI provider cannot masquerade as an empty listener table.
     internal static SunshineCollisionSnapshot Read()
@@ -260,15 +264,16 @@ internal static class WindowsSunshineCollisionReader
         var result = new SunshineCollisionSnapshot();
         try
         {
-            foreach (ServiceController service in ServiceController.GetServices())
-            {
-                using (service)
-                    if (service.ServiceName.IndexOf("sunshine", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                        service.DisplayName.IndexOf("sunshine", StringComparison.OrdinalIgnoreCase) >= 0)
-                        result.ExistingSunshineService = true;
-            }
+            using (var service = new ServiceController("SunshineService"))
+            { var observed = service.Status; result.ExistingSunshineService = true; }
             result.ServiceObservationComplete = true;
         }
+        catch (InvalidOperationException ex)
+        {
+            var win32 = ex.InnerException as Win32Exception;
+            result.ServiceObservationComplete = win32 != null && win32.NativeErrorCode == 1060;
+        }
+        catch (Win32Exception ex) { result.ServiceObservationComplete = ex.NativeErrorCode == 1060; }
         catch { result.ServiceObservationComplete = false; }
         try
         {
@@ -287,7 +292,7 @@ internal static class WindowsSunshineCollisionReader
             {
                 using (var searcher = new ManagementObjectSearcher(scope,
                     new ObjectQuery("SELECT LocalPort" + (query.Tcp ? ", State" : "") +
-                        " FROM " + query.Class)))
+                        " FROM " + query.Class + " WHERE " + PortFilter)))
                 using (ManagementObjectCollection rows = searcher.Get())
                     foreach (ManagementBaseObject row in rows)
                     {
@@ -303,9 +308,10 @@ internal static class WindowsSunshineCollisionReader
         return result;
     }
 
-    internal static IList<SunshineListener> ReadListeners(out bool complete)
+    internal static IList<SunshineListener> ReadListeners(int ownedPid, out bool complete)
     {
         var listeners = new List<SunshineListener>();
+        if (ownedPid <= 0) { complete = false; return listeners; }
         try
         {
             var scope = new ManagementScope(@"\\.\root\StandardCimv2");
@@ -314,7 +320,8 @@ internal static class WindowsSunshineCollisionReader
                                            new { Class = "MSFT_NetUDPEndpoint", Tcp = false } })
                 using (var searcher = new ManagementObjectSearcher(scope,
                     new ObjectQuery("SELECT LocalAddress, LocalPort, OwningProcess" +
-                        (query.Tcp ? ", State" : "") + " FROM " + query.Class)))
+                        (query.Tcp ? ", State" : "") + " FROM " + query.Class +
+                        " WHERE OwningProcess=" + ownedPid + " OR " + PortFilter)))
                 using (ManagementObjectCollection rows = searcher.Get())
                     foreach (ManagementBaseObject row in rows)
                     {

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+#pragma warning disable 0649 // Physical evidence is populated only by a separately authorized acceptance run.
 
 // A source-side acceptance harness. Values must be measured on the approved
 // physical test target; defaults are Unknown and never imply success.
