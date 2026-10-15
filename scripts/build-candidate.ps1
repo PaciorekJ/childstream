@@ -18,7 +18,9 @@ if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force 
 $tracked = @(git -C $root ls-files --cached --full-name | Where-Object { $_ -match '^(src|scripts|docs|tests|\.github)/|^README\.md$' })
 if ($LASTEXITCODE -ne 0) { throw 'Tracked-file inventory failed.' }
 $entries = [ordered]@{}
-foreach ($relative in ($tracked | Sort-Object -Culture invariant)) {
+$sortedTracked = [string[]]@($tracked)
+[Array]::Sort($sortedTracked, [StringComparer]::Ordinal)
+foreach ($relative in $sortedTracked) {
     $full = Join-Path $root $relative
     if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw "Missing tracked file: $relative" }
     $entries[$relative.Replace('\','/')] = [System.IO.File]::ReadAllBytes($full)
@@ -49,7 +51,9 @@ $file = [System.IO.File]::Open($zipPath, [System.IO.FileMode]::CreateNew)
 try {
     $zip = [System.IO.Compression.ZipArchive]::new($file, [System.IO.Compression.ZipArchiveMode]::Create, $false)
     try {
-        foreach ($name in @($entries.Keys | Sort-Object -Culture invariant)) {
+        $sortedNames = [string[]]@($entries.Keys)
+        [Array]::Sort($sortedNames, [StringComparer]::Ordinal)
+        foreach ($name in $sortedNames) {
             $entry = $zip.CreateEntry($name, [System.IO.Compression.CompressionLevel]::Optimal)
             $entry.LastWriteTime = [DateTimeOffset]::new(1980,1,1,0,0,0,[TimeSpan]::Zero)
             $stream = $entry.Open()
