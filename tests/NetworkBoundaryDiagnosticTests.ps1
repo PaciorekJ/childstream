@@ -12,7 +12,7 @@ $baseline = @{
         @{ InterfaceIndex = 2; Status = 'Disconnected'; MediaConnectionState = 'Disconnected'; HardwareInterface = $true; Virtual = $false; VerifiedRole = '' },
         @{ InterfaceIndex = 3; Status = 'Disconnected'; MediaConnectionState = 'Disconnected'; HardwareInterface = $true; Virtual = $false; VerifiedRole = '' },
         @{ InterfaceIndex = 40; Status = 'Up'; MediaConnectionState = 'Connected'; HardwareInterface = $false; Virtual = $true;
-            MacAddress = '00-15-5D-00-00-40'; InterfaceDescription = 'Hyper-V Virtual Ethernet Adapter';
+            MacAddress = '00-15-5D-00-00-40'; InterfaceDescription = 'Hyper-V Virtual Ethernet Adapter'; Label = 'vEthernet (host-only)';
             PnPDeviceID = 'ROOT\VMS_MP\0001' }
     ) }
     IpInterfaces = @{ State = 'Accessible'; Items = @(@{ InterfaceIndex = 40; ConnectionState = 'Connected' }) }
@@ -57,6 +57,36 @@ Check (-not $hostOnly.StageAPlanAuthorized -and $hostOnly.DiagnosticOnly) 'Diagn
 $hostWithoutPnp = Clone $baseline
 $hostWithoutPnp.Adapters.Items[2].Remove('PnPDeviceID')
 Check ((Predicate (Get-ChildStreamNetworkBoundaryDiagnostic -Observation $hostWithoutPnp) 'virtual-paths-attributed') -eq 'Pass') 'A unique MAC, virtual identity, adapter description and matched Hyper-V port/switch attribute the host port without PnP coverage.'
+$numberedHostPort = Clone $baseline
+$numberedHostPort.Adapters.Items[2].InterfaceDescription = 'Hyper-V Virtual Ethernet Adapter #2'
+Check ((Predicate (Get-ChildStreamNetworkBoundaryDiagnostic -Observation $numberedHostPort) 'virtual-paths-attributed') -eq 'Pass') 'Windows-numbered Hyper-V adapter is accepted only with the unique host-port and switch identity.'
+$missingHostPort = Clone $numberedHostPort
+$missingHostPort.HostPorts.Items = @()
+Check ((Predicate (Get-ChildStreamNetworkBoundaryDiagnostic -Observation $missingHostPort) 'virtual-paths-attributed') -eq 'Unknown') 'The numbered description and matching label alone cannot attribute a host interface.'
+$externalHostPort = Clone $numberedHostPort
+$externalHostPort.Switches.Items[0].SwitchType = 'External'
+$externalHostReport = Get-ChildStreamNetworkBoundaryDiagnostic -Observation $externalHostPort
+Check ((Predicate $externalHostReport 'switches-have-no-external-bridge') -eq 'Fail' -and
+    (Predicate $externalHostReport 'virtual-paths-attributed') -eq 'Unknown') 'A numbered adapter on an External switch cannot pass as a host-only interface.'
+$duplicateAdapterMac = Clone $numberedHostPort
+$duplicateAdapterMac.Adapters.Items += @{ InterfaceIndex = 51; Status = 'Up'; MediaConnectionState = 'Connected'; HardwareInterface = $false; Virtual = $true;
+    MacAddress = '00-15-5D-00-00-40'; InterfaceDescription = 'Hyper-V Virtual Ethernet Adapter #2'; Label = 'vEthernet (host-only)' }
+Check ((Predicate (Get-ChildStreamNetworkBoundaryDiagnostic -Observation $duplicateAdapterMac) 'virtual-paths-attributed') -eq 'Unknown') 'Duplicate adapter MAC cannot attribute either interface to one host port.'
+$duplicatePortMac = Clone $numberedHostPort
+$duplicatePortMac.HostPorts.Items += @{ Id = 'port-2'; SwitchName = 'host-only'; SwitchId = 'switch-1'; MacAddress = '00155D000040' }
+Check ((Predicate (Get-ChildStreamNetworkBoundaryDiagnostic -Observation $duplicatePortMac) 'hyperv-host-port-graph') -eq 'Unknown') 'Duplicate host-port MAC makes the graph ambiguous.'
+$wrongSwitchLabel = Clone $numberedHostPort
+$wrongSwitchLabel.Adapters.Items[2].Label = 'vEthernet (different-switch)'
+Check ((Predicate (Get-ChildStreamNetworkBoundaryDiagnostic -Observation $wrongSwitchLabel) 'virtual-paths-attributed') -eq 'Unknown') 'Adapter label must corroborate the identity-matched host port switch.'
+$wrongSwitchId = Clone $numberedHostPort
+$wrongSwitchId.HostPorts.Items[0].SwitchId = 'different-switch'
+Check ((Predicate (Get-ChildStreamNetworkBoundaryDiagnostic -Observation $wrongSwitchId) 'virtual-paths-attributed') -eq 'Unknown') 'A mismatched switch ID remains unattributed.'
+$unsupportedVirtual = Clone $numberedHostPort
+$unsupportedVirtual.Adapters.Items[2].InterfaceDescription = 'Unrelated Virtual Ethernet Adapter'
+Check ((Predicate (Get-ChildStreamNetworkBoundaryDiagnostic -Observation $unsupportedVirtual) 'virtual-paths-attributed') -eq 'Unknown') 'Unique MAC and matching label cannot admit an unsupported adapter type.'
+$unsupportedSuffix = Clone $numberedHostPort
+$unsupportedSuffix.Adapters.Items[2].InterfaceDescription = 'Hyper-V Virtual Ethernet Adapter #2 extra'
+Check ((Predicate (Get-ChildStreamNetworkBoundaryDiagnostic -Observation $unsupportedSuffix) 'virtual-paths-attributed') -eq 'Unknown') 'Only the exact Windows numeric suffix is accepted.'
 $firstFingerprint = Get-ChildStreamBoundaryFingerprint -Observation (Clone $baseline)
 Check (-not [string]::IsNullOrEmpty($firstFingerprint)) 'Complete source graph has a private fingerprint.'
 $reordered = Clone $baseline
@@ -158,6 +188,16 @@ $report = Get-ChildStreamNetworkBoundaryDiagnostic -Observation $tunnel
 Check ($report.Conditions.External -eq 'Unknown') 'An addressed tunnel without an independently proven underlay graph remains unknown.'
 $tunnel.Adapters.Items[-1].Label = 'Tailscale'
 Check ((Predicate (Get-ChildStreamNetworkBoundaryDiagnostic -Observation $tunnel) 'virtual-paths-attributed') -eq 'Unknown') 'Tunnel name alone is never a whitelist.'
+$pausedTunnelWithRetainedRoute = Clone $tunnel
+$pausedTunnelWithRetainedRoute.IpAddresses.Items = @($pausedTunnelWithRetainedRoute.IpAddresses.Items | Where-Object InterfaceIndex -ne 41)
+Check ((Predicate (Get-ChildStreamNetworkBoundaryDiagnostic -Observation $pausedTunnelWithRetainedRoute) 'virtual-paths-attributed') -eq 'Unknown') 'A paused tunnel with a retained route still blocks the external boundary.'
+$pausedTunnelWithRetainedAddress = Clone $tunnel
+$pausedTunnelWithRetainedAddress.Routes.Items = @($pausedTunnelWithRetainedAddress.Routes.Items | Where-Object InterfaceIndex -ne 41)
+Check ((Predicate (Get-ChildStreamNetworkBoundaryDiagnostic -Observation $pausedTunnelWithRetainedAddress) 'virtual-paths-attributed') -eq 'Unknown') 'A paused tunnel with a retained address still blocks the external boundary.'
+$pausedTunnelWithoutPath = Clone $tunnel
+$pausedTunnelWithoutPath.IpAddresses.Items = @($pausedTunnelWithoutPath.IpAddresses.Items | Where-Object InterfaceIndex -ne 41)
+$pausedTunnelWithoutPath.Routes.Items = @($pausedTunnelWithoutPath.Routes.Items | Where-Object InterfaceIndex -ne 41)
+Check ((Predicate (Get-ChildStreamNetworkBoundaryDiagnostic -Observation $pausedTunnelWithoutPath) 'virtual-paths-attributed') -eq 'Pass') 'An unaddressed, unrouted tunnel is not an external path when complete bridge evidence shows no bridge.'
 
 $miniport = Clone $baseline
 $miniport.Adapters.Items += @{ InterfaceIndex = 42; Status = 'Up'; MediaConnectionState = 'Connected'; HardwareInterface = $false; Virtual = $true }

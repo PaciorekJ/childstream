@@ -363,9 +363,12 @@ function Get-ChildStreamNetworkBoundaryDiagnostic {
         if ((Read-Field $adapter 'HardwareInterface') -eq $true -or (Read-Field $adapter 'Status') -ne 'Up') { continue }
         $index = [string](Read-Field $adapter 'InterfaceIndex')
         $mac = Normalize-Mac (Read-Field $adapter 'MacAddress')
-        $isHostPort = $hostPortGraphKnown -and $mac -and $hostPortByMac.ContainsKey($mac) -and
+        $port = if ($mac -and $hostPortByMac.ContainsKey($mac)) { $hostPortByMac[$mac] } else { $null }
+        $portSwitchName = if ($null -ne $port) { [string](Read-Field $port 'SwitchName') } else { '' }
+        $isHostPort = $hostPortGraphKnown -and $null -ne $port -and
             (Read-Field $adapter 'Virtual') -eq $true -and
-            [string](Read-Field $adapter 'InterfaceDescription') -eq 'Hyper-V Virtual Ethernet Adapter'
+            [string](Read-Field $adapter 'InterfaceDescription') -cmatch '^Hyper-V Virtual Ethernet Adapter(?: #[1-9][0-9]*)?$' -and
+            [string](Read-Field $adapter 'Label') -ceq "vEthernet ($portSwitchName)"
         if ($isHostPort) { continue }
         if ((Read-Field $adapter 'Virtual') -eq $true -and
             -not $addressIndices.ContainsKey($index) -and -not $routeIndices.ContainsKey($index) -and
