@@ -10,6 +10,8 @@ using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
 using System.Security.Principal;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
@@ -375,8 +377,17 @@ internal sealed class WindowsFeasibilityHost : IFeasibilityHost
         {
             object details = At(sessions, "AssociatedChildDetails");
             if (Is(details, "Accessible") && Num(At(details, "LogonTime")) > 0)
+            {
                 s.AssociatedChild = new ChildSessionIdentity(checked((uint)Num(At(child, "SessionId"))),
                     Num(At(details, "LogonTime")));
+                long childId = s.AssociatedChild.Value.SessionId;
+                s.IndependentOnlyAssociatedChild = childId != 0 && childId != parent &&
+                    Is(enumerated, "Accessible") &&
+                    sessionItems.All(x => Num(At(x, "SessionId")) == 0 ||
+                        Num(At(x, "SessionId")) == parent || Num(At(x, "SessionId")) == childId) &&
+                    sessionItems.Count(x => Num(At(x, "SessionId")) == parent) == 1 &&
+                    sessionItems.Count(x => Num(At(x, "SessionId")) == childId) == 1;
+            }
             else s.ChildAccess = ResourceAccess.Unknown;
         }
         if (!Is(current, "Accessible") || Num(At(current, "SessionId")) != parent) s.ParentLogonTime = -1;
@@ -416,7 +427,8 @@ internal sealed class WindowsFeasibilityHost : IFeasibilityHost
         if (!native.Logoff(id)) throw new Win32Exception(native.LastError, "Exact-child logoff failed.");
         return true;
     }
-    public ProbeConnectionResult ConnectWithoutPassword() { return ProbeActiveX.Connect(native); }
+    public ProbeConnectionResult ConnectWithoutPassword(Action observeBoundary, Action<ChildSessionIdentity> observedChild)
+    { return ProbeActiveX.Connect(native, observeBoundary, observedChild); }
 }
 
 [ComImport, Guid("302D8188-0052-4807-806A-362B628F9AC5"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -499,7 +511,8 @@ internal static class ProbeRdpNoPrompt
 }
 internal static class ProbeActiveX
 {
-    internal static ProbeConnectionResult Connect(IProbeNative native)
+    internal static ProbeConnectionResult Connect(IProbeNative native, Action observeBoundary,
+        Action<ChildSessionIdentity> observedChild)
     {
         uint before;
         if (!native.GetChildId(out before) || before != uint.MaxValue)
@@ -516,43 +529,84 @@ internal static class ProbeActiveX
             ProbeRdpNoPrompt.Configure(box.Ocx);
             object child = true;
             ((IProbeRdpExtendedSettings)box.Ocx).put_Property("ConnectToChildSession", ref child);
-            ocx.Connect(); // asynchronous: a successful return is not authentication evidence
-            DateTime deadline = DateTime.UtcNow.AddSeconds(45);
-            ProbeConnectionResult observed = null;
-            while (DateTime.UtcNow < deadline && !form.IsDisposed)
+            if (observedChild == null) throw new ArgumentNullException("observedChild");
+            if (observeBoundary != null) observeBoundary(); // fail before creating a child
+            Exception monitorError = null;
+            object errorGate = new object();
+            using (var stop = new CancellationTokenSource())
             {
-                Application.DoEvents();
-                if (form.IsDisposed) break;
-                if ((int)ocx.Connected == 1)
+                Task monitorTask = null;
+                ProbeConnectionResult result = null;
+                try
                 {
-                    uint id;
-                    if (native.GetChildId(out id) && id != uint.MaxValue)
+                    ocx.Connect(); // asynchronous: return is not authentication evidence
+                    DateTime deadline = DateTime.UtcNow.AddSeconds(45);
+                    while (DateTime.UtcNow < deadline && !form.IsDisposed)
                     {
-                        long? generation = native.LogonTime(id);
-                        if (generation.HasValue && generation.Value > 0)
+                        Application.DoEvents();
+                        if (form.IsDisposed) break;
+                        lock (errorGate) { if (monitorError != null) break; }
+                        if ((int)ocx.Connected == 1)
                         {
-                            observed = new ProbeConnectionResult { Outcome = ProbeConnectOutcome.AutomaticLogon,
-                                Identity = new ChildSessionIdentity(id, generation.Value) };
-                            break;
+                            uint id;
+                            if (native.GetChildId(out id) && id != uint.MaxValue)
+                            {
+                                long? generation = native.LogonTime(id);
+                                if (generation.HasValue && generation.Value > 0)
+                                {
+                                    var identity = new ChildSessionIdentity(id, generation.Value);
+                                    observedChild(identity); // persist exact child before viewer interaction
+                                    result = (int)ocx.Connected == 1 && !form.IsDisposed
+                                        ? new ProbeConnectionResult { Outcome = ProbeConnectOutcome.AutomaticLogon,
+                                            Identity = identity }
+                                        : new ProbeConnectionResult { Outcome = ProbeConnectOutcome.Unknown,
+                                            Identity = identity, ErrorCode = native.LastError };
+                                    break;
+                                }
+                            }
                         }
+                        Thread.Sleep(100);
+                    }
+                    if (result == null)
+                        result = new ProbeConnectionResult { Outcome = ProbeConnectOutcome.Unknown,
+                            ErrorCode = native.LastError };
+                    else if (result.Outcome == ProbeConnectOutcome.AutomaticLogon && !form.IsDisposed)
+                    {
+                        // One independent capture was taken before Connect and
+                        // observedChild checked the boundary after authentication.
+                        // Start periodic captures only during interactive viewing;
+                        // a concurrent full capture must not block the identity
+                        // callback while the COM connection is being established.
+                        if (observeBoundary != null)
+                            monitorTask = Task.Run(() =>
+                            {
+                                while (!stop.IsCancellationRequested)
+                                {
+                                    try { observeBoundary(); }
+                                    catch (Exception ex)
+                                    {
+                                        lock (errorGate) monitorError = ex;
+                                        try { form.BeginInvoke((MethodInvoker)(() => form.Close())); }
+                                        catch (InvalidOperationException) { }
+                                        return;
+                                    }
+                                    if (stop.Token.WaitHandle.WaitOne(5000)) return;
+                                }
+                            });
+                        form.Text = "ChildStream test viewer - close after interaction checks";
+                        Application.Run(form);
                     }
                 }
-                System.Threading.Thread.Sleep(100);
+                finally
+                {
+                    stop.Cancel();
+                    if (monitorTask != null) monitorTask.Wait();
+                }
+                lock (errorGate)
+                    if (monitorError != null)
+                        throw new InvalidOperationException("Isolated boundary changed during the viewer test.", monitorError);
+                return result;
             }
-            if (observed == null)
-                return new ProbeConnectionResult { Outcome = ProbeConnectOutcome.Unknown,
-                    ErrorCode = native.LastError };
-
-            // Keep the authenticated viewer alive for the operator's independent
-            // desktop and focus checks. Closing this window disconnects the viewer;
-            // it does not sign out the child. The probe journals the observed
-            // identity only after the window closes and the host is rechecked.
-            if (!form.IsDisposed)
-            {
-                form.Text = "ChildStream test viewer - close after interaction checks";
-                Application.Run(form);
-            }
-            return observed;
         }
     }
 }

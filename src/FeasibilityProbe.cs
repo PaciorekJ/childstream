@@ -31,6 +31,7 @@ internal sealed class ProbeSnapshot
     internal ResourceAccess ChildAccess;
     internal int ChildApiErrorCode;
     internal bool IndependentNoUnexpectedSessions;
+    internal bool IndependentOnlyAssociatedChild;
     internal string SessionInventoryFingerprint;
     internal ChildSessionIdentity? AssociatedChild;
 
@@ -60,6 +61,7 @@ internal sealed class ProbeJournal
     internal string NetworkDeviationFingerprint = "";
     internal string NetworkDeviationReason = "";
     internal bool NetworkRecoveryReviewed;
+    internal bool ReviewedChildTeardown;
 }
 
 internal sealed class ProbeConnectionResult
@@ -83,7 +85,7 @@ internal interface IFeasibilityHost
     ProbeSnapshot Capture();
     ProbeSnapshot CaptureBoundary(bool operatorConfirmedPhysicalSeverance);
     bool CompareExchangeChildFeature(bool expected, bool desired);
-    ProbeConnectionResult ConnectWithoutPassword();
+    ProbeConnectionResult ConnectWithoutPassword(Action observeBoundary, Action<ChildSessionIdentity> observedChild);
     bool LogoffExact(ChildSessionIdentity expected);
     bool HasAdministratorPrivilege { get; }
 }
@@ -209,6 +211,8 @@ internal static class ProbeCodec
                 writer.Write(journal.NetworkDeviationReason ?? "");
                 writer.Write(journal.NetworkRecoveryReviewed);
             }
+            if (journal.Plan.Original.FormatVersion >= 5)
+                writer.Write(journal.ReviewedChildTeardown);
             writer.Flush(); return stream.ToArray();
         }
     }
@@ -237,6 +241,10 @@ internal static class ProbeCodec
                     journal.NetworkDeviationObserved && String.IsNullOrEmpty(journal.NetworkDeviationReason))
                     throw new InvalidDataException("Inconsistent network recovery snapshot.");
             }
+            // The optional v5 tail accepts journals written before reviewed
+            // exact-child teardown existed. All new v5 writes include the flag.
+            if (journal.Plan.Original.FormatVersion >= 5 && stream.Position < stream.Length)
+                journal.ReviewedChildTeardown = reader.ReadBoolean();
             if (stream.Position != stream.Length) throw new InvalidDataException("Trailing probe journal data.");
             if (journal.ActiveParentId == uint.MaxValue || journal.ActiveParentLogonTime <= 0 ||
                 (journal.PositiveChild.HasValue &&
@@ -247,7 +255,14 @@ internal static class ProbeCodec
                   journal.Stage == ProbeStage.ChildEnded) && !journal.PositiveChild.HasValue) ||
                 (journal.Stage == ProbeStage.Connected && journal.AuthenticationOutcome != "AutomaticLogon") ||
                 (journal.Stage == ProbeStage.Connected && !journal.ConnectionAttempted) ||
-                (journal.Stage == ProbeStage.ChildEnded && !journal.ConsoleConfirmed))
+                (journal.Stage == ProbeStage.ChildEnded && !journal.ConsoleConfirmed &&
+                 !journal.ReviewedChildTeardown) ||
+                journal.ReviewedChildTeardown &&
+                    (journal.Plan.Original.FormatVersion != 5 || !journal.ConnectionAttempted ||
+                     !journal.PositiveChild.HasValue ||
+                     (journal.Stage != ProbeStage.TeardownPrepared &&
+                      journal.Stage != ProbeStage.ChildEnded && journal.Stage != ProbeStage.Restoring &&
+                      journal.Stage != ProbeStage.Restored && journal.Stage != ProbeStage.Conflict)))
                 throw new InvalidDataException("Inconsistent probe progress snapshot.");
         }
     }
@@ -315,6 +330,10 @@ internal sealed class FeasibilityProbe
 
     private static bool IsIsolated(ProbeNetworkPosture posture)
     { return posture == ProbeNetworkPosture.NetworkIsolated || posture == ProbeNetworkPosture.ExternalNetworkIsolated; }
+
+    private static bool StageBPosture(ProbeNetworkPosture posture)
+    { return posture == ProbeNetworkPosture.ConnectedRdpGuard ||
+        posture == ProbeNetworkPosture.ExternalNetworkIsolated; }
 
     private static bool IsolationAccepted(ProbeSnapshot snapshot, ProbeNetworkPosture posture)
     { return snapshot != null && (posture == ProbeNetworkPosture.NetworkIsolated
@@ -480,15 +499,18 @@ internal sealed class FeasibilityProbe
         }
     }
 
-    internal ProbeJournal ApproveStageB(string approvedHash, bool explicitConsent)
+    internal ProbeJournal ApproveStageB(string approvedHash, bool explicitConsent,
+        bool operatorConfirmedIsolation = false)
     {
         using (owner.Acquire())
         {
             ProbeJournal j = RequiredJournal();
-            Require(j.Plan.Original.NetworkPosture == ProbeNetworkPosture.ConnectedRdpGuard &&
+            Require(StageBPosture(j.Plan.Original.NetworkPosture) &&
                 j.Stage == ProbeStage.StageAValidated && explicitConsent && j.Plan.Hash == approvedHash,
                 "Stage B requires separate consent for the exact Stage A plan.");
-            ProbeSnapshot s = host.Capture(); ValidateUnchanged(j, s);
+            Require(!IsIsolated(j.Plan.Original.NetworkPosture) || operatorConfirmedIsolation,
+                "Stage B requires renewed physical isolation confirmation.");
+            ProbeSnapshot s = CaptureForJournal(j, operatorConfirmedIsolation); ValidateUnchanged(j, s);
             Require(s.ParentSessionId == j.ActiveParentId && s.ParentLogonTime == j.ActiveParentLogonTime &&
                 s.ParentSessionId == s.ConsoleSessionId && s.FeatureEnabled &&
                 s.ChildAccess == ResourceAccess.Absent && s.ChildApiErrorCode == 0 &&
@@ -498,31 +520,73 @@ internal sealed class FeasibilityProbe
         }
     }
 
-    internal ProbeJournal ConnectOnce()
+    internal ProbeJournal ConnectOnce(bool operatorConfirmedIsolation = false)
     {
         using (owner.Acquire())
         {
             ProbeJournal j = RequiredJournal();
-            Require(j.Plan.Original.NetworkPosture == ProbeNetworkPosture.ConnectedRdpGuard &&
+            Require(StageBPosture(j.Plan.Original.NetworkPosture) &&
                 j.Stage == ProbeStage.ReadyConnect, "The one connection attempt is unavailable.");
-            ProbeSnapshot before = host.Capture(); ValidateUnchanged(j, before);
+            Require(!IsIsolated(j.Plan.Original.NetworkPosture) || operatorConfirmedIsolation,
+                "Stage B connection requires renewed physical isolation confirmation.");
+            ProbeSnapshot before = CaptureForJournal(j, operatorConfirmedIsolation); ValidateUnchanged(j, before);
             Require(before.ParentSessionId == j.ActiveParentId && before.ParentLogonTime == j.ActiveParentLogonTime &&
                 before.FeatureEnabled && before.ChildAccess == ResourceAccess.Absent && before.ChildApiErrorCode == 0 &&
                 before.IndependentNoUnexpectedSessions && !before.AssociatedChild.HasValue,
                 "Parent or child changed before connection.");
             j.ConnectionAttempted = true; j.Stage = ProbeStage.Connecting; store.Save(j);
+            object journalGate = new object();
+            Action observeBoundary = () =>
+            {
+                lock (journalGate)
+                {
+                    ProbeSnapshot observed = CaptureForJournal(j, operatorConfirmedIsolation);
+                    ValidateUnchanged(j, observed);
+                    Require(observed.ParentSessionId == j.ActiveParentId &&
+                        observed.ParentLogonTime == j.ActiveParentLogonTime && observed.FeatureEnabled &&
+                        (observed.ChildAccess == ResourceAccess.Absent &&
+                            observed.IndependentNoUnexpectedSessions && !observed.AssociatedChild.HasValue ||
+                         observed.ChildAccess == ResourceAccess.Accessible &&
+                            observed.IndependentOnlyAssociatedChild && observed.AssociatedChild.HasValue &&
+                            (!j.PositiveChild.HasValue ||
+                             j.PositiveChild.Value.Equals(observed.AssociatedChild.Value))),
+                        "Unexpected parent, child, or session during the viewer test.");
+                }
+            };
+            Action<ChildSessionIdentity> observedChild = identity =>
+            {
+                lock (journalGate)
+                {
+                    ProbeSnapshot observed = CaptureForJournal(j, operatorConfirmedIsolation);
+                    ValidateUnchanged(j, observed);
+                    Require(observed.ParentSessionId == j.ActiveParentId &&
+                        observed.ParentLogonTime == j.ActiveParentLogonTime && observed.FeatureEnabled &&
+                        observed.ChildAccess == ResourceAccess.Accessible &&
+                        observed.IndependentOnlyAssociatedChild && observed.AssociatedChild.HasValue &&
+                        observed.AssociatedChild.Value.Equals(identity) &&
+                        identity.SessionId != j.ActiveParentId && identity.LogonTime > 0,
+                        "The connected viewer does not have one exact parent-associated child.");
+                    Require(!j.PositiveChild.HasValue || j.PositiveChild.Value.Equals(identity),
+                        "The connected child identity changed.");
+                    j.PositiveChild = identity;
+                    j.AuthenticationOutcome = "AutomaticLogonObserved";
+                    store.Save(j);
+                }
+            };
             try
             {
-                ProbeConnectionResult result = host.ConnectWithoutPassword();
-                ProbeSnapshot after = host.Capture(); ValidateUnchanged(j, after);
+                ProbeConnectionResult result = host.ConnectWithoutPassword(observeBoundary, observedChild);
+                ProbeSnapshot after = CaptureForJournal(j, operatorConfirmedIsolation); ValidateUnchanged(j, after);
                 Require(result != null, "The connection result is missing; the attempt is unresolved.");
                 j.ErrorCode = result.ErrorCode; j.AuthenticationOutcome = result.Outcome.ToString();
-                if (after.ParentSessionId == j.ActiveParentId && after.ParentLogonTime == j.ActiveParentLogonTime &&
-                    after.ChildAccess == ResourceAccess.Accessible && result.Identity.HasValue && after.AssociatedChild.HasValue &&
+                bool verifiedChild = after.ParentSessionId == j.ActiveParentId &&
+                    after.ParentLogonTime == j.ActiveParentLogonTime &&
+                    after.ChildAccess == ResourceAccess.Accessible && after.IndependentOnlyAssociatedChild &&
+                    result.Identity.HasValue && j.PositiveChild.HasValue && after.AssociatedChild.HasValue &&
                     result.Identity.Value.Equals(after.AssociatedChild.Value) &&
-                    result.Identity.Value.SessionId != before.ParentSessionId && result.Identity.Value.LogonTime > 0)
-                    j.PositiveChild = result.Identity;
-                j.Stage = result.Outcome == ProbeConnectOutcome.AutomaticLogon && j.PositiveChild.HasValue
+                    result.Identity.Value.Equals(j.PositiveChild.Value) &&
+                    result.Identity.Value.SessionId != before.ParentSessionId && result.Identity.Value.LogonTime > 0;
+                j.Stage = result.Outcome == ProbeConnectOutcome.AutomaticLogon && verifiedChild
                     ? ProbeStage.Connected : ProbeStage.OutcomeUnknown;
                 store.Save(j); return j;
             }
@@ -535,43 +599,109 @@ internal sealed class FeasibilityProbe
         }
     }
 
-    internal ProbeJournal ConfirmConsoleUsable(bool operatorConfirmed)
+    internal ProbeJournal ConfirmConsoleUsable(bool operatorConfirmed,
+        bool operatorConfirmedIsolation = false)
     {
         using (owner.Acquire())
         {
             ProbeJournal j = RequiredJournal();
-            Require(j.Plan.Original.NetworkPosture == ProbeNetworkPosture.ConnectedRdpGuard &&
+            Require(StageBPosture(j.Plan.Original.NetworkPosture) &&
                 operatorConfirmed && j.PositiveChild.HasValue &&
                 (j.Stage == ProbeStage.Connected || j.Stage == ProbeStage.OutcomeUnknown),
                 "Physical-console usability needs an explicit operator checkpoint.");
-            ProbeSnapshot s = host.Capture(); ValidateUnchanged(j, s);
-            Require(s.ParentSessionId == s.ConsoleSessionId && s.ChildAccess == ResourceAccess.Accessible && s.AssociatedChild.HasValue &&
+            Require(!IsIsolated(j.Plan.Original.NetworkPosture) || operatorConfirmedIsolation,
+                "Interaction confirmation requires renewed physical isolation confirmation.");
+            ProbeSnapshot s = CaptureForJournal(j, operatorConfirmedIsolation); ValidateUnchanged(j, s);
+            Require(s.ParentSessionId == s.ConsoleSessionId && s.ChildAccess == ResourceAccess.Accessible &&
+                s.IndependentOnlyAssociatedChild && s.AssociatedChild.HasValue &&
                 s.AssociatedChild.Value.Equals(j.PositiveChild.Value), "Console or child identity changed.");
             j.ConsoleConfirmed = true; store.Save(j); return j;
         }
     }
 
-    internal ProbeJournal EndPositiveChild(bool explicitConsent)
+    internal ProbeJournal EndPositiveChild(bool explicitConsent,
+        bool operatorConfirmedIsolation = false)
     {
         using (owner.Acquire())
         {
             ProbeJournal j = RequiredJournal();
-            Require(j.Plan.Original.NetworkPosture == ProbeNetworkPosture.ConnectedRdpGuard &&
+            Require(StageBPosture(j.Plan.Original.NetworkPosture) &&
                 explicitConsent && j.ConsoleConfirmed && j.PositiveChild.HasValue &&
                 (j.Stage == ProbeStage.Connected || j.Stage == ProbeStage.OutcomeUnknown),
                 "Only a positively identified test child may be ended with explicit consent.");
-            ProbeSnapshot before = host.Capture(); ValidateUnchanged(j, before);
+            Require(!IsIsolated(j.Plan.Original.NetworkPosture) || operatorConfirmedIsolation,
+                "Child teardown requires renewed physical isolation confirmation.");
+            ProbeSnapshot before = CaptureForJournal(j, operatorConfirmedIsolation); ValidateUnchanged(j, before);
             Require(before.ParentSessionId == j.ActiveParentId && before.ParentLogonTime == j.ActiveParentLogonTime &&
-                before.ChildAccess == ResourceAccess.Accessible && before.AssociatedChild.HasValue &&
+                before.ChildAccess == ResourceAccess.Accessible && before.IndependentOnlyAssociatedChild &&
+                before.AssociatedChild.HasValue &&
                 before.AssociatedChild.Value.Equals(j.PositiveChild.Value),
                 "The parent-associated child identity changed; logoff is forbidden.");
             j.Stage = ProbeStage.TeardownPrepared; store.Save(j);
             // TeardownPrepared remains durable on any exception; never automatically repeat logoff.
             bool result = host.LogoffExact(j.PositiveChild.Value);
-            ProbeSnapshot after = host.Capture(); ValidateUnchanged(j, after);
+            ProbeSnapshot after = CaptureForJournal(j, operatorConfirmedIsolation); ValidateUnchanged(j, after);
             j.Stage = result && after.ParentSessionId == j.ActiveParentId &&
                 after.ParentLogonTime == j.ActiveParentLogonTime &&
-                after.ChildAccess == ResourceAccess.Absent && !after.AssociatedChild.HasValue
+                after.ChildAccess == ResourceAccess.Absent && after.IndependentNoUnexpectedSessions &&
+                !after.AssociatedChild.HasValue
+                ? ProbeStage.ChildEnded : ProbeStage.TeardownPrepared;
+            store.Save(j); return j;
+        }
+    }
+
+    internal ProbeJournal ReconcileInterruptedConnection(bool operatorConfirmedIsolation)
+    {
+        using (owner.Acquire())
+        {
+            ProbeJournal j = RequiredJournal();
+            Require(j.Plan.Original.NetworkPosture == ProbeNetworkPosture.ExternalNetworkIsolated &&
+                operatorConfirmedIsolation && j.Stage == ProbeStage.Connecting &&
+                j.ConnectionAttempted && j.PositiveChild.HasValue,
+                "Only a durably identified interrupted isolated connection can be reconciled.");
+            ProbeSnapshot s = CaptureForJournal(j, true); ValidateUnchanged(j, s);
+            Require(s.ParentSessionId == j.ActiveParentId && s.ParentLogonTime == j.ActiveParentLogonTime &&
+                s.ChildAccess == ResourceAccess.Accessible && s.IndependentOnlyAssociatedChild &&
+                s.AssociatedChild.HasValue && s.AssociatedChild.Value.Equals(j.PositiveChild.Value),
+                "The interrupted viewer's exact child is not independently present.");
+            j.Stage = ProbeStage.OutcomeUnknown;
+            j.AuthenticationOutcome = "InterruptedAfterIdentity";
+            store.Save(j); return j;
+        }
+    }
+
+    internal ProbeJournal EndPositiveChildReviewed(bool explicitConsent, bool operatorConfirmedIsolation)
+    {
+        using (owner.Acquire())
+        {
+            ProbeJournal j = RequiredJournal();
+            Require(j.Plan.Original.NetworkPosture == ProbeNetworkPosture.ExternalNetworkIsolated &&
+                explicitConsent && operatorConfirmedIsolation && j.ConnectionAttempted &&
+                j.PositiveChild.HasValue &&
+                (j.Stage == ProbeStage.Connecting || j.Stage == ProbeStage.Connected ||
+                 j.Stage == ProbeStage.OutcomeUnknown),
+                "Reviewed teardown requires a durably identified test child and separate consent.");
+            ProbeSnapshot before = CaptureForJournal(j, true);
+            Require(before.BoundaryAccepted && before.FeatureAccess == ResourceAccess.Accessible &&
+                before.FeatureEnabled && before.RdpPolicyDenied && before.FirewallObservationComplete &&
+                before.AccountBinding == j.Plan.Original.AccountBinding &&
+                before.ParentSessionId == j.ActiveParentId &&
+                before.ParentSessionId == before.ConsoleSessionId && before.ParentProtocolType == 0 &&
+                before.ParentLogonTime == j.ActiveParentLogonTime &&
+                before.ChildAccess == ResourceAccess.Accessible &&
+                before.IndependentOnlyAssociatedChild && before.AssociatedChild.HasValue &&
+                before.AssociatedChild.Value.Equals(j.PositiveChild.Value),
+                "Reviewed teardown lacks external/guest isolation or the exact child identity.");
+            j.ReviewedChildTeardown = true;
+            j.Stage = ProbeStage.TeardownPrepared; store.Save(j);
+            bool result = host.LogoffExact(j.PositiveChild.Value);
+            ProbeSnapshot after = CaptureForJournal(j, true);
+            j.Stage = result && after.BoundaryAccepted &&
+                after.AccountBinding == j.Plan.Original.AccountBinding &&
+                after.ParentSessionId == j.ActiveParentId &&
+                after.ParentLogonTime == j.ActiveParentLogonTime &&
+                after.ChildAccess == ResourceAccess.Absent && after.ChildApiErrorCode == 0 &&
+                after.IndependentNoUnexpectedSessions && !after.AssociatedChild.HasValue
                 ? ProbeStage.ChildEnded : ProbeStage.TeardownPrepared;
             store.Save(j); return j;
         }

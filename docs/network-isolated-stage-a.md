@@ -1,6 +1,6 @@
 # Network-isolated Stage A: physical-console runbook
 
-**Preparation only.** This document does not authorize a host change. Obtain separate approval of the exact source SHA, the physical isolation method, the plan hash, Stage A feature write, and the operator recovery arrangement. Stage B is unavailable to an isolated plan. Keep this document and the repository on the PC before disconnecting it; do not depend on internet access during the experiment.
+**Preparation only.** This document does not authorize a host change. Obtain separate approval of the exact source SHA, the physical isolation method, the plan hash, Stage A feature write, and the operator recovery arrangement. This version 4 strict-isolation plan remains Stage A only; the separate version 5 external/guest boundary has its own [isolated Stage B path](isolated-stage-b.md) after positive Stage A evidence and a new approval. Keep this document and the repository on the PC before disconnecting it; do not depend on internet access during the experiment.
 
 **Current status:** The strict gate below remains unchanged. The predicate-level read-only diagnostic and the proposed external/internal boundary are in [stage-a-network-boundary-design.md](stage-a-network-boundary-design.md). Retained internal adapters cannot be accepted until their switch/underlay paths and active peers are independently verified. Do not try to use this runbook to bypass the strict gate.
 

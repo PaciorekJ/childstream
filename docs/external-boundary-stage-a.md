@@ -49,7 +49,7 @@ After a separate approval for fresh sign-out/logon, sign out **only the parent c
 .\tests\.artifacts\ChildStreamFeasibilityProbe.exe status
 ```
 
-`StageAValidated` requires a fresh console parent and a positive no-child WTS API result plus independent session enumeration. `StageAQueryUnknown` preserves error 1168 or another ambiguous result as **unknown**, not success. Both outcomes proceed to restoration; neither authorizes Stage B. A deviation or query failure prohibits further experiment progression.
+`StageAValidated` requires a fresh console parent and a positive no-child WTS API result plus independent session enumeration. `StageAQueryUnknown` preserves error 1168 or another ambiguous result as **unknown**, not success. Stage A approval alone never authorizes Stage B. The normal path restores the feature. If Stage A is validated and a **new, exact-plan Stage B approval** is separately granted while the same v5 boundary remains intact, continue directly with [one isolated local Stage B test](isolated-stage-b.md) before restoration. A deviation or query failure prohibits that progression.
 
 ## Restoration and reconnect decision
 

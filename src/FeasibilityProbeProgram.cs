@@ -66,6 +66,7 @@ internal static class ProbePrivateState
 internal static class FeasibilityProbeProgram
 {
     private const string IsolationConfirmation = "I-CONFIRM-PHYSICAL-ISOLATION";
+    private const string InteractionConfirmation = "I-OBSERVED-INDEPENDENT-DESKTOP";
     private static bool Confirmed(string[] args, int index)
     { return args.Length == index + 1 && args[index] == IsolationConfirmation; }
     private static void Usage()
@@ -73,6 +74,8 @@ internal static class FeasibilityProbeProgram
         Console.WriteLine("Connected posture: plan | begin HASH | prepare-a | verify-a | restore | restore-reviewed");
         Console.WriteLine("Isolated Stage A: plan-isolated CONFIRM | begin-isolated HASH CONFIRM | prepare-isolated CONFIRM | verify-isolated CONFIRM | restore-isolated CONFIRM | restore-isolated-reviewed CONFIRM | reconnect-check CONFIRM");
         Console.WriteLine("External-boundary Stage A: plan-boundary CONFIRM | begin-boundary HASH CONFIRM | prepare-boundary CONFIRM | verify-boundary CONFIRM | restore-boundary CONFIRM | restore-boundary-reviewed CONFIRM | reconnect-boundary-check CONFIRM");
+        Console.WriteLine("Isolated Stage B (separate approval): approve-b-boundary HASH CONFIRM | connect-once-boundary CONFIRM | confirm-interaction-boundary ID:LOGON CONFIRM " + InteractionConfirmation + " | end-child-boundary ID:LOGON CONFIRM");
+        Console.WriteLine("Isolated recovery: reconcile-connection-boundary CONFIRM | end-child-boundary-reviewed ID:LOGON CONFIRM (separate review required)");
         Console.WriteLine("CONFIRM is the literal " + IsolationConfirmation + ". Other commands: status | approve-b HASH | connect-once | confirm-console | end-child ID:LOGON | repair-journal");
         Console.WriteLine("All commands must run at the physical console. No automatic elevation or sign-out is performed.");
     }
@@ -94,6 +97,13 @@ internal static class FeasibilityProbeProgram
         ProbeJournal existing = store.Load();
         if (existing == null || existing.Plan.Original.NetworkPosture != expected)
             throw new InvalidOperationException("This command requires the matching probe posture and journal.");
+    }
+    private static void RequireExactChild(IProbeStore store, string value)
+    {
+        ProbeJournal existing = store.Load();
+        if (existing == null || !existing.PositiveChild.HasValue ||
+            value != existing.PositiveChild.Value.SessionId + ":" + existing.PositiveChild.Value.LogonTime)
+            throw new InvalidOperationException("Exact child ID and generation approval does not match the journal.");
     }
     [STAThread]
     public static int Main(string[] args)
@@ -176,16 +186,50 @@ internal static class FeasibilityProbeProgram
                     result = probe.ResumeAfterFreshLogon(true); break;
                 case "approve-b":
                     if (args.Length != 2) throw new ArgumentException("Use approve-b with the reviewed exact plan hash.");
+                    RequirePosture(store, ProbeNetworkPosture.ConnectedRdpGuard);
                     result = probe.ApproveStageB(args[1], true); break;
-                case "connect-once": result = probe.ConnectOnce(); break;
-                case "confirm-console": result = probe.ConfirmConsoleUsable(true); break;
+                case "approve-b-boundary":
+                    if (args.Length != 3 || !Confirmed(args, 2))
+                        throw new ArgumentException("Use approve-b-boundary with the reviewed hash and renewed physical isolation confirmation.");
+                    RequirePosture(store, ProbeNetworkPosture.ExternalNetworkIsolated);
+                    result = probe.ApproveStageB(args[1], true, true); break;
+                case "connect-once":
+                    RequirePosture(store, ProbeNetworkPosture.ConnectedRdpGuard);
+                    result = probe.ConnectOnce(); break;
+                case "connect-once-boundary":
+                    if (!Confirmed(args, 1)) throw new ArgumentException("Renewed physical isolation confirmation is required.");
+                    RequirePosture(store, ProbeNetworkPosture.ExternalNetworkIsolated);
+                    result = probe.ConnectOnce(true); break;
+                case "confirm-console":
+                    RequirePosture(store, ProbeNetworkPosture.ConnectedRdpGuard);
+                    result = probe.ConfirmConsoleUsable(true); break;
+                case "confirm-interaction-boundary":
+                    if (args.Length != 4 || args[2] != IsolationConfirmation || args[3] != InteractionConfirmation)
+                        throw new ArgumentException("Exact child, physical isolation, and observed interaction confirmations are required.");
+                    RequirePosture(store, ProbeNetworkPosture.ExternalNetworkIsolated);
+                    RequireExactChild(store, args[1]);
+                    result = probe.ConfirmConsoleUsable(true, true); break;
                 case "end-child":
                     if (args.Length != 2) throw new ArgumentException("Use end-child ID:LOGON from the journal.");
-                    var existing = store.Load();
-                    if (existing == null || !existing.PositiveChild.HasValue ||
-                        args[1] != existing.PositiveChild.Value.SessionId + ":" + existing.PositiveChild.Value.LogonTime)
-                        throw new InvalidOperationException("Exact child ID and generation approval does not match the journal.");
+                    RequirePosture(store, ProbeNetworkPosture.ConnectedRdpGuard);
+                    RequireExactChild(store, args[1]);
                     result = probe.EndPositiveChild(true); break;
+                case "end-child-boundary":
+                    if (args.Length != 3 || !Confirmed(args, 2))
+                        throw new ArgumentException("Exact child and renewed physical isolation confirmation are required.");
+                    RequirePosture(store, ProbeNetworkPosture.ExternalNetworkIsolated);
+                    RequireExactChild(store, args[1]);
+                    result = probe.EndPositiveChild(true, true); break;
+                case "reconcile-connection-boundary":
+                    if (!Confirmed(args, 1)) throw new ArgumentException("Renewed physical isolation confirmation is required.");
+                    RequirePosture(store, ProbeNetworkPosture.ExternalNetworkIsolated);
+                    result = probe.ReconcileInterruptedConnection(true); break;
+                case "end-child-boundary-reviewed":
+                    if (args.Length != 3 || !Confirmed(args, 2))
+                        throw new ArgumentException("Exact child and renewed physical isolation confirmation are required.");
+                    RequirePosture(store, ProbeNetworkPosture.ExternalNetworkIsolated);
+                    RequireExactChild(store, args[1]);
+                    result = probe.EndPositiveChildReviewed(true, true); break;
                 case "restore":
                     RequirePosture(store, ProbeNetworkPosture.ConnectedRdpGuard);
                     result = probe.RestoreOriginal(); break;

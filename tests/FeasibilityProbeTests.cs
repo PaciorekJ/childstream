@@ -10,10 +10,10 @@ internal static class FeasibilityProbeTests
     {
         internal ProbeSnapshot State = Base();
         internal bool Admin = true, FailBeforeFeature, FailAfterFeature, FailRestore, FailConnectAfterChild,
-            FailLogoffAfterChild, CredentialPrompt, LoseNetworkAfterFeature, StartRdpAfterFeature,
+            FailConnectAfterIdentity, FailLogoffAfterChild, CredentialPrompt, LoseNetworkAfterFeature, StartRdpAfterFeature,
             LoseBoundaryAfterFeature, FailBoundaryCapture;
         internal int FeatureWrites, Connections, Logoffs;
-        internal Action OnConnectionAttempt;
+        internal Action OnConnectionAttempt, OnViewerInterval;
         internal ChildSessionIdentity TestChild = new ChildSessionIdentity(31, 200);
         public bool HasAdministratorPrivilege { get { return Admin; } }
         public ProbeSnapshot Capture() { return Clone(State); }
@@ -45,11 +45,19 @@ internal static class FeasibilityProbeTests
             if (FailAfterFeature) throw new IOException("After feature write");
             return true;
         }
-        public ProbeConnectionResult ConnectWithoutPassword()
+        public ProbeConnectionResult ConnectWithoutPassword(Action observeBoundary,
+            Action<ChildSessionIdentity> observedChild)
         {
             if (OnConnectionAttempt != null) OnConnectionAttempt();
+            if (observeBoundary != null) observeBoundary();
             Connections++; State.ChildAccess = ResourceAccess.Accessible; State.AssociatedChild = TestChild;
+            State.IndependentNoUnexpectedSessions = false;
+            State.IndependentOnlyAssociatedChild = true;
             if (FailConnectAfterChild) throw new IOException("After connection");
+            if (!CredentialPrompt) observedChild(TestChild);
+            if (FailConnectAfterIdentity) throw new IOException("After durable child identity");
+            if (OnViewerInterval != null) OnViewerInterval();
+            if (observeBoundary != null) observeBoundary();
             return new ProbeConnectionResult { Outcome = CredentialPrompt ? ProbeConnectOutcome.CredentialPrompt : ProbeConnectOutcome.AutomaticLogon,
                 Identity = TestChild, ErrorCode = CredentialPrompt ? 1326 : 0 };
         }
@@ -58,6 +66,8 @@ internal static class FeasibilityProbeTests
             Logoffs++;
             if (!State.AssociatedChild.HasValue || !State.AssociatedChild.Value.Equals(expected)) return false;
             State.ChildAccess = ResourceAccess.Absent; State.AssociatedChild = null;
+            State.IndependentNoUnexpectedSessions = true;
+            State.IndependentOnlyAssociatedChild = false;
             if (FailLogoffAfterChild) throw new IOException("After logoff");
             return true;
         }
@@ -82,6 +92,7 @@ internal static class FeasibilityProbeTests
             FeatureAccess = x.FeatureAccess, FeatureEnabled = x.FeatureEnabled,
             ChildAccess = x.ChildAccess, ChildApiErrorCode = x.ChildApiErrorCode,
             IndependentNoUnexpectedSessions = x.IndependentNoUnexpectedSessions,
+            IndependentOnlyAssociatedChild = x.IndependentOnlyAssociatedChild,
             SessionInventoryFingerprint = x.SessionInventoryFingerprint,
             ParentSessionId = x.ParentSessionId, ConsoleSessionId = x.ConsoleSessionId,
             ParentProtocolType = x.ParentProtocolType,
@@ -143,6 +154,12 @@ internal static class FeasibilityProbeTests
             Begin(); Probe.PrepareFeature(); Host.State.ParentLogonTime = 101;
             ProbeJournal stageA = Probe.ResumeAfterFreshLogon();
             return Probe.ApproveStageB(stageA.Plan.Hash, true);
+        }
+        internal ProbeJournal ReadyBoundary()
+        {
+            BeginBoundary(); Probe.PrepareFeature(true); Host.State.ParentLogonTime = 101;
+            ProbeJournal stageA = Probe.ResumeAfterFreshLogon(true);
+            return Probe.ApproveStageB(stageA.Plan.Hash, true, true);
         }
         public void Dispose() { Directory.Delete(Root, true); }
     }
@@ -503,6 +520,20 @@ internal static class FeasibilityProbeTests
             new { SessionId = 0 }, new { SessionId = 1 }, new { SessionId = 8 } } };
         input.Json = serializer.Serialize(document);
         Check(!host.Capture().IndependentNoUnexpectedSessions, "unexpected session blocks independent absence gate");
+        document = (Dictionary<string, object>)serializer.DeserializeObject(SyntheticJson());
+        sessions = (Dictionary<string, object>)document["Sessions"];
+        sessions["AssociatedChild"] = new { State = "Accessible", SessionId = 31, ErrorCode = 0 };
+        sessions["AssociatedChildDetails"] = new { State = "Accessible", SessionId = 31, LogonTime = 400L };
+        sessions["Enumerated"] = new { State = "Accessible", Items = new object[] {
+            new { SessionId = 0 }, new { SessionId = 1 }, new { SessionId = 31 } } };
+        input.Json = serializer.Serialize(document);
+        Check(host.Capture().IndependentOnlyAssociatedChild && !host.Capture().IndependentNoUnexpectedSessions,
+            "only the exact parent-associated child is accepted during Stage B");
+        sessions["Enumerated"] = new { State = "Accessible", Items = new object[] {
+            new { SessionId = 0 }, new { SessionId = 1 }, new { SessionId = 31 }, new { SessionId = 32 } } };
+        input.Json = serializer.Serialize(document);
+        Check(!host.Capture().IndependentOnlyAssociatedChild,
+            "an unrelated enumerated session blocks Stage B identity evidence");
     }
     private static ProbeSnapshot FirewallSnapshot(Action<Dictionary<string, object>> change)
     {
@@ -952,7 +983,7 @@ internal static class FeasibilityProbeTests
             Check(f.Probe.ResumeAfterFreshLogon(true).Stage == ProbeStage.StageAValidated,
                 "v5 Stage A validates a fresh parent without creating a child");
             Throws<InvalidOperationException>(() => f.Probe.ApproveStageB(f.Store.Load().Plan.Hash, true),
-                "v5 cannot approve Stage B");
+                "v5 cannot approve Stage B without separate isolation confirmation");
             Check(f.Probe.RestoreOriginal(false, false, true).Stage == ProbeStage.Restored &&
                 f.Probe.AssessReconnect(true).Ready,
                 "v5 restores original feature and checks reconnect safety");
@@ -1035,6 +1066,8 @@ internal static class FeasibilityProbeTests
             f.Host.State.ParentLogonTime = 101;
             Check(f.Probe.ResumeAfterFreshLogon(true).Stage == ProbeStage.StageAQueryUnknown,
                 "persistent 1168 remains unknown in v5");
+            Throws<InvalidOperationException>(() => f.Probe.ApproveStageB(plan.Hash, true, true),
+                "persistent 1168 cannot authorize isolated Stage B");
             Check(f.Probe.RestoreOriginal(false, false, true).Stage == ProbeStage.Restored,
                 "unknown child lookup can restore feature while child absence is independently proven");
         }
@@ -1049,6 +1082,186 @@ internal static class FeasibilityProbeTests
             f.Host.State.NetworkFingerprint = "network-1";
             Check(f.Probe.RestoreOriginal(true, true, true).Stage == ProbeStage.Restored,
                 "reviewed recovery restores after fresh logon drift");
+        }
+    }
+    private static void ExternalBoundaryStageB()
+    {
+        using (var f = new Fixture())
+        {
+            f.BeginIsolated(); f.Probe.PrepareFeature(true); f.Host.State.ParentLogonTime = 101;
+            ProbeJournal stageA = f.Probe.ResumeAfterFreshLogon(true);
+            Throws<InvalidOperationException>(() => f.Probe.ApproveStageB(stageA.Plan.Hash, true, true),
+                "strict v4 isolated plan remains Stage A only");
+        }
+        using (var f = new Fixture())
+        {
+            f.BeginBoundary(); f.Probe.PrepareFeature(true); f.Host.State.ParentLogonTime = 101;
+            ProbeJournal stageA = f.Probe.ResumeAfterFreshLogon(true);
+            Throws<InvalidOperationException>(() => f.Probe.ApproveStageB(stageA.Plan.Hash, true),
+                "v5 Stage B refuses missing renewed isolation confirmation");
+            Throws<InvalidOperationException>(() => f.Probe.ApproveStageB("wrong", true, true),
+                "v5 Stage B approval binds the exact Stage A plan hash");
+            Check(f.Probe.ApproveStageB(stageA.Plan.Hash, true, true).Stage == ProbeStage.ReadyConnect &&
+                f.Host.FeatureWrites == 1,
+                "validated v5 Stage A enters separately approved Stage B without a second feature cycle");
+            Throws<InvalidOperationException>(() => f.Probe.ConnectOnce(),
+                "isolated child creation refuses missing physical confirmation");
+            f.Host.OnViewerInterval = () =>
+            {
+                ProbeJournal active = f.Store.Load();
+                Check(active.Stage == ProbeStage.Connecting && active.ConnectionAttempted &&
+                    active.PositiveChild.HasValue && active.PositiveChild.Value.Equals(f.Host.TestChild),
+                    "exact child identity is durable while the viewer remains open");
+            };
+            Check(f.Probe.ConnectOnce(true).Stage == ProbeStage.Connected && f.Host.Connections == 1,
+                "one isolated loopback connection retains the same child after viewer close");
+            Throws<InvalidOperationException>(() => f.Probe.ConnectOnce(true), "isolated viewer cannot reconnect implicitly");
+            Throws<InvalidOperationException>(() => f.Probe.ConfirmConsoleUsable(true),
+                "interaction checkpoint requires renewed isolation confirmation");
+            Throws<InvalidOperationException>(() => f.Probe.ConfirmConsoleUsable(false, true),
+                "interaction checkpoint requires an operator observation");
+            Check(f.Probe.ConfirmConsoleUsable(true, true).ConsoleConfirmed,
+                "independent parent and child observation is recorded after exact identity recheck");
+            Throws<InvalidOperationException>(() => f.Probe.EndPositiveChild(true),
+                "isolated teardown requires renewed physical confirmation");
+            Throws<InvalidOperationException>(() => f.Probe.EndPositiveChild(false, true),
+                "isolated teardown requires separate destructive consent");
+            Check(f.Probe.EndPositiveChild(true, true).Stage == ProbeStage.ChildEnded && f.Host.Logoffs == 1,
+                "one exact associated child is ended without affecting another session");
+            Check(f.Probe.RestoreOriginal(false, false, true).Stage == ProbeStage.Restored &&
+                f.Probe.AssessReconnect(true).Ready && f.Host.FeatureWrites == 2,
+                "same v5 journal restores the one feature write and verifies network reconnect readiness");
+        }
+        using (var f = new Fixture())
+        {
+            ProbeJournal current = f.ReadyBoundary();
+            byte[] expanded = ProbeCodec.JournalBytes(current);
+            byte[] earlierV5 = new byte[expanded.Length - 1];
+            Array.Copy(expanded, earlierV5, earlierV5.Length);
+            var decoded = new ProbeJournal { Plan = current.Plan };
+            ProbeCodec.ReadJournal(earlierV5, decoded);
+            Check(decoded.Stage == ProbeStage.ReadyConnect && !decoded.ReviewedChildTeardown,
+                "published v5 journals without the optional teardown flag remain readable");
+            byte[] trailing = new byte[expanded.Length + 1];
+            Array.Copy(expanded, trailing, expanded.Length);
+            Throws<InvalidDataException>(() => ProbeCodec.ReadJournal(trailing,
+                new ProbeJournal { Plan = current.Plan }), "unexpected v5 journal tail is rejected");
+        }
+        using (var f = new Fixture())
+        {
+            f.ReadyBoundary();
+            f.Host.OnConnectionAttempt = () => { f.Host.State.BoundaryAccepted = false;
+                f.Host.State.NetworkFingerprint = "lost-before-activex"; };
+            Throws<InvalidOperationException>(() => f.Probe.ConnectOnce(true),
+                "last isolated boundary check stops before ActiveX child creation");
+            Check(f.Host.Connections == 0 && f.Store.Load().NetworkDeviationObserved &&
+                !f.Store.Load().PositiveChild.HasValue,
+                "pre-ActiveX network loss is durable without a child");
+            f.Host.State.BoundaryAccepted = true; f.Host.State.NetworkFingerprint = "network-1";
+            Check(f.Probe.RestoreOriginal(false, true, true).Stage == ProbeStage.Restored,
+                "reviewed pre-ActiveX abort restores the original feature");
+        }
+        using (var f = new Fixture())
+        {
+            f.ReadyBoundary();
+            f.Host.FailConnectAfterIdentity = true;
+            Throws<IOException>(() => f.Probe.ConnectOnce(true),
+                "viewer failure after identity does not erase the durable child");
+            Check(f.Store.Load().Stage == ProbeStage.OutcomeUnknown &&
+                f.Store.Load().PositiveChild.HasValue && f.Host.Connections == 1,
+                "post-identity failure retains one exact child and forbids retry");
+            Check(f.Probe.EndPositiveChildReviewed(true, true).Stage == ProbeStage.ChildEnded,
+                "reviewed recovery terminates the exact observed child after viewer failure");
+            Check(f.Store.Load().ReviewedChildTeardown && !f.Store.Load().NetworkDeviationObserved,
+                "reviewed child teardown is recorded without fabricating network drift");
+            Check(f.Probe.RestoreOriginal(false, false, true).Stage == ProbeStage.Restored &&
+                f.Probe.AssessReconnect(true).Ready,
+                "post-failure reviewed recovery verifies original feature and boundary");
+        }
+        using (var f = new Fixture())
+        {
+            f.ReadyBoundary();
+            f.Host.OnViewerInterval = () => { f.Host.State.BoundaryAccepted = false;
+                f.Host.State.NetworkFingerprint = "external-link-returned"; };
+            Throws<InvalidOperationException>(() => f.Probe.ConnectOnce(true),
+                "network loss during the viewer stops the connection");
+            Check(f.Store.Load().Stage == ProbeStage.OutcomeUnknown &&
+                f.Store.Load().NetworkDeviationObserved && f.Store.Load().PositiveChild.HasValue,
+                "network loss and the already observed child remain durable");
+            Throws<InvalidOperationException>(() => f.Probe.EndPositiveChildReviewed(true, true),
+                "reviewed teardown cannot run while external isolation is lost");
+            Check(f.Host.Logoffs == 0, "lost isolation causes no child termination");
+            f.Host.State.BoundaryAccepted = true; f.Host.State.NetworkFingerprint = "network-1";
+            Throws<InvalidOperationException>(() => f.Probe.EndPositiveChild(true, true),
+                "normal teardown cannot erase a recorded network deviation");
+            Check(f.Probe.EndPositiveChildReviewed(true, true).Stage == ProbeStage.ChildEnded &&
+                !f.Store.Load().ConsoleConfirmed && f.Store.Load().ReviewedChildTeardown,
+                "separately reviewed exact-child recovery can end an unaccepted viewer test");
+            Throws<InvalidOperationException>(() => f.Probe.RestoreOriginal(false, false, true),
+                "recorded deviation still requires reviewed feature restoration");
+            Check(f.Probe.RestoreOriginal(false, true, true).Stage == ProbeStage.Restored &&
+                f.Probe.AssessReconnect(true).Ready,
+                "reviewed recovery verifies original feature and network after child teardown");
+        }
+        using (var f = new Fixture())
+        {
+            f.ReadyBoundary();
+            f.Host.OnViewerInterval = () => {
+                f.Host.State.TermServiceStopped = false;
+                f.Host.State.RdpListenersAbsent = false;
+                f.Host.State.BoundaryRdpAccepted = false;
+                f.Host.State.ListenerFingerprint = "unexpected-rdp-listener";
+                f.Host.State.NetworkFingerprint = "rdp-listener-drift";
+            };
+            Throws<InvalidOperationException>(() => f.Probe.ConnectOnce(true),
+                "unexpected RDP listener during viewer interaction aborts Stage B");
+            Check(f.Store.Load().NetworkDeviationObserved && f.Store.Load().PositiveChild.HasValue,
+                "unexpected listener and exact child remain in private journal");
+            Check(f.Probe.EndPositiveChildReviewed(true, true).Stage == ProbeStage.ChildEnded,
+                "reviewed offline teardown can end the exact child despite listener drift");
+            Throws<InvalidOperationException>(() => f.Probe.RestoreOriginal(false, true, true),
+                "feature restoration does not clear unexpected listener conflict");
+            Check(f.Store.Load().Stage == ProbeStage.Conflict && !f.Probe.AssessReconnect(true).Ready,
+                "external reconnection stays forbidden while listener remains");
+            f.Host.State.TermServiceStopped = true;
+            f.Host.State.RdpListenersAbsent = true;
+            f.Host.State.BoundaryRdpAccepted = true;
+            f.Host.State.ListenerFingerprint = "listener-1";
+            f.Host.State.NetworkFingerprint = "network-1";
+            Check(f.Probe.RestoreOriginal(true, true, true).Stage == ProbeStage.Restored &&
+                f.Probe.AssessReconnect(true).Ready,
+                "separately recovered listener state permits exact original-state verification");
+        }
+        using (var f = new Fixture())
+        {
+            f.ReadyBoundary();
+            ProbeJournal interrupted = f.Store.Load();
+            interrupted.Stage = ProbeStage.Connecting;
+            interrupted.ConnectionAttempted = true;
+            interrupted.PositiveChild = f.Host.TestChild;
+            interrupted.AuthenticationOutcome = "AutomaticLogonObserved";
+            f.Store.Save(interrupted);
+            f.Host.State.ChildAccess = ResourceAccess.Accessible;
+            f.Host.State.AssociatedChild = f.Host.TestChild;
+            f.Host.State.IndependentNoUnexpectedSessions = false;
+            f.Host.State.IndependentOnlyAssociatedChild = true;
+            Throws<InvalidOperationException>(() => f.Probe.ReconcileInterruptedConnection(false),
+                "interrupted viewer recovery requires physical confirmation");
+            Check(f.Probe.ReconcileInterruptedConnection(true).Stage == ProbeStage.OutcomeUnknown,
+                "interrupted viewer is reconciled without creating another child");
+            Throws<InvalidOperationException>(() => f.Probe.ConnectOnce(true),
+                "reconciled viewer never retries child creation");
+        }
+        using (var f = new Fixture())
+        {
+            f.ReadyBoundary();
+            f.Host.OnViewerInterval = () => f.Host.State.AssociatedChild =
+                new ChildSessionIdentity(32, 201);
+            Throws<InvalidOperationException>(() => f.Probe.ConnectOnce(true),
+                "changed child identity aborts viewer acceptance");
+            Throws<InvalidOperationException>(() => f.Probe.EndPositiveChildReviewed(true, true),
+                "reviewed teardown cannot target a different associated child");
+            Check(f.Host.Logoffs == 0, "unrelated child is never logged off");
         }
     }
     private static object Accessible(params object[] items)
@@ -1175,7 +1388,8 @@ internal static class FeasibilityProbeTests
         {
             PlanningAndApproval(); FeatureFailureAndRecovery(); FreshLogonAndConnection(); TeardownAndRollback();
             JournalAndOwnership(); ObservedHostBoundary(); WindowsAdapterSynthetic(); FirewallGateSynthetic();
-            NetworkGateSynthetic(); IsolatedLifecycle(); ExternalBoundaryLifecycle(); BoundaryCaptureParser(); PrivateStateSynthetic();
+            NetworkGateSynthetic(); IsolatedLifecycle(); ExternalBoundaryLifecycle(); ExternalBoundaryStageB();
+            BoundaryCaptureParser(); PrivateStateSynthetic();
             Console.WriteLine("Feasibility probe: " + assertions + " offline assertions passed."); return 0;
         }
         catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
