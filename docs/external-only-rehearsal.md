@@ -1,0 +1,7 @@
+# Completed external-only read-only rehearsal
+
+This is a historical evidence record, **not an executable procedure**. The protected workstation is now outside the Stage A/B execution path under the permanent [scope boundary](scope-boundary.md). Do not repeat its physical disconnection or inspect unrelated workloads for ChildStream.
+
+During the completed, operator-controlled physical-console rehearsal at reviewed source `8b1775ae91017022d7b73e304183d88e4e36ab0b`, disconnected physical uplinks, physical route/link corroboration, the Hyper-V host-port graph, NAT/bridge/forwarding assessment and the ordinary RDP baseline passed. Virtual-path attribution remained Unknown. The private capture identified an addressed Tailscale tunnel without a host-port match and a WSL vEthernet adapter whose Windows-generated `#2` description was rejected by the then-current exact string check. The subsequent focused source correction attributes the latter only through a unique management-OS port MAC, matching Internal switch ID/name and exact adapter label. The addressed tunnel still remains Unknown. Active internal guests kept `GuestPath=Fail`, as expected.
+
+No Stage A plan hash, probe journal, feature write or child session was created in this rehearsal. The physical links were restored afterward. These measurements do not prove current host isolation or allow the guest, tunnel or connected-network firewall gates to be weakened. The next feasibility test belongs on a [separate Windows environment](stage-ab-physical-window.md).

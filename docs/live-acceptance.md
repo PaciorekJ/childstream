@@ -1,6 +1,6 @@
 # First live-system acceptance plan (not yet executed)
 
-Target: Windows 11 Pro build 26200, Ryzen 7 5800X, RTX 3060, 32 GB RAM, Acer 3440x1440 primary, Fire TV Moonlight, Xbox Series Bluetooth controller, Xbox One USB controller. Preserve the current native Sunshine/VDD setup and its working fallback. This plan requires a separate live-system authorization.
+Product target attributes: Windows 11 Pro build 26200, Ryzen 7 5800X, RTX 3060, 32 GB RAM, Acer 3440x1440 primary, Fire TV Moonlight, Xbox Series Bluetooth controller, Xbox One USB controller. Preserve the current native Sunshine/VDD setup and its working fallback. **This is an acceptance specification, not an executable plan for the protected workstation.** The permanent [scope boundary](scope-boundary.md) blocks a test there that inspects or interrupts unrelated work or shared services. First prove child-session behavior in a [separate Windows environment](stage-ab-physical-window.md); later target-host acceptance requires a coexistence and RDP-containment design plus separate authorization.
 
 ## Before any mutation
 

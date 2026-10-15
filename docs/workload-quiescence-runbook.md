@@ -1,0 +1,5 @@
+# Retired: shared-workload pause procedure
+
+**Do not use the former workload shutdown procedure.** It conflicts with the permanent [ChildStream scope boundary](scope-boundary.md). ChildStream may not inspect or interrupt unrelated repositories, containers, databases, volumes, services, development processes, Docker Desktop, WSL2 or Tailscale to make a feasibility gate pass. The former `scripts/workload-inventory.ps1` collector has been removed from the repository. Earlier private captures and shutdown matrices are historical evidence; they are not ChildStream action lists or pending approval requests.
+
+The protected workstation's current v5 `GuestPath` and virtual-path observations remain blockers. Do not reinterpret them as harmless or change the diagnostic to admit active guests. The [isolated test strategy](stage-ab-physical-window.md) uses a separate Windows environment with its own network and recovery boundary. Stage A/B commands remain separately authorized only for that target after its prerequisites pass.

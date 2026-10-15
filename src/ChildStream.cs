@@ -201,6 +201,20 @@ static class Program
         menu.Items.Add("Show", null, (s, e) => { f.Show(); f.WindowState = FormWindowState.Normal; f.Activate(); });
         ToolStripMenuItem reconnectItem = new ToolStripMenuItem("Reconnect now");
         menu.Items.Add(reconnectItem);
+        menu.Items.Add("Streaming readiness", null, (s, e) =>
+        {
+            string session = lifecycle.State == ChildLifecycleState.Connected && lifecycle.CheckConnectedIdentity()
+                ? "Verified child session " + lifecycle.ObservedChild.Value.SessionId +
+                  " (generation " + lifecycle.ObservedChild.Value.LogonTime + ")."
+                : "No currently verified child desktop. State: " + lifecycle.State + ".";
+            SunshineCollisionSnapshot collision = WindowsSunshineCollisionReader.Read();
+            string conflict = SunshineStartupGate.Check(collision);
+            MessageBox.Show(session + "\n" +
+                (conflict ?? "No Sunshine service, process or default-family port collision was observed.") +
+                "\nPortable streaming remains disabled until child process launch, capture, input, audio, " +
+                "network and rollback acceptance pass on an independent Windows target.",
+                "ChildStream readiness", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        });
         menu.Items.Add("Inspect/remove legacy saved password", null, (s, e) => { RemoveLegacyPasswordExplicitly(); });
         ToolStripMenuItem signOutItem = new ToolStripMenuItem("End session (sign out, closes games)");
         menu.Items.Add(signOutItem);

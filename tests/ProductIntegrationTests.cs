@@ -1,0 +1,364 @@
+using System;
+using System.IO;
+using System.IO.Compression;
+using System.Security.Cryptography;
+using System.Text;
+
+internal static class ProductIntegrationTests
+{
+    private static int assertions;
+    private static readonly string SunshineDigest = new string('a', 64);
+    private static readonly string SteamDigest = new string('b', 64);
+    private static readonly string GameDigest = new string('c', 64);
+    private static void Check(bool truth, string label)
+    { assertions++; if (!truth) throw new Exception(label); }
+    private static void Reject(Action action, string label)
+    { bool rejected = false; try { action(); } catch (InvalidDataException) { rejected = true; }
+      catch (InvalidOperationException) { rejected = true; }
+      Check(rejected, label); }
+
+    private sealed class FakeProcesses : IProductProcessHost
+    {
+        internal ProductProcessIdentity Current;
+        internal bool CloseCalled, KillCalled, Exit;
+        internal string LastArguments;
+        public int CurrentSessionId { get; set; }
+        internal long? SessionLogonTime = 123;
+        public long? ReadSessionLogonTime(int sessionId) { return SessionLogonTime; }
+        public ProductProcessIdentity Read(int pid) { return Current; }
+        public ProductProcessIdentity Start(string path, string args, string dir)
+        { LastArguments = args; return Current; }
+        public bool RequestClose(int pid) { CloseCalled = true; return true; }
+        public bool WaitForExit(int pid, int ms) { return Exit; }
+        public void Kill(int pid) { KillCalled = true; Exit = true; }
+    }
+
+    private static MemoryStream Archive(params string[] paths)
+    {
+        var stream = new MemoryStream();
+        using (var zip = new ZipArchive(stream, ZipArchiveMode.Create, true))
+            foreach (string path in paths)
+            { using (var writer = new StreamWriter(zip.CreateEntry(path).Open(), Encoding.UTF8)) writer.Write("bytes"); }
+        stream.Position = 0;
+        return stream;
+    }
+
+    private static void Configuration(string root)
+    {
+        string installed = Path.Combine(root, "ChildStream");
+        var audio = new ChildAudioEndpointInventory { SessionId = 2, Complete = true };
+        audio.ActiveRenderIds.Add("{audio-endpoint}");
+        var option = new ChildProductOptions { ParentSessionId = 1, Child = new ChildSessionIdentity(2, 123),
+            OwnedInstallationRoot = installed, OwnedRoot = Path.Combine(installed, "sessions", "2-123"),
+            DisplayDeviceId = Guid.NewGuid().ToString(),
+            AudioEndpointId = "{audio-endpoint}", DisplayActiveInChild = true,
+            AudioInventory = audio, Capture = CaptureBackend.WindowsGraphicsCapture };
+        string config = ChildProductConfiguration.BuildSunshine(option);
+        Check(config.Contains("bind_address = 127.0.0.1") && config.Contains("upnp = disabled") &&
+            config.Contains("origin_web_ui_allowed = pc"), "loopback-only posture");
+        Check(config.Contains("capture = wgc") && config.Contains("encoder = nvenc") &&
+            config.Contains("dd_configuration_option = verify_only"), "explicit capture without display mutation");
+        Check(config.Contains("controller = disabled") && config.Contains("gamepad_driver = vigembus") &&
+            config.Contains("install_steam_audio_drivers = disabled"), "free input driver and no automatic driver install");
+        Check(config.Contains("credentials_file = " + Path.Combine(installed, "sessions", "2-123", "sunshine_state.json")),
+            "credentials scoped to child config");
+        option.ViGEmBusPresent = true;
+        Check(ChildProductConfiguration.BuildSunshine(option).Contains("controller = enabled"), "controller only with observed driver");
+        option.BindAddress = "192.0.2.1";
+        Reject(() => ChildProductConfiguration.BuildSunshine(option), "LAN requires independent posture");
+        option.BindAddress = "127.0.0.1"; option.Port = 48000;
+        Reject(() => ChildProductConfiguration.BuildSunshine(option), "unverified port offset blocked");
+        option.Port = 47989; option.AudioEndpointId = "bad\ninjection = enabled";
+        Reject(() => ChildProductConfiguration.BuildSunshine(option), "config injection blocked");
+        option.AudioEndpointId = "{audio-endpoint}"; audio.Complete = false;
+        Reject(() => ChildProductConfiguration.BuildSunshine(option), "incomplete child audio inventory blocked");
+        audio.Complete = true; audio.SessionId = 1;
+        Reject(() => ChildProductConfiguration.BuildSunshine(option), "parent audio inventory cannot qualify child");
+        audio.SessionId = 2; option.DisplayActiveInChild = false;
+        Reject(() => ChildProductConfiguration.BuildSunshine(option), "parent or inactive display rejected");
+        option.DisplayActiveInChild = true; option.Child = new ChildSessionIdentity(1, 123);
+        Reject(() => ChildProductConfiguration.BuildSunshine(option), "parent session cannot be child");
+        option.Child = new ChildSessionIdentity(2, 123);
+        option.OwnedRoot = Path.Combine(root, "native-sunshine-config");
+        Reject(() => ChildProductConfiguration.BuildSunshine(option), "native config path rejected");
+    }
+
+    private static void Processes(string root)
+    {
+        string path = Path.Combine(root, "sunshine.exe");
+        var fake = new FakeProcesses { CurrentSessionId = 2,
+            Current = new ProductProcessIdentity { Pid = 42, SessionId = 2, StartTimeUtcTicks = 123,
+                ExecutablePath = path, ExecutableSha256 = SunshineDigest } };
+        Reject(() => new ChildOwnedProcess(fake, new ChildSessionIdentity(2, 123), path, "hash"),
+            "non-digest process pin rejected");
+        var owned = new ChildOwnedProcess(fake, new ChildSessionIdentity(2, 123), path, SunshineDigest);
+        owned.Start("config");
+        Check(owned.VerifyRunning(), "owned child process verified");
+        fake.Current = new ProductProcessIdentity { Pid = 42, SessionId = 1, StartTimeUtcTicks = 123,
+            ExecutablePath = path, ExecutableSha256 = SunshineDigest };
+        Check(!owned.VerifyRunning(), "session drift detected");
+        Reject(() => owned.Stop(100), "unrelated process preserved");
+        Check(!fake.KillCalled && !fake.CloseCalled, "no stop attempted on wrong session");
+        fake.Current.SessionId = 2; fake.Current.StartTimeUtcTicks = 124;
+        Reject(() => owned.Stop(100), "PID reuse preserved");
+        fake.Current.StartTimeUtcTicks = 123;
+        fake.SessionLogonTime = 124;
+        Reject(() => owned.Stop(100), "child session generation drift preserves process");
+        Check(!fake.KillCalled && !fake.CloseCalled, "generation drift caused no stop");
+        fake.SessionLogonTime = 123;
+        owned.Stop(100);
+        Check(fake.CloseCalled && fake.KillCalled, "owned process graceful then bounded termination");
+        fake.CurrentSessionId = 1;
+        Reject(() => new ChildOwnedProcess(fake, new ChildSessionIdentity(2, 123), path, SunshineDigest).Start(""),
+            "parent cannot launch child-owned process");
+        fake.CurrentSessionId = 2; fake.SessionLogonTime = null;
+        Reject(() => new ChildOwnedProcess(fake, new ChildSessionIdentity(2, 123), path, SunshineDigest).Start(""),
+            "unobserved child generation cannot launch process");
+    }
+
+    private static void Archives()
+    {
+        using (var stream = Archive("Sunshine/sunshine.exe", "Sunshine/assets/icon.png"))
+            Check(PortableSunshineArchive.ValidateManifest(stream).Count == 2, "expected lite archive layout");
+        using (var stream = Archive("Sunshine/../escape", "Sunshine/sunshine.exe"))
+            Reject(() => PortableSunshineArchive.ValidateManifest(stream), "traversal rejected");
+        using (var stream = Archive("Sunshine/sunshine.exe", "Sunshine/SUNSHINE.EXE"))
+            Reject(() => PortableSunshineArchive.ValidateManifest(stream), "case-insensitive duplicate rejected");
+        using (var stream = Archive("unexpected.exe"))
+            Reject(() => PortableSunshineArchive.ValidateManifest(stream), "archive rename rejected");
+        using (var stream = Archive("Sunshine/assets/icon.png"))
+            Reject(() => PortableSunshineArchive.ValidateManifest(stream), "missing executable rejected");
+        using (var stream = Archive("Sunshine/sunshine.exe", "Sunshine/CON.txt"))
+            Reject(() => PortableSunshineArchive.ValidateManifest(stream), "Windows device path rejected");
+        using (var stream = Archive("Sunshine/sunshine.exe", "Sunshine/trailing. "))
+            Reject(() => PortableSunshineArchive.ValidateManifest(stream), "ambiguous Windows trailing path rejected");
+    }
+
+    private static void PinnedArchive(string path)
+    {
+        string owned = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "PinnedChildStream");
+        var package = SunshineReleasePin.Create(Path.Combine(owned, "versions", SunshineReleasePin.Version),
+            Path.Combine(owned, "config"));
+        package.Validate(owned);
+        using (var file = package.Admit(path, new PinnedSunshineReleaseVerifier()))
+        {
+            Check(PortableSunshineArchive.ValidateManifest(file).Count > 1, "real pinned archive layout");
+            using (var zip = new ZipArchive(file, ZipArchiveMode.Read, true))
+            using (var executable = zip.GetEntry("Sunshine/sunshine.exe").Open())
+            using (var sha = SHA256.Create())
+                Check(BitConverter.ToString(sha.ComputeHash(executable)).Replace("-", "").Equals(
+                    SunshineReleasePin.ExecutableSha256, StringComparison.OrdinalIgnoreCase),
+                    "real pinned executable digest");
+        }
+    }
+
+    private static void Extraction(string root)
+    {
+        string installed = Path.Combine(root, "ChildStream");
+        string version = Path.Combine(installed, "versions", "vtest");
+        string config = Path.Combine(installed, "config");
+        using (var stream = Archive("Sunshine/sunshine.exe", "Sunshine/assets/icon.png"))
+        {
+            string archiveHash, executableHash;
+            using (var sha = SHA256.Create())
+                archiveHash = BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
+            stream.Position = 0;
+            using (var zip = new ZipArchive(stream, ZipArchiveMode.Read, true))
+            using (var input = zip.GetEntry("Sunshine/sunshine.exe").Open())
+            using (var sha = SHA256.Create())
+                executableHash = BitConverter.ToString(sha.ComputeHash(input)).Replace("-", "").ToLowerInvariant();
+            stream.Position = 0;
+            var package = new PortableSunshinePackage { Version = "vtest",
+                SourceUrl = "https://github.com/LizardByte/Sunshine/releases/download/vtest/sunshine.zip",
+                Sha256 = archiveHash, ExecutableSha256 = executableHash,
+                PortableRoot = version, ConfigRoot = config };
+            package.Validate(installed);
+            package.VerifyBytes(stream);
+            stream.Position = 0;
+            PortableSunshineArchive.ExtractIntoNewRoot(stream, version, package, null);
+            Check(File.Exists(Path.Combine(version, "sunshine.exe")), "validated archive extracted into new owned root");
+            stream.Position = 0;
+            Reject(() => PortableSunshineArchive.ExtractIntoNewRoot(stream, version, package, null),
+                "existing extraction root preserved");
+        }
+    }
+
+    private static void ExtractionRecovery(string root)
+    {
+        string installed = Path.Combine(root, "recovery", "ChildStream");
+        string version = Path.Combine(installed, "versions", "vtest");
+        using (var stream = Archive("Sunshine/sunshine.exe", "Sunshine/assets/icon.png"))
+        {
+            string archiveHash, executableHash;
+            using (var sha = SHA256.Create())
+                archiveHash = BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
+            stream.Position = 0;
+            using (var zip = new ZipArchive(stream, ZipArchiveMode.Read, true))
+            using (var input = zip.GetEntry("Sunshine/sunshine.exe").Open())
+            using (var sha = SHA256.Create())
+                executableHash = BitConverter.ToString(sha.ComputeHash(input)).Replace("-", "").ToLowerInvariant();
+            stream.Position = 0;
+            var package = new PortableSunshinePackage { Version = "vtest",
+                SourceUrl = "https://github.com/LizardByte/Sunshine/releases/download/vtest/sunshine.zip",
+                Sha256 = archiveHash, ExecutableSha256 = executableHash, PortableRoot = version,
+                ConfigRoot = Path.Combine(installed, "config") };
+            var plan = PortableExtractionTransaction.Plan(stream, package, installed);
+            Reject(() => PortableExtractionTransaction.Apply(stream, package, installed, "wrong", null),
+                "unapproved extraction cannot mutate");
+            Check(!Directory.Exists(version), "unapproved extraction root absent");
+            PortableExtractionTransaction.Apply(stream, package, installed, plan.Hash, null);
+            Check(File.Exists(Path.Combine(version, "sunshine.exe")), "journaled portable executable installed");
+            PortableExtractionTransaction.Apply(stream, package, installed, plan.Hash, null);
+            File.WriteAllText(Path.Combine(version, "assets", "icon.png"), "drift");
+            Reject(() => PortableExtractionTransaction.Recover(version), "changed portable file is preserved");
+            Check(File.Exists(Path.Combine(version, "sunshine.exe")), "conflict precedes deletion");
+            File.Delete(Path.Combine(version, "assets", "icon.png"));
+            PortableExtractionTransaction.Recover(version);
+            Check(!Directory.Exists(version), "partial extraction fully recovered");
+            PortableExtractionTransaction.Recover(version);
+            PortableExtractionTransaction.Apply(stream, package, installed, plan.Hash, null);
+            Check(File.Exists(Path.Combine(version, "sunshine.exe")), "reinstall after verified rollback");
+            PortableExtractionTransaction.Recover(version);
+            Check(!Directory.Exists(version), "reinstalled version rolled back again");
+        }
+    }
+
+    private static void Conflicts()
+    {
+        var state = new SunshineCollisionSnapshot { ServiceObservationComplete = true,
+            ProcessObservationComplete = true, PortObservationComplete = true };
+        Check(SunshineStartupGate.Check(state) == null, "complete empty collision snapshot passes");
+        state.ExistingSunshineService = true;
+        Check(SunshineStartupGate.Check(state) != null, "native service preserved");
+        state.ExistingSunshineService = false; state.UdpListeners.Add(48000);
+        Check(SunshineStartupGate.Check(state) != null, "stream port collision");
+        state.UdpListeners.Clear(); state.ExistingSunshineProcess = true;
+        Check(SunshineStartupGate.Check(state) != null, "existing Sunshine process preserved");
+        state.ExistingSunshineProcess = false; state.PortObservationComplete = false;
+        Check(SunshineStartupGate.Check(state) != null, "incomplete listener inventory fails closed");
+        var endpoints = new [] { new SunshineListener { Pid = 77, Protocol = "TCP",
+            Port = 47990, LocalAddress = "127.0.0.1" } };
+        Check(SunshineRuntimeGate.Check(true, 77, endpoints) == null, "owned loopback listener accepted");
+        endpoints[0].LocalAddress = "0.0.0.0";
+        Check(SunshineRuntimeGate.Check(true, 77, endpoints) != null, "unexpected LAN listener blocked");
+        endpoints[0].LocalAddress = "127.0.0.1"; endpoints[0].Pid = 88;
+        Check(SunshineRuntimeGate.Check(true, 77, endpoints) != null, "unexpected listener owner blocked");
+        endpoints[0].Pid = 77; endpoints[0].Port = 50000;
+        Check(SunshineRuntimeGate.Check(true, 77, endpoints) != null, "unexpected Sunshine port blocked");
+        Check(SunshineRuntimeGate.Check(false, 77, endpoints) != null, "incomplete runtime listener snapshot blocked");
+        Check(SteamChildPolicy.Check(true, true, false, false) != null, "parent Steam conflict");
+        Check(SteamChildPolicy.Check(false, false, false, false) != null, "Steam unknown fails closed");
+        Check(SteamChildPolicy.Check(true, false, false, false) == null, "known empty Steam state");
+    }
+
+    private static void OwnedFileTransaction(string root)
+    {
+        root = Path.Combine(root, "owned-files", "ChildStream");
+        Directory.CreateDirectory(root);
+        string file = Path.Combine(root, "installed", "candidate.txt");
+        string journal = Path.Combine(root, "candidate.journal");
+        const string owner = "childstream-product-test";
+        var host = new WindowsOwnedInstallerHost(root, journal);
+        var engine = new InstallerEngine(host, new FileJournalStore(journal), new InstallerPolicy(root),
+            new FileTransactionOwnership(Path.Combine(root, "candidate.lock")));
+        var operation = new InstallOperation { Target = new ResourceTarget(ResourceKind.OwnedFile, file),
+            Desired = new ResourceState { Access = ResourceAccess.Accessible, ValueType = "FileBytes",
+                Data = Encoding.UTF8.GetBytes("candidate"), Owner = owner },
+            Privilege = InstallPrivilege.CurrentUser, OwnershipEvidence = owner,
+            Verification = "Exact owned bytes", Reversal = "Remove only exact owned file" };
+        var plan = engine.Plan(new [] { operation });
+        Check(engine.Apply(plan, plan.Hash).Phase == JournalPhase.Complete, "real owned file created transactionally");
+        Check(File.ReadAllText(file) == "candidate", "installed bytes on disk");
+        Check(engine.Apply(plan, plan.Hash).Phase == JournalPhase.Complete, "real owned file idempotent");
+        File.WriteAllText(file, "outside-change");
+        Reject(() => engine.RecoverOrUninstall(), "external file drift blocks deletion");
+        Check(File.ReadAllText(file) == "outside-change", "drifted file preserved");
+        File.WriteAllText(file, "candidate");
+        Check(engine.RecoverOrUninstall().Phase == JournalPhase.RolledBack, "exact owned file rolled back");
+        Check(!File.Exists(file), "rollback removed only the owned file");
+        Check(engine.RecoverOrUninstall().Phase == JournalPhase.RolledBack, "rollback idempotent");
+        string unrelated = Path.Combine(root, "installed", "unrelated.txt");
+        File.WriteAllText(unrelated, "preserve");
+        Check(File.ReadAllText(unrelated) == "preserve", "unrelated sibling preserved");
+    }
+
+    private static void Acceptance()
+    {
+        var child = new ChildSessionIdentity(2, 123);
+        var missing = ProductAcceptance.Evaluate(child, null);
+        Check(!ProductAcceptance.Complete(missing), "unmeasured hardware cannot pass acceptance");
+        var evidence = new PhysicalProductEvidence {
+            IndependentParentAndChildInput = true, ChildDisplayActive = true,
+            ParentDisplayUnchanged = true, ParentDisplayId = "parent", ChildDisplayId = "child",
+            SunshineCaptureDisplayId = "parent", SunshineSessionId = 2, EncoderObserved = "software",
+            MoonlightWidth = 1920, MoonlightHeight = 1080, MoonlightFps = 60,
+            SustainedStreamStable = true, ParentForegroundGamepadWorks = false,
+            ParentUnaffectedByGamepad = true, TwoControllersDistinct = true,
+            ChildAudioOnTv = true, ParentAudioOnPc = true, AudioIsolated = true,
+            SteamBigPictureInChild = true, MinecraftDungeonsPlayedInChild = true,
+            ExactChildTeardown = true, OriginalSettingsRestored = true };
+        var rows = ProductAcceptance.Evaluate(child, evidence);
+        Check(!ProductAcceptance.Complete(rows), "parent capture, software encoder and focus failure reject");
+        evidence.SunshineCaptureDisplayId = "child"; evidence.EncoderObserved = "nvenc";
+        evidence.ParentForegroundGamepadWorks = true;
+        Check(ProductAcceptance.Complete(ProductAcceptance.Evaluate(child, evidence)),
+            "fully populated physical-evidence model satisfies deterministic gates only");
+    }
+
+    private static void Steam(string root)
+    {
+        string steamPath = Path.Combine(root, "steam.exe");
+        string gamePath = Path.Combine(root, "game.exe");
+        var fake = new FakeProcesses { CurrentSessionId = 2,
+            Current = new ProductProcessIdentity { Pid = 21, SessionId = 2,
+                StartTimeUtcTicks = 10, ExecutablePath = steamPath, ExecutableSha256 = SteamDigest } };
+        var runtime = new SteamChildRuntime(fake, new ChildSessionIdentity(2, 123),
+            steamPath, SteamDigest, gamePath, GameDigest);
+        Reject(() => runtime.StartBigPicture(true, true, false, false), "parent Steam preserved");
+        runtime.StartBigPicture(true, false, false, false);
+        Check(runtime.Stage == SteamChildStage.BigPictureStarted && fake.LastArguments == "-bigpicture",
+            "Steam Big Picture starts only in observed child");
+        Reject(() => runtime.RequestMinecraftDungeons(false, false, false), "unknown Steam ownership blocks game request");
+        runtime.RequestMinecraftDungeons(true, false, false);
+        Check(runtime.Stage == SteamChildStage.GameRequested &&
+            fake.LastArguments == "-applaunch 1672970", "game launch request uses exact app ID");
+        Reject(() => runtime.StopGame(100), "request is not game process evidence");
+        fake.Current = new ProductProcessIdentity { Pid = 31, SessionId = 1,
+            StartTimeUtcTicks = 11, ExecutablePath = gamePath, ExecutableSha256 = GameDigest };
+        Reject(() => runtime.ObserveGame(fake.Current), "parent game cannot be attached");
+        Check(runtime.Stage == SteamChildStage.Conflict, "wrong-session game ends in conflict");
+        fake.Current = new ProductProcessIdentity { Pid = 22, SessionId = 2,
+            StartTimeUtcTicks = 12, ExecutablePath = steamPath, ExecutableSha256 = SteamDigest };
+        runtime = new SteamChildRuntime(fake, new ChildSessionIdentity(2, 123),
+            steamPath, SteamDigest, gamePath, GameDigest);
+        runtime.StartBigPicture(true, false, false, false);
+        runtime.RequestMinecraftDungeons(true, false, false);
+        fake.Current = new ProductProcessIdentity { Pid = 32, SessionId = 2,
+            StartTimeUtcTicks = 13, ExecutablePath = gamePath, ExecutableSha256 = GameDigest };
+        runtime.ObserveGame(fake.Current);
+        Check(runtime.Stage == SteamChildStage.GameObserved, "exact child game observed");
+        Reject(() => runtime.StopSteam(100), "Steam cannot stop before running game");
+        runtime.StopGame(100);
+        Check(fake.CloseCalled && fake.KillCalled && runtime.Stage == SteamChildStage.GameEnded,
+            "only observed child game stopped");
+        fake.Current = new ProductProcessIdentity { Pid = 22, SessionId = 2,
+            StartTimeUtcTicks = 12, ExecutablePath = steamPath, ExecutableSha256 = SteamDigest };
+        runtime.StopSteam(100);
+        Check(runtime.Stage == SteamChildStage.Ended, "verified child Steam stopped after game");
+    }
+
+    internal static int Main(string[] args)
+    {
+        string root = Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
+            "product-fixtures-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Configuration(root); Processes(root); Archives(); Extraction(root); ExtractionRecovery(root);
+            Conflicts(); OwnedFileTransaction(root); Acceptance(); Steam(root);
+            if (args.Length == 1) PinnedArchive(args[0]);
+            Console.WriteLine("Product integration offline assertions passed: " + assertions);
+            return 0;
+        }
+        catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
+    }
+}

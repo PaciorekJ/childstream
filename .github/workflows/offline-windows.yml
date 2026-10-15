@@ -2,7 +2,7 @@ name: Windows offline checks
 
 on:
   pull_request:
-    branches: [master, codex/hardened-foundation]
+    branches: [master, codex/hardened-foundation, codex/transactional-installer]
 
 permissions:
   contents: read
@@ -15,6 +15,16 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Compile launcher and run pure offline launcher and installer tests
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Compile and run offline launcher, installer, and feasibility tests
         shell: pwsh
         run: .\tests\offline.ps1
+      - name: Build unsigned candidate package
+        shell: pwsh
+        run: .\scripts\build-candidate.ps1
+      - name: Retain candidate package for review
+        uses: actions/upload-artifact@v4
+        with:
+          name: childstream-unsigned-candidate
+          path: tests/.artifacts/candidate/ChildStream-candidate-*.zip
+          if-no-files-found: error
