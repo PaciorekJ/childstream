@@ -2,7 +2,7 @@
 
 ChildStream is a Windows child-session and portable Sunshine proof of concept for streaming a second interactive desktop to Moonlight. It is **not ready for live installation**. The original setup changed global RDP and firewall state, downloaded an unpinned executable, and had no rollback journal. This branch disables that installer path until its architecture and recovery behavior can be validated.
 
-**Execution target:** The shared development workstation is blocked for Stage A/B under the permanent [scope boundary](docs/scope-boundary.md). ChildStream must not inspect or interrupt unrelated work, Docker Desktop, WSL2, Tailscale or shared networking to make a feasibility plan pass. The next live test belongs on a [separate Windows environment](docs/stage-ab-physical-window.md); no host mutation is authorized by this repository.
+**Execution target:** The shared development workstation is blocked for Stage A/B under the permanent [scope boundary](docs/scope-boundary.md). ChildStream must not inspect or interrupt unrelated work, Docker Desktop, WSL2, Tailscale or shared networking to make a feasibility plan pass. No independent Windows target is currently available; its [minimum requirements and no-purchase options](docs/independent-test-environment.md) are documented. The next live test belongs on a [separate Windows environment](docs/stage-ab-physical-window.md); no host mutation is authorized by this repository.
 
 Read the [architecture and security audit](docs/audit.md) and [live acceptance plan](docs/live-acceptance.md) before testing on a Windows host. The intended outcome is independent physical and remote interaction with separate capture, input, and audio; none of those hardware claims has been established by this branch.
 

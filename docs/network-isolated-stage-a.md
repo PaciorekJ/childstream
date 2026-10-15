@@ -1,6 +1,6 @@
 # Network-isolated Stage A: dedicated-target console runbook
 
-**Preparation only for a separate Windows target.** The protected workstation is blocked by the permanent [scope boundary](scope-boundary.md); do not disconnect it, pause shared services, or sign it out for ChildStream. This document does not authorize a test-target change. Obtain separate approval of the exact source SHA, isolation method, plan hash, Stage A feature write and operator recovery arrangement. This version 4 strict-isolation plan remains Stage A only; its Stage B continuation needs a focused source increment. The separate version 5 external/guest boundary has an [isolated Stage B path](isolated-stage-b.md) only when all v5 sources and predicates pass on an independent target. Keep this document and the repository on the target before disconnecting it; do not depend on internet access during the experiment.
+**Preparation only for a separate Windows target.** The protected workstation is blocked by the permanent [scope boundary](scope-boundary.md); do not disconnect it, pause shared services, or sign it out for ChildStream. This document does not authorize a test-target change. Obtain separate approval of the exact source SHA, isolation method, plan hash, Stage A feature write and operator recovery arrangement. New strict plans use v6 and have a [separately approved Stage B path](strict-isolated-stage-b.md); published v4 journals remain Stage A only. The separate v5 external/guest boundary has its own [Stage B path](isolated-stage-b.md) only when all v5 sources and predicates pass on an independent target. Keep this document and the repository on the target before disconnecting it; do not depend on internet access during the experiment.
 
 **Current status:** The strict gate below remains unchanged. The predicate-level read-only diagnostic and the proposed external/internal boundary are in [stage-a-network-boundary-design.md](stage-a-network-boundary-design.md). Retained internal adapters cannot be accepted until their switch/underlay paths and active peers are independently verified. Do not try to use this runbook to bypass the strict gate.
 
@@ -10,7 +10,7 @@
 
 This is an observed Windows network-stack boundary at each check, not continuous monitoring or proof about every external device. An unrepresented path or an interface that reconnects between checks remains a risk. Keep physical cables removed and radios off for the entire experiment, and have a second local observer verify them. If the target cannot satisfy the strict gate, **stop** and design a separately reviewed external isolation mechanism; do not weaken the 20 potentially permissive firewall-rule findings or change those rules.
 
-The 2026-10-14 **connected**, read-only console inventory successfully read all four network sources: 21 adapters, 16 IP interfaces, 22 addresses and 63 routes. Nine adapters were active, eight non-loopback IP interfaces were connected, and non-loopback addresses and routes were present. The gate correctly rejected this connected state. No physical disconnection, isolated plan or plan hash has been tested on the host.
+The earlier **connected**, read-only console inventory showed that the shared workstation failed the strict gate. Its details are historical private evidence and no new shared-host plan is authorized. No independent-target isolated plan or plan hash has been tested.
 
 ## Before physical isolation
 
@@ -31,7 +31,7 @@ Only after both operators confirm the actual physical isolation, run from the re
 .\tests\.artifacts\ChildStreamFeasibilityProbe.exe plan-isolated I-CONFIRM-PHYSICAL-ISOLATION
 ```
 
-Keep the printed hash privately. The v4 plan binds the `NetworkIsolated` posture, operator confirmation, network fingerprint, RDP-denied policy, stopped `TermService`, absent inspected RDP endpoints, firewall/profile inventory, console/session identity and other original-state fingerprints. The connected-network `plan` still rejects the 20 potentially permissive and six unknown firewall rules.
+Keep the printed hash privately. The v6 plan binds the `NetworkIsolated` posture, operator confirmation, network fingerprint, RDP-denied policy, stopped `TermService`, absent inspected RDP endpoints, firewall/profile inventory, console/session identity and other original-state fingerprints. The connected-network `plan` still rejects the 20 potentially permissive and six unknown firewall rules.
 
 ## Stage A, only after exact-hash approval
 
@@ -58,7 +58,7 @@ If and only if the stage reached `AwaitFreshParent`, the operator saves remainin
 .\tests\.artifacts\ChildStreamFeasibilityProbe.exe status
 ```
 
-Only a successful no-child API response plus independent session enumeration validates Stage A. Error 1168 remains `StageAQueryUnknown` and requires restoration; it never authorizes Stage B. No command in this runbook creates or signs out a child session.
+Only a successful no-child API response plus independent session enumeration validates Stage A. Error 1168 remains `StageAQueryUnknown` and requires restoration; it never authorizes Stage B. After `StageAValidated`, the operator may either restore below or seek **separate** approval for the [v6 strict-isolation Stage B test](strict-isolated-stage-b.md) under the same journal. No command in this Stage A runbook creates or signs out a child session.
 
 ## Restore before considering reconnection
 

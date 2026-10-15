@@ -1,6 +1,6 @@
 # One isolated local Stage B interaction test
 
-**Prepared in source; no live Stage B test is authorized or reported as passed.** The protected workstation is [outside this execution path](scope-boundary.md); do not pause Docker/WSL/Tailscale, disconnect its network or sign it out for ChildStream. On a separate dedicated target whose complete version 5 `ExternalNetworkIsolated` gate actually passes, this path continues the *same* journal after a positive `StageAValidated` result. Keep that target isolated and the second local observer present. Do not restore its child feature or reconnect it between Stage A and this separately approved test. The version 4 strict-isolation plan remains Stage A only. The connected-network RDP gate is unchanged.
+**Prepared in source; no live Stage B test is authorized or reported as passed.** The protected workstation is [outside this execution path](scope-boundary.md); do not pause Docker/WSL/Tailscale, disconnect its network or sign it out for ChildStream. This page covers a separate dedicated target whose complete version 5 `ExternalNetworkIsolated` gate actually passes. The [v6 strict-isolation procedure](strict-isolated-stage-b.md) is the smaller no-NIC target path. Published v4 strict journals remain Stage A only. Keep the target isolated and the second local observer present. Do not restore its child feature or reconnect it between Stage A and this separately approved test. The connected-network RDP gate is unchanged.
 
 ## Separate approval and preflight
 

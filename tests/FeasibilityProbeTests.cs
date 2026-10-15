@@ -161,6 +161,12 @@ internal static class FeasibilityProbeTests
             ProbeJournal stageA = Probe.ResumeAfterFreshLogon(true);
             return Probe.ApproveStageB(stageA.Plan.Hash, true, true);
         }
+        internal ProbeJournal ReadyStrict()
+        {
+            BeginIsolated(); Probe.PrepareFeature(true); Host.State.ParentLogonTime = 101;
+            ProbeJournal stageA = Probe.ResumeAfterFreshLogon(true);
+            return Probe.ApproveStageB(stageA.Plan.Hash, true, true);
+        }
         public void Dispose() { Directory.Delete(Root, true); }
     }
     private static void Check(bool value, string name)
@@ -778,8 +784,8 @@ internal static class FeasibilityProbeTests
             Throws<InvalidOperationException>(() => f.Probe.Plan(ProbeNetworkPosture.NetworkIsolated, false),
                 "operator isolation confirmation is mandatory");
             ProbePlan plan = f.Probe.Plan(ProbeNetworkPosture.NetworkIsolated, true);
-            Check(plan.Original.FormatVersion == 4 && plan.Original.NetworkPosture == ProbeNetworkPosture.NetworkIsolated,
-                "isolated posture and confirmation are bound into v4 plan");
+            Check(plan.Original.FormatVersion == 6 && plan.Original.NetworkPosture == ProbeNetworkPosture.NetworkIsolated,
+                "isolated posture and confirmation are bound into v6 plan");
             f.Host.State.NetworkFingerprint = "network-2";
             Throws<InvalidOperationException>(() => f.Probe.Begin(plan, plan.Hash, true),
                 "network-state drift invalidates exact approved plan");
@@ -828,7 +834,7 @@ internal static class FeasibilityProbeTests
             Check(f.Probe.AssessReconnect(true).Ready,
                 "reconnect check requires restored feature, isolation, and original infrastructure");
             Throws<InvalidOperationException>(() => f.Probe.ApproveStageB(f.Store.Load().Plan.Hash, true),
-                "isolated Stage A journal can never authorize Stage B");
+                "restored isolated journal cannot authorize Stage B");
         }
         using (var f = new Fixture())
         {
@@ -1088,7 +1094,14 @@ internal static class FeasibilityProbeTests
     {
         using (var f = new Fixture())
         {
-            f.BeginIsolated(); f.Probe.PrepareFeature(true); f.Host.State.ParentLogonTime = 101;
+            f.SetIsolated();
+            ProbePlan legacy = f.Probe.Plan(ProbeNetworkPosture.NetworkIsolated, true);
+            legacy.Original.FormatVersion = 4;
+            legacy.Hash = ProbeCodec.Hash(ProbeCodec.PlanBytes(legacy.Original));
+            Check(ProbeCodec.ReadPlan(ProbeCodec.PlanBytes(legacy.Original)).FormatVersion == 4,
+                "published strict v4 plan remains readable");
+            f.Probe.Begin(legacy, legacy.Hash, true);
+            f.Probe.PrepareFeature(true); f.Host.State.ParentLogonTime = 101;
             ProbeJournal stageA = f.Probe.ResumeAfterFreshLogon(true);
             Throws<InvalidOperationException>(() => f.Probe.ApproveStageB(stageA.Plan.Hash, true, true),
                 "strict v4 isolated plan remains Stage A only");
@@ -1264,6 +1277,102 @@ internal static class FeasibilityProbeTests
             Check(f.Host.Logoffs == 0, "unrelated child is never logged off");
         }
     }
+    private static void StrictIsolationStageB()
+    {
+        using (var f = new Fixture())
+        {
+            ProbeJournal ready = f.ReadyStrict();
+            Check(ready.Plan.Original.FormatVersion == 6 && ready.Stage == ProbeStage.ReadyConnect &&
+                f.Host.FeatureWrites == 1, "v6 exact plan proceeds from Stage A to separately approved Stage B");
+            Throws<InvalidOperationException>(() => f.Probe.ConnectOnce(),
+                "strict Stage B requires renewed physical isolation confirmation");
+            f.Host.OnViewerInterval = () => Check(f.Store.Load().PositiveChild.HasValue &&
+                f.Store.Load().Stage == ProbeStage.Connecting,
+                "v6 exact child identity is durable during viewer lifetime");
+            Check(f.Probe.ConnectOnce(true).Stage == ProbeStage.Connected && f.Host.Connections == 1,
+                "v6 strict isolation permits only one identified loopback child");
+            Check(f.Probe.ConfirmConsoleUsable(true, true).ConsoleConfirmed,
+                "v6 independent interaction checkpoint remains explicit");
+            Check(f.Probe.EndPositiveChild(true, true).Stage == ProbeStage.ChildEnded && f.Host.Logoffs == 1,
+                "v6 normal teardown targets only the journaled child");
+            Check(f.Probe.RestoreOriginal(false, false, true).Stage == ProbeStage.Restored &&
+                f.Probe.AssessReconnect(true).Ready && f.Host.FeatureWrites == 2,
+                "v6 restores feature and verifies original infrastructure before reconnect");
+        }
+        using (var f = new Fixture())
+        {
+            ProbeJournal ready = f.ReadyStrict();
+            byte[] complete = ProbeCodec.JournalBytes(ready);
+            byte[] missingTail = new byte[complete.Length - 1];
+            Array.Copy(complete, missingTail, missingTail.Length);
+            Throws<InvalidDataException>(() => ProbeCodec.ReadJournal(missingTail,
+                new ProbeJournal { Plan = ready.Plan }), "v6 journal requires reviewed teardown field");
+        }
+        using (var f = new Fixture())
+        {
+            f.ReadyStrict();
+            f.Host.OnConnectionAttempt = () => f.Host.State.NetworkIsolationAccepted = false;
+            Throws<InvalidOperationException>(() => f.Probe.ConnectOnce(true),
+                "strict isolation loss before ActiveX prevents child creation");
+            Check(f.Host.Connections == 0 && f.Store.Load().NetworkDeviationObserved,
+                "strict preconnection deviation is durable");
+            f.Host.State.NetworkIsolationAccepted = true;
+            Check(f.Probe.RestoreOriginal(false, true, true).Stage == ProbeStage.Restored,
+                "reviewed v6 recovery restores after preconnection deviation");
+        }
+        using (var f = new Fixture())
+        {
+            f.ReadyStrict();
+            f.Host.OnViewerInterval = () => f.Host.State.NetworkIsolationAccepted = false;
+            Throws<InvalidOperationException>(() => f.Probe.ConnectOnce(true),
+                "strict isolation loss during viewer aborts acceptance");
+            Check(f.Store.Load().PositiveChild.HasValue && f.Store.Load().NetworkDeviationObserved,
+                "v6 preserves exact child and deviation after viewer abort");
+            Throws<InvalidOperationException>(() => f.Probe.EndPositiveChildReviewed(true, true),
+                "v6 reviewed teardown cannot act until isolation returns");
+            Check(f.Host.Logoffs == 0, "no child logoff while strict isolation is lost");
+            f.Host.State.NetworkIsolationAccepted = true;
+            f.Host.State.NetworkFingerprint = "network-drifted-but-isolated";
+            Throws<InvalidOperationException>(() => f.Probe.EndPositiveChildReviewed(true, true),
+                "v6 reviewed teardown requires the exact approved network fingerprint");
+            Check(f.Host.Logoffs == 0, "changed strict network fingerprint cannot cause logoff");
+            f.Host.State.NetworkFingerprint = "network-1";
+            Check(f.Probe.EndPositiveChildReviewed(true, true).Stage == ProbeStage.ChildEnded &&
+                f.Store.Load().ReviewedChildTeardown, "v6 separately reviewed teardown ends exact child");
+            Check(f.Probe.RestoreOriginal(false, true, true).Stage == ProbeStage.Restored &&
+                f.Probe.AssessReconnect(true).Ready, "v6 deviation recovery verifies restoration");
+        }
+        using (var f = new Fixture())
+        {
+            f.ReadyStrict();
+            f.Host.FailConnectAfterIdentity = true;
+            Throws<IOException>(() => f.Probe.ConnectOnce(true),
+                "v6 interrupted viewer keeps exact identity");
+            Check(f.Probe.EndPositiveChildReviewed(true, true).Stage == ProbeStage.ChildEnded,
+                "v6 reviewed teardown recovers interrupted viewer without retry");
+            Check(f.Probe.RestoreOriginal(false, false, true).Stage == ProbeStage.Restored,
+                "v6 interrupted viewer recovers original feature");
+        }
+        using (var f = new Fixture())
+        {
+            f.ReadyStrict();
+            f.Host.OnViewerInterval = () => {
+                f.Host.State.TermServiceStopped = false;
+                f.Host.State.RdpListenersAbsent = false;
+                f.Host.State.ListenerFingerprint = "unexpected-rdp-listener";
+            };
+            Throws<InvalidOperationException>(() => f.Probe.ConnectOnce(true),
+                "v6 listener drift during viewer aborts Stage B");
+            Check(f.Store.Load().PositiveChild.HasValue && f.Store.Load().Stage == ProbeStage.OutcomeUnknown,
+                "v6 retains exact child after listener drift");
+            Check(f.Probe.EndPositiveChildReviewed(true, true).Stage == ProbeStage.ChildEnded,
+                "v6 reviewed offline teardown may end only exact child after listener drift");
+            Throws<InvalidOperationException>(() => f.Probe.RestoreOriginal(false, false, true),
+                "v6 feature restoration does not clear unexpected RDP exposure");
+            Check(f.Store.Load().Stage == ProbeStage.Conflict && !f.Probe.AssessReconnect(true).Ready,
+                "v6 unexpected listener forbids reconnection");
+        }
+    }
     private static object Accessible(params object[] items)
     { return new { State = "Accessible", Items = items }; }
 
@@ -1389,6 +1498,7 @@ internal static class FeasibilityProbeTests
             PlanningAndApproval(); FeatureFailureAndRecovery(); FreshLogonAndConnection(); TeardownAndRollback();
             JournalAndOwnership(); ObservedHostBoundary(); WindowsAdapterSynthetic(); FirewallGateSynthetic();
             NetworkGateSynthetic(); IsolatedLifecycle(); ExternalBoundaryLifecycle(); ExternalBoundaryStageB();
+            StrictIsolationStageB();
             BoundaryCaptureParser(); PrivateStateSynthetic();
             Console.WriteLine("Feasibility probe: " + assertions + " offline assertions passed."); return 0;
         }
