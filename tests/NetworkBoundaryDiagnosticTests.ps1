@@ -83,6 +83,19 @@ Check ((Predicate $report 'internal-guests-quiescent') -eq 'Fail' -and
     (Predicate $report 'docker-host-forwarding-absent') -eq 'Fail') 'Active WSL2/Docker guests and forwarding block the internal exposure claim.'
 Check ('internal-guests-quiescent' -in $report.BlockingFindings.CurrentState -and
     'physical-severance-confirmed' -notin $report.BlockingFindings.EvidenceGaps) 'Current workload blockers and preapproval checks are reported separately.'
+Check ((Predicate $report 'virtual-paths-attributed') -eq 'Pass' -and
+    $report.Conditions.GuestPath -eq 'Fail' -and -not $report.StageAPlanAuthorized) `
+    'An external-only rehearsal can assess the virtual-path predicate while active guests still prohibit a plan.'
+$activeTunnel = Clone $activeGuests
+$activeTunnel.Adapters.Items += @{ InterfaceIndex = 41; Status = 'Up'; MediaConnectionState = 'Connected';
+    HardwareInterface = $false; Virtual = $true; Label = 'Tailscale' }
+$activeTunnel.IpAddresses.Items += @{ InterfaceIndex = 41; Address = '100.64.0.25' }
+$activeTunnel.Routes.Items += @{ InterfaceIndex = 41; DestinationPrefix = '100.64.0.0/24' }
+$report = Get-ChildStreamNetworkBoundaryDiagnostic -Observation $activeTunnel
+Check ((Predicate $report 'physical-uplinks-down') -eq 'Pass' -and
+    (Predicate $report 'virtual-paths-attributed') -eq 'Unknown' -and
+    $report.Conditions.External -eq 'Unknown' -and $report.Conditions.GuestPath -eq 'Fail') `
+    'An addressed unmatched tunnel remains visible as an independent blocker while Docker and WSL run.'
 
 $stopped = Clone $baseline
 Check ((Get-ChildStreamDockerErrorClass 'open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified') -eq 'DaemonUnavailable' -and
