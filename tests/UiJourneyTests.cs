@@ -219,7 +219,7 @@ internal static class UiJourneyTests
             guide.RefreshState(); Save(guide, folder, "guide-audio-route-pending-simulated");
             guideStatus = "WrongEndpoint: game renders to {child-audio}; Sunshine captures {child-audio-2}. Change only the game's output in child Volume Mixer.";
             guide.RefreshState(); Save(guide, folder, "guide-audio-route-wrong-simulated");
-            guideStatus = "Exact game render session observed on {child-audio-2}; Sunshine capture ready. Endpoint privacy and Moonlight playback still need physical checks.";
+            guideStatus = "Exact game render session observed on {child-audio-2} (NondefaultEndpoint); Sunshine capture ready. Endpoint privacy and Moonlight playback still need physical checks.";
             guide.RefreshState(); Save(guide, folder, "guide-audio-ready-simulated");
             guideStatus = "Moonlight reconnected to the same owned ChildStream certificate and audio endpoint.";
             guide.RefreshState(); Save(guide, folder, "guide-audio-reconnect-simulated");

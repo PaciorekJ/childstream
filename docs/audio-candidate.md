@@ -54,6 +54,8 @@ positive observation. The positive synthetic production-path fixture names
 endpoint, with Sunshine `audio_sink` set to that same endpoint. It exercises
 the presenter, controller, agent, owned game record, configuration file,
 observation and Sunshine-only recovery with unchanged game and pairing.
+The status separately labels `DefaultEndpoint` and `NondefaultEndpoint`;
+observing game render on the default is not evidence of child-only audio.
 
 This does **not** establish the Windows per-app preference programmatically,
 read its persisted value, prove it is scoped to the child session, or prove

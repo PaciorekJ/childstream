@@ -582,8 +582,9 @@ static class Program
             {
                 string route = Convert.ToString(observed.ContainsKey("gameAudio") ? observed["gameAudio"] : "ObservationIncomplete");
                 string sink = Convert.ToString(observed.ContainsKey("captureEndpoint") ? observed["captureEndpoint"] : "");
+                string kind = Convert.ToString(observed.ContainsKey("routeKind") ? observed["routeKind"] : "Unknown");
                 statusText.Text = route == "GameRenderObserved" ?
-                    "Exact game render session observed on " + sink + "; Sunshine capture ready. Endpoint privacy and Moonlight playback still require physical checks." :
+                    "Exact game render session observed on " + sink + " (" + kind + "); Sunshine capture ready. Endpoint privacy and Moonlight playback still require physical checks." :
                     "Game audio: " + route + ". Select the game's output in child Volume Mixer as " + sink + ", then wait for recheck.";
             }
         };

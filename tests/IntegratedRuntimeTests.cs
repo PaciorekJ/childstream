@@ -722,9 +722,15 @@ static class IntegratedRuntimeTests
             gameAudio.GameAudioActive = true;
             Check(Convert.ToString(presenter.Observe()["gameAudio"]) == "GameRenderObserved" &&
                 Convert.ToString(presenter.Observe()["routeConfiguration"]) == "AdoptedObservedOutput" &&
+                Convert.ToString(presenter.Observe()["routeKind"]) == "NondefaultEndpoint" &&
                 Convert.ToString(presenter.Observe()["captureEndpoint"]) == sink &&
                 Convert.ToBoolean(presenter.Observe()["captureReady"]),
                 "exact owned game render session on selected nondefault sink reaches capture-ready status");
+            gameAudio.AudioDefaultId = sink;
+            Check(Convert.ToString(presenter.Observe()["routeKind"]) == "DefaultEndpoint" &&
+                Convert.ToString(presenter.Observe()["gameAudio"]) == "GameRenderObserved",
+                "default endpoint association remains distinct from a nondefault explicit route");
+            gameAudio.AudioDefaultId = "{child-audio}";
             gameAudio.GameAudioWrong = true;
             Check(Convert.ToString(presenter.Observe()["gameAudio"]) == "WrongEndpoint",
                 "real output on the wrong endpoint never verifies the route");

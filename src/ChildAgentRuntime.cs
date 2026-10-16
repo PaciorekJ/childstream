@@ -296,6 +296,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
                 state == "SunshineReady" ? "ScopedRulesVerified" : "ChangedOrUnavailable" },
             { "steamStage", steam == null ? "NotStarted" : steam.Stage.ToString() },
             { "gameAudio", gameAudio }, { "captureEndpoint", selectedAudioId ?? "" },
+            { "routeKind", CaptureRouteKind() },
             { "routeConfiguration", gameAudio == "GameRenderObserved" ? "AdoptedObservedOutput" :
                 volumeMixerOpenedForGame ? "OwnerSelectionRequested" : "NotEstablished" },
             { "captureReady", state == "SunshineReady" && AudioReady() },
@@ -328,6 +329,19 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
             return verdict;
         }
         catch { return "ObservationIncomplete"; }
+    }
+    private string CaptureRouteKind()
+    {
+        if (String.IsNullOrEmpty(selectedAudioId)) return "NotConfigured";
+        try
+        {
+            ChildAudioEndpointInventory audio = environment.ReadAudio(child);
+            if (audio == null || !audio.Complete || audio.SessionId != (int)child.SessionId ||
+                !audio.ActiveRenderIds.Contains(selectedAudioId)) return "Unknown";
+            return String.Equals(audio.DefaultRenderId, selectedAudioId, StringComparison.Ordinal) ?
+                "DefaultEndpoint" : "NondefaultEndpoint";
+        }
+        catch { return "Unknown"; }
     }
     private void OpenGameAudioRoute()
     {
