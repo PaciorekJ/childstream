@@ -870,7 +870,11 @@ static class IntegratedRuntimeTests
                 lanAudio.Process.GameStops == 0 && lanAudio.Pairing.Bootstraps == 1 &&
                 Convert.ToString(presenter.Observe()["audioMode"]) == "SilentRouteWithdrawn",
                 "idle LAN route loss disconnects the already paired audio stream and keeps scoped posture");
-            app.Execute(ChildAgentOperation.StopSteam, ""); presenter.Stop(); app.Stop();
+            app.Execute(ChildAgentOperation.StopSteam, ""); presenter.Stop();
+            Check(Convert.ToString(presenter.Observe()["stage"]) == "NoSunshine" &&
+                Convert.ToString(presenter.Observe()["audioMode"]) == "Stopped",
+                "explicit owned stop clears an earlier automatic audio-withdrawal label");
+            app.Stop();
         }
         var routeDrift = new Environment(root + "-audio-promotion-drift") { MultipleDevices = true };
         using (var worker = new ChildAgentRuntime(child, 1, routeDrift, new ManualMonitor()))

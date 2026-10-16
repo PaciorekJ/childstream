@@ -302,8 +302,10 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
             { "steamStage", steam == null ? "NotStarted" : steam.Stage.ToString() },
             { "gameAudio", gameAudio }, { "captureEndpoint", selectedAudioId ?? "" },
             { "captureEndpointName", CaptureEndpointName() },
-            { "audioMode", streamAudioEnabled && state == "SunshineReady" ? "CaptureEnabled" :
-                audioWithdrawn ? "SilentRouteWithdrawn" : "SilentPreparation" },
+            { "audioMode", state == "SunshineReady" ?
+                streamAudioEnabled ? "CaptureEnabled" :
+                audioWithdrawn ? "SilentRouteWithdrawn" : "SilentPreparation" :
+                state == "SunshineAudioWithdrawn" ? "SilentRouteWithdrawn" : "Stopped" },
             { "routeKind", CaptureRouteKind() },
             { "routeConfiguration", gameAudio == "GameRenderObserved" ? "AdoptedObservedOutput" :
                 volumeMixerOpenedForGame ? "OwnerSelectionRequested" : "NotEstablished" },
@@ -621,6 +623,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
             monitoringLan = false; monitoringRuntime = false; monitor.Stop();
             sunshine = null; sunshineIdentity = null; pairing = null; owner = null; lanAddress = null;
             selectedAudioId = null; selectedDisplayId = null; streamAudioEnabled = false;
+            audioWithdrawn = false;
             identity.Dispose(); identity = null;
         }
         catch { uncertain = true; throw; }
