@@ -143,6 +143,8 @@ static class Program
     [STAThread]
     static int Main(string[] args)
     {
+        if (args.Length == 2 && args[0] == "-child-agent")
+            return WindowsChildAgentEntry.Run(args[1]);
         if (args.Length > 0 && args[0] == "-enable")
         {
             MessageBox.Show("Child-session enablement requires the future transactional installer. No change was made.", "ChildStream");

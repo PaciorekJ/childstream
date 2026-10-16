@@ -15,7 +15,7 @@ $outDir = Join-Path $root 'tests\.artifacts\candidate'
 New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 $zipPath = Join-Path $outDir ("ChildStream-candidate-$sha.zip")
 if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
-$tracked = @(git -C $root ls-files --cached --full-name | Where-Object { $_ -match '^(src|scripts|docs|tests|\.github)/|^README\.md$' })
+$tracked = @(git -C $root ls-files --cached --full-name | Where-Object { $_ -match '^(src|scripts|docs|tests|\.github)/|^README\.md$|^LICENSE$|^THIRD-PARTY-NOTICES\.md$' })
 if ($LASTEXITCODE -ne 0) { throw 'Tracked-file inventory failed.' }
 $entries = [ordered]@{}
 $sortedTracked = [string[]]@($tracked)
@@ -65,6 +65,8 @@ try {
 }
 finally { $file.Dispose() }
 $digest = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+& (Join-Path $PSScriptRoot 'verify-candidate.ps1') -Path $zipPath -ExpectedSha256 $digest -ExpectedSourceSha $sha | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Candidate verification failed.' }
 Write-Output "Candidate: $zipPath"
 Write-Output "Source SHA: $sha"
 Write-Output "Candidate SHA256: $digest"

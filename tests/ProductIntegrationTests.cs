@@ -33,6 +33,22 @@ internal static class ProductIntegrationTests
         public void Kill(int pid) { KillCalled = true; Exit = true; }
     }
 
+    private sealed class FakeBootstrap : IChildBootstrapHost
+    {
+        internal ChildSessionIdentity? Associated = new ChildSessionIdentity(2, 123);
+        internal long? Generation = 123;
+        internal ProductProcessIdentity Agent;
+        internal bool Requested, Exited, WrongHello;
+        public ChildSessionIdentity? ReadAssociatedChild() { return Associated; }
+        public long? ReadLogonTime(uint id) { return Generation; }
+        public void RequestAgentInSession(ChildAgentRequest request) { Requested = true; }
+        public ChildAgentHello WaitForAgent(ChildAgentRequest request, int timeoutMs)
+        { return new ChildAgentHello { Nonce = WrongHello ? "wrong" : request.Nonce,
+            Pid = Agent.Pid, Child = request.Child }; }
+        public ProductProcessIdentity ReadAgent(int pid) { return Agent; }
+        public void RequestAgentExit(int pid) { Exited = true; Agent = null; }
+    }
+
     private static MemoryStream Archive(params string[] paths)
     {
         var stream = new MemoryStream();
@@ -347,6 +363,43 @@ internal static class ProductIntegrationTests
         Check(runtime.Stage == SteamChildStage.Ended, "verified child Steam stopped after game");
     }
 
+    private static void ChildBootstrap(string root)
+    {
+        string path = Path.Combine(root, "ChildStream.exe");
+        var child = new ChildSessionIdentity(2, 123);
+        var request = new ChildAgentRequest { ParentSessionId = 1, Child = child,
+            PipeName = "ChildStream-" + new string('a', 32), Nonce = new string('d', 64) };
+        Check(ChildAgentRequest.Decode(request.Encode()).Child.Equals(child), "agent request round trip");
+        var fake = new FakeBootstrap { Agent = new ProductProcessIdentity { Pid = 42, SessionId = 2,
+            StartTimeUtcTicks = 12, ExecutablePath = path, ExecutableSha256 = SunshineDigest } };
+        var controller = new ChildAgentController(fake, 1, child, path, SunshineDigest);
+        controller.Start(request);
+        Check(fake.Requested && controller.Stage == ChildAgentStage.Ready && controller.Reconcile(),
+            "exact child agent handshake and process accepted");
+        controller.Stop();
+        Check(fake.Exited && controller.Stage == ChildAgentStage.Ended, "exact agent exit verified");
+        fake = new FakeBootstrap { Agent = new ProductProcessIdentity { Pid = 42, SessionId = 2,
+            StartTimeUtcTicks = 12, ExecutablePath = path, ExecutableSha256 = SunshineDigest } };
+        controller = new ChildAgentController(fake, 1, child, path, SunshineDigest);
+        controller.Start(request);
+        fake.Generation = 124;
+        Reject(() => controller.Stop(), "generation drift blocks agent shutdown");
+        Check(!fake.Exited && controller.Stage == ChildAgentStage.Uncertain,
+            "generation drift preserved agent for reviewed recovery");
+        fake = new FakeBootstrap { Generation = null, Agent = new ProductProcessIdentity { Pid = 42,
+            SessionId = 2, StartTimeUtcTicks = 12, ExecutablePath = path,
+            ExecutableSha256 = SunshineDigest } };
+        controller = new ChildAgentController(fake, 1, child, path, SunshineDigest);
+        Reject(() => controller.Start(request), "unknown child generation prevents launch request");
+        Check(!fake.Requested, "no scheduler action after unknown generation");
+        fake.Generation = 123; fake.WrongHello = true;
+        Reject(() => controller.Start(request), "wrong agent handshake rejected");
+        Check(controller.Stage == ChildAgentStage.Uncertain, "ambiguous task start remains uncertain");
+        Reject(() => controller.Start(request), "uncertain task start cannot be repeated");
+        request.PipeName = "unowned-pipe";
+        Reject(() => request.Encode(), "unowned pipe name rejected");
+    }
+
     internal static int Main(string[] args)
     {
         string root = Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
@@ -354,7 +407,7 @@ internal static class ProductIntegrationTests
         try
         {
             Configuration(root); Processes(root); Archives(); Extraction(root); ExtractionRecovery(root);
-            Conflicts(); OwnedFileTransaction(root); Acceptance(); Steam(root);
+            Conflicts(); OwnedFileTransaction(root); Acceptance(); Steam(root); ChildBootstrap(root);
             if (args.Length == 1) PinnedArchive(args[0]);
             Console.WriteLine("Product integration offline assertions passed: " + assertions);
             return 0;

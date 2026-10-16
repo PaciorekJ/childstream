@@ -5,6 +5,7 @@ ChildStream is a Windows child-session and portable Sunshine proof of concept fo
 **Execution target:** The shared development workstation is blocked for Stage A/B under the permanent [scope boundary](docs/scope-boundary.md). ChildStream must not inspect or interrupt unrelated work, Docker Desktop, WSL2, Tailscale or shared networking to make a feasibility plan pass. No independent Windows target is currently available; its [minimum requirements and no-purchase options](docs/independent-test-environment.md) are documented. The next live test belongs on a [separate Windows environment](docs/stage-ab-physical-window.md); no host mutation is authorized by this repository.
 
 Read the [architecture and security audit](docs/audit.md) and [live acceptance plan](docs/live-acceptance.md) before testing on a Windows host. The intended outcome is independent physical and remote interaction with separate capture, input, and audio; none of those hardware claims has been established by this branch.
+The [runtime map](docs/product-runtime-map.md) identifies which product classes are actually invoked and which still require connection and live Windows proof.
 
 ## Offline work
 
@@ -27,8 +28,8 @@ An explicit **End session** action checks the parent-associated child ID and its
 - `src/SessionSignOutGuard.cs`: durable, credential-free sign-out intent and explicit absence reconciliation.
 - `src/LegacyCredentialCleanup.cs`: explicit, path-scoped legacy credential cleanup.
 - `src/InstallerFoundation.cs` and `src/InstallerInventory.cs`: offline transaction engine, typed inventory, and portable package admission contracts.
-- `src/PortableSunshine.cs`, `src/PortableExtractionTransaction.cs`, `src/ProductIntegration.cs`, `src/WindowsAudioEndpoints.cs`, `src/ProductAcceptance.cs`, and `src/WindowsOwnedInstallerHost.cs`: pinned Sunshine package, exact-child configuration, process/collision and audio selection guards, archive and owned-file recovery candidates, and physical acceptance gates.
-- `scripts/build-candidate.ps1`: repeatable unsigned, uninstalled candidate package with source and file hashes; no Sunshine binary or hardware acceptance claim.
+- `src/PortableSunshine.cs`, `src/PortableExtractionTransaction.cs`, `src/ProductIntegration.cs`, `src/WindowsAudioEndpoints.cs`, `src/ChildRuntimeBootstrap.cs`, `src/ProductAcceptance.cs`, and `src/WindowsOwnedInstallerHost.cs`: pinned Sunshine package, exact-child configuration and agent protocol, process/collision and audio selection guards, archive and owned-file recovery candidates, and physical acceptance gates. Task registration and live agent startup remain disabled.
+- `scripts/build-candidate.ps1` and `scripts/verify-candidate.ps1`: repeatable unsigned, uninstalled candidate package with source and file hashes, license and notice; no Sunshine binary or hardware acceptance claim.
 - `src/FeasibilityProbe.cs`, `src/WindowsFeasibilityHost.cs`, and `src/FeasibilityProbeProgram.cs`: gated one-session experiment, narrow Windows adapter, and console commands; live execution requires separate approval.
 - `scripts/feasibility-inventory.ps1`: read-only, typed Windows 11 Pro feasibility inventory.
 - `scripts/diagnose.ps1`: read-only inventory; omits credentials and Sunshine config contents.
