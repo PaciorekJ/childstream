@@ -17,6 +17,24 @@ internal sealed class WildcardInterfaceEvidence
         InterfaceProtected, LocalRulesEffective;
 }
 
+internal static class WindowsFirewallProfile
+{
+    internal const int Domain = 1, Private = 2, Public = 4;
+    internal const int PublicCategory = 0, PrivateCategory = 1, DomainCategory = 2;
+    internal static int FromNetworkCategory(int category)
+    {
+        switch (category)
+        {
+            case PublicCategory: return Public;
+            case PrivateCategory: return Private;
+            case DomainCategory: return Domain;
+            default: return 0;
+        }
+    }
+    internal static bool IsSingle(int profile)
+    { return profile == Domain || profile == Private || profile == Public; }
+}
+
 // Host adapter for a future separately approved LAN transaction. It is never
 // called by the offline suite against workstation network/firewall state.
 internal sealed class WindowsLanFirewallHost : ILanFirewallHost
@@ -37,7 +55,8 @@ internal sealed class WindowsLanFirewallHost : ILanFirewallHost
     {
         return expectedIndex > 0 && expectedIndex == observedIndex &&
             String.Equals(expectedAlias, observedAlias, StringComparison.Ordinal) &&
-            networkCategory == 1 && (activeProfiles & 2) != 0;
+            networkCategory == WindowsFirewallProfile.PrivateCategory &&
+            (activeProfiles & WindowsFirewallProfile.Private) != 0;
     }
     internal static bool WildcardScopeAccepted(IList<WildcardInterfaceEvidence> interfaces)
     {
@@ -48,15 +67,34 @@ internal sealed class WindowsLanFirewallHost : ILanFirewallHost
             if (item == null || String.IsNullOrWhiteSpace(item.Identity) ||
                 String.IsNullOrWhiteSpace(item.Address) ||
                 !unique.Add(item.Identity + "|" + item.Address) || !item.ProfileKnown ||
-                (item.Profile != 1 && item.Profile != 2 && item.Profile != 4) ||
-                item.Selected && item.Profile != 2 || !item.FirewallEnabled ||
+                !WindowsFirewallProfile.IsSingle(item.Profile) ||
+                item.Selected && item.Profile != WindowsFirewallProfile.Private || !item.FirewallEnabled ||
                 !item.DefaultInboundBlocked || !item.InterfaceProtected ||
                 !item.LocalRulesEffective)
                 return false;
         return true;
     }
-    private static int ProfileBit(int category)
-    { return category == 0 ? 1 : category == 1 ? 2 : category == 2 ? 4 : 0; }
+    // This is the production conversion and policy-reading path used for each
+    // IPv4 address reachable through Sunshine's wildcard listener.
+    internal static WildcardInterfaceEvidence AssessInterface(string identity, string address,
+        string alias, bool selected, IList<Tuple<string, int>> profileRows,
+        int activeProfiles, dynamic policy, bool localRulesEffective)
+    {
+        bool one = profileRows != null && profileRows.Count == 1 &&
+            String.Equals(profileRows[0].Item1, alias, StringComparison.Ordinal);
+        int profile = one ? WindowsFirewallProfile.FromNetworkCategory(profileRows[0].Item2) : 0;
+        bool known = profile != 0 && (activeProfiles & profile) != 0;
+        return new WildcardInterfaceEvidence {
+            Identity = identity, Address = address, Selected = selected, Profile = profile,
+            ProfileKnown = known,
+            FirewallEnabled = known && Convert.ToBoolean(policy.FirewallEnabled[profile]),
+            DefaultInboundBlocked = known &&
+                Convert.ToInt32(policy.DefaultInboundAction[profile]) == 0 &&
+                !Convert.ToBoolean(policy.BlockAllInboundTraffic[profile]),
+            InterfaceProtected = known && FirewallAppliesTo(policy, alias, profile),
+            LocalRulesEffective = localRulesEffective
+        };
+    }
     internal static bool RuleIntersectsWildcard(int ruleProfiles, int reachableProfiles)
     { return ruleProfiles == 0 || (ruleProfiles & reachableProfiles) != 0; }
     private static string Fingerprint(IList<WildcardInterfaceEvidence> interfaces)
@@ -113,14 +151,19 @@ internal sealed class WindowsLanFirewallHost : ILanFirewallHost
             }
         return matches == 1 && privateProfile;
     }
-    private static bool FirewallAppliesTo(dynamic policy, string alias)
+    private static bool FirewallAppliesTo(dynamic policy, string alias, int profile)
     {
-        object excluded = policy.ExcludedInterfaces[2];
+        if (!WindowsFirewallProfile.IsSingle(profile) || String.IsNullOrWhiteSpace(alias)) return false;
+        object excluded = policy.ExcludedInterfaces[profile];
         if (excluded == null || excluded is string) return false; // Unknown provider shape fails closed.
         var list = excluded as IEnumerable;
         if (list == null) return false;
         foreach (object item in list)
-            if (String.Equals(Convert.ToString(item), alias, StringComparison.OrdinalIgnoreCase)) return false;
+        {
+            string excludedAlias = item as string;
+            if (String.IsNullOrWhiteSpace(excludedAlias)) return false;
+            if (String.Equals(excludedAlias, alias, StringComparison.OrdinalIgnoreCase)) return false;
+        }
         return true;
     }
     private static dynamic Policy()
@@ -168,7 +211,7 @@ internal sealed class WindowsLanFirewallHost : ILanFirewallHost
             RemoteSubnet = Convert.ToString(rule.RemoteAddresses), LocalPorts = Convert.ToString(rule.LocalPorts),
             Protocol = Convert.ToInt32(rule.Protocol), Enabled = Convert.ToBoolean(rule.Enabled),
             InboundAllow = Convert.ToInt32(rule.Direction) == 1 && Convert.ToInt32(rule.Action) == 1,
-            PrivateOnly = Convert.ToInt32(rule.Profiles) == 2,
+            PrivateOnly = Convert.ToInt32(rule.Profiles) == WindowsFirewallProfile.Private,
             NoEdgeTraversal = !Convert.ToBoolean(rule.EdgeTraversal) };
     }
     public LanFirewallObservation Read(string address, SunshinePortFamily family, string executable)
@@ -198,14 +241,16 @@ internal sealed class WindowsLanFirewallHost : ILanFirewallHost
         }
         dynamic policy = Policy();
         int activeProfiles = Convert.ToInt32(policy.CurrentProfileTypes);
-        result.PrivateProfileActive = selectedAdapter != null && (activeProfiles & 2) != 0 &&
+        result.PrivateProfileActive = selectedAdapter != null &&
+            (activeProfiles & WindowsFirewallProfile.Private) != 0 &&
             SelectedPrivateProfile(selectedAdapter, activeProfiles);
-        result.FirewallEnabled = Convert.ToBoolean(policy.FirewallEnabled[2]);
-        result.DefaultInboundBlocked = Convert.ToInt32(policy.DefaultInboundAction[2]) == 0 &&
-            !Convert.ToBoolean(policy.BlockAllInboundTraffic[2]);
+        result.FirewallEnabled = Convert.ToBoolean(policy.FirewallEnabled[WindowsFirewallProfile.Private]);
+        result.DefaultInboundBlocked =
+            Convert.ToInt32(policy.DefaultInboundAction[WindowsFirewallProfile.Private]) == 0 &&
+            !Convert.ToBoolean(policy.BlockAllInboundTraffic[WindowsFirewallProfile.Private]);
         result.LocalRulesEffective = Convert.ToInt32(policy.LocalPolicyModifyState) == 0;
         result.InterfaceFirewallApplies = selectedAdapter != null &&
-            FirewallAppliesTo(policy, selectedAdapter.Name);
+            FirewallAppliesTo(policy, selectedAdapter.Name, WindowsFirewallProfile.Private);
         // 0.0.0.0 serves every assigned IPv4 address, including internal and
         // Public/Domain interfaces. Collect each exact interface/profile and
         // reject a missing, duplicated or unprotected path before admission.
@@ -236,23 +281,16 @@ internal sealed class WindowsLanFirewallHost : ILanFirewallHost
             if (addresses.Length == 0) continue;
             int index = adapter.GetIPProperties().GetIPv4Properties().Index;
             List<Tuple<string, int>> profiles;
-            bool one = profileRows.TryGetValue(index, out profiles) && profiles.Count == 1 &&
-                String.Equals(profiles[0].Item1, adapter.Name, StringComparison.Ordinal);
-            int bit = one ? ProfileBit(profiles[0].Item2) : 0;
-            exposureProfiles |= bit;
+            profileRows.TryGetValue(index, out profiles);
             foreach (var item in addresses)
-                reachability.Add(new WildcardInterfaceEvidence {
-                    Identity = adapter.Id + "|" + index, Address = item.Address.ToString(),
-                    Selected = selectedAdapter != null && adapter.Id == selectedAdapter.Id &&
-                        item.Address.Equals(parsed), Profile = bit,
-                    ProfileKnown = one && bit != 0 && (activeProfiles & bit) != 0,
-                    FirewallEnabled = bit != 0 && Convert.ToBoolean(policy.FirewallEnabled[bit]),
-                    DefaultInboundBlocked = bit != 0 &&
-                        Convert.ToInt32(policy.DefaultInboundAction[bit]) == 0 &&
-                        !Convert.ToBoolean(policy.BlockAllInboundTraffic[bit]),
-                    InterfaceProtected = bit != 0 && FirewallAppliesTo(policy, adapter.Name),
-                    LocalRulesEffective = result.LocalRulesEffective
-                });
+            {
+                WildcardInterfaceEvidence assessed = AssessInterface(adapter.Id + "|" + index,
+                    item.Address.ToString(), adapter.Name,
+                    selectedAdapter != null && adapter.Id == selectedAdapter.Id && item.Address.Equals(parsed),
+                    profiles, activeProfiles, policy, result.LocalRulesEffective);
+                reachability.Add(assessed);
+                exposureProfiles |= assessed.Profile;
+            }
         }
         result.WildcardScopeComplete = WildcardScopeAccepted(reachability);
         if (result.WildcardScopeComplete && result.NetworkIdentity != null)
@@ -294,7 +332,7 @@ internal sealed class WindowsLanFirewallHost : ILanFirewallHost
         created.Name = rule.Name; created.Description = "ChildStream-owned approved LAN streaming ports";
         created.ApplicationName = rule.Executable; created.Protocol = rule.Protocol;
         created.LocalPorts = rule.LocalPorts; created.LocalAddresses = rule.LocalAddress;
-        created.RemoteAddresses = rule.RemoteSubnet; created.Profiles = 2;
+        created.RemoteAddresses = rule.RemoteSubnet; created.Profiles = WindowsFirewallProfile.Private;
         created.Direction = 1; created.Action = 1; created.EdgeTraversal = false;
         created.Enabled = true;
         policy.Rules.Add(created);

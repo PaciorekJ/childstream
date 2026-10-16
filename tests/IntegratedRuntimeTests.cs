@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Threading.Tasks;
 
 static class IntegratedRuntimeTests
 {
@@ -117,6 +118,14 @@ static class IntegratedRuntimeTests
         internal string LastConfig;
         internal string GameIntentPath { get { return Path.Combine(Root, "game.intent"); } }
         internal string GameRecordPath { get { return Path.Combine(Root, "game.record"); } }
+        internal string SteamIntentPath { get { return Path.Combine(Root, "steam.intent"); } }
+        internal string SteamRecordPath { get { return Path.Combine(Root, "steam.record"); } }
+        internal string RuntimeUncertainPath { get { return Path.Combine(Root, "runtime.uncertain"); } }
+        private static string ChildText(ChildSessionIdentity child)
+        { return child.SessionId + "|" + child.LogonTime; }
+        private static string ProcessText(ChildSessionIdentity child, ProductProcessIdentity process)
+        { return ChildText(child) + "|" + process.Pid + "|" + process.StartTimeUtcTicks +
+            "|" + process.ExecutableSha256; }
         internal Environment(string root)
         { Root = Path.Combine(root, "ChildStream"); Process.Path = Path.Combine(root, "Sunshine", "sunshine.exe");
           Process.SteamPath = Path.Combine(root, "Steam", "steam.exe");
@@ -180,29 +189,63 @@ static class IntegratedRuntimeTests
             ChildSteam = Process.SteamCurrent != null }; }
         public ProductProcessIdentity ReadGameProcess(ChildSessionIdentity child, SteamInstallation installation)
         { return Process.GameCurrent; }
-        public void RecordSteamIntent(ChildSessionIdentity child) { SteamIntents++; }
+        public void RecordSteamIntent(ChildSessionIdentity child)
+        { File.WriteAllText(SteamIntentPath, ChildText(child)); SteamIntents++; }
         public void RecordSteamStarted(ChildSessionIdentity child, ProductProcessIdentity process)
-        { if (process == null || process.Pid != 130) throw new Exception("Wrong Steam record"); SteamRecords++; }
+        { if (process == null || process.Pid != 130 || File.ReadAllText(SteamIntentPath) != ChildText(child))
+              throw new Exception("Wrong Steam record");
+          File.WriteAllText(SteamRecordPath, ProcessText(child, process)); SteamRecords++; }
         public void RecordGameRequest(ChildSessionIdentity child)
         { GameIntents++; using (var file = new FileStream(GameIntentPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-          { byte[] bytes = System.Text.Encoding.ASCII.GetBytes(child.SessionId + "|" + child.LogonTime);
+            { byte[] bytes = System.Text.Encoding.ASCII.GetBytes(ChildText(child));
             file.Write(bytes, 0, bytes.Length); file.Flush(true); } }
         public void RecordGameObserved(ChildSessionIdentity child, ProductProcessIdentity process)
         {
             if (process == null || process.Pid != 140 || !File.Exists(GameIntentPath)) throw new Exception("Wrong game record");
             using (var file = new FileStream(GameRecordPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-            { byte[] bytes = System.Text.Encoding.ASCII.GetBytes(child.SessionId + "|" + child.LogonTime + "|" +
-                process.Pid + "|" + process.StartTimeUtcTicks); file.Write(bytes, 0, bytes.Length); file.Flush(true); }
+            { byte[] bytes = System.Text.Encoding.ASCII.GetBytes(ProcessText(child, process));
+              file.Write(bytes, 0, bytes.Length); file.Flush(true); }
             if (FailGameRecord) throw new IOException("Injected interrupted record publication.");
             GameRecords++;
         }
         public void ResolveSteamStopped(ChildSessionIdentity child, ProductProcessIdentity steam,
             ProductProcessIdentity game)
-        { if (steam == null || steam.Pid != 130 || game == null || game.Pid != 140 ||
-              File.ReadAllText(GameRecordPath) != child.SessionId + "|" + child.LogonTime + "|" +
-                game.Pid + "|" + game.StartTimeUtcTicks) throw new Exception("Wrong stopped record");
-          File.Delete(GameRecordPath); File.Delete(GameIntentPath); SteamResolved++; }
-        public void RecordRuntimeUncertainty(ChildSessionIdentity child, string reason) { UncertainRecords++; }
+        { if (steam == null || steam.Pid != 130 || File.ReadAllText(SteamRecordPath) != ProcessText(child, steam) ||
+              (File.Exists(GameIntentPath) && (game == null || game.Pid != 140 ||
+                File.ReadAllText(GameRecordPath) != ProcessText(child, game))))
+              throw new Exception("Wrong stopped record");
+          File.Delete(GameRecordPath); File.Delete(GameIntentPath);
+          File.Delete(SteamRecordPath); File.Delete(SteamIntentPath); SteamResolved++; }
+        public void VerifySteamRecoveryState(ChildSessionIdentity child, SteamChildStage stage,
+            ProductProcessIdentity steam, ProductProcessIdentity game)
+        {
+            if (File.Exists(RuntimeUncertainPath) &&
+                File.ReadAllText(RuntimeUncertainPath) != ChildText(child) + "|LanWithdrawalUnknown")
+                throw new InvalidOperationException("Unrelated runtime uncertainty.");
+            if (stage == SteamChildStage.NotStarted)
+            {
+                if (File.Exists(SteamIntentPath) || File.Exists(SteamRecordPath) ||
+                    File.Exists(GameIntentPath) || File.Exists(GameRecordPath))
+                    throw new InvalidOperationException("Detached Steam state.");
+                return;
+            }
+            if ((stage != SteamChildStage.BigPictureStarted && stage != SteamChildStage.GameObserved) ||
+                steam == null || File.ReadAllText(SteamIntentPath) != ChildText(child) ||
+                File.ReadAllText(SteamRecordPath) != ProcessText(child, steam))
+                throw new InvalidOperationException("Steam record drift.");
+            if (stage == SteamChildStage.BigPictureStarted)
+            {
+                if (File.Exists(GameIntentPath) || File.Exists(GameRecordPath))
+                    throw new InvalidOperationException("Unobserved game request.");
+            }
+            else if (game == null || File.ReadAllText(GameIntentPath) != ChildText(child) ||
+                File.ReadAllText(GameRecordPath) != ProcessText(child, game))
+                throw new InvalidOperationException("Game record drift.");
+        }
+        public void RecordRuntimeUncertainty(ChildSessionIdentity child, string reason)
+        { if (!File.Exists(RuntimeUncertainPath))
+              File.WriteAllText(RuntimeUncertainPath, ChildText(child) + "|" + reason);
+          UncertainRecords++; }
     }
     private sealed class Bootstrap : IChildBootstrapHost, IChildAgentCommandHost
     {
@@ -231,6 +274,174 @@ static class IntegratedRuntimeTests
     private static void Check(bool value, string message) { checks++; if (!value) throw new Exception(message); }
     private static void Reject(Action operation, string message)
     { bool rejected = false; try { operation(); } catch { rejected = true; } Check(rejected, message); }
+    private static void GamePreservingRecovery(string root, ChildSessionIdentity child,
+        string agentPath, ChildAgentRequest request)
+    {
+        string[] fixtures = { root + "-steam-recover", root + "-game-recover",
+            root + "-record-recover", root + "-pending-recover", root + "-monitor-recover" };
+        try
+        {
+            var noGame = new Environment(fixtures[0]);
+            using (var worker = new ChildAgentRuntime(child, 1, noGame, new ManualMonitor()))
+            {
+                var app = new ChildAgentController(new Bootstrap(worker, child, agentPath), 1, child,
+                    agentPath, Digest); app.Start(request);
+                var presenter = new ChildStreamingPresenter(app, child);
+                var choice = presenter.Prepare(null);
+                presenter.Commit(choice, choice.Catalog.Displays[0].Id, choice.Catalog.Audio[0], false);
+                app.Execute(ChildAgentOperation.StartSteam, "");
+                ProductProcessIdentity originalSteam = noGame.Process.SteamCurrent;
+                noGame.Process.Current = null;
+                var lost = presenter.Observe();
+                Check((string)lost["stage"] == "SunshineLost" &&
+                    ChildStreamingUiState.From(lost, false).Recover,
+                    "healthy owned Steam leaves SunshineLost recovery available in production UI");
+                Check(presenter.Recover().Contains("NoSunshine") &&
+                    Object.ReferenceEquals(noGame.Process.SteamCurrent, originalSteam) &&
+                    noGame.Process.SteamStarts == 1 && noGame.Process.SteamStops == 0,
+                    "absent exact Sunshine reconciles without touching healthy child Steam");
+                var recoveredState = ChildStreamingUiState.From(presenter.Observe(), false);
+                Check(recoveredState.StartLocal && !recoveredState.Recover && !recoveredState.Pair,
+                    "reconciled stream exposes fresh start without stale pairing or recovery actions");
+                choice = presenter.Prepare(null);
+                presenter.Commit(choice, choice.Catalog.Displays[0].Id, choice.Catalog.Audio[0], false);
+                Check(noGame.Process.Starts == 2 && noGame.Pairing.Bootstraps == 1 &&
+                    noGame.Identity.Credentials && noGame.Process.SteamCurrent == originalSteam,
+                    "stream restarts around same Steam process and persistent pairing identity");
+                app.Execute(ChildAgentOperation.StopSteam, ""); presenter.Stop(); app.Stop();
+            }
+            var withGame = new Environment(fixtures[1]);
+            using (var worker = new ChildAgentRuntime(child, 1, withGame, new ManualMonitor()))
+            {
+                var app = new ChildAgentController(new Bootstrap(worker, child, agentPath), 1, child,
+                    agentPath, Digest); app.Start(request);
+                var presenter = new ChildStreamingPresenter(app, child);
+                var choice = presenter.Prepare(null);
+                presenter.Commit(choice, choice.Catalog.Displays[0].Id, choice.Catalog.Audio[0], false);
+                app.Execute(ChildAgentOperation.StartSteam, "");
+                app.Execute(ChildAgentOperation.RequestGame, "");
+                ProductProcessIdentity originalSteam = withGame.Process.SteamCurrent;
+                ProductProcessIdentity originalGame = withGame.Process.GameCurrent;
+                var cancelled = presenter.Prepare("192.168.50.10");
+                Check(presenter.Observe()["stage"].Equals("SunshineReady") &&
+                    withGame.Process.Stops == 0 && withGame.Process.GameStops == 0,
+                    "cancelled streaming picker leaves game and stream running");
+                withGame.WrongListener = true;
+                var lost = presenter.Observe();
+                Check((string)lost["stage"] == "SunshineBoundaryLost" &&
+                    ChildStreamingUiState.From(lost, false).Recover,
+                    "owned listener loss exposes recovery while observed game is healthy");
+                Check(presenter.Recover().Contains("NoSunshine") && withGame.Process.Stops == 1 &&
+                    withGame.Process.Current == null && withGame.Process.SteamCurrent == originalSteam &&
+                    withGame.Process.GameCurrent == originalGame && withGame.Process.GameStops == 0 &&
+                    withGame.Process.SteamStops == 0 && withGame.GameRecords == 1,
+                    "exact present failed Sunshine is stopped without game or Steam termination");
+                withGame.WrongListener = false;
+                choice = presenter.Prepare(null);
+                presenter.Commit(choice, choice.Catalog.Displays[0].Id, choice.Catalog.Audio[0], false);
+                Check(withGame.Process.Starts == 2 && withGame.Process.SteamStarts == 1 &&
+                    withGame.Process.GameRequests == 1 && withGame.Pairing.Bootstraps == 1 &&
+                    withGame.Process.GameCurrent == originalGame &&
+                    app.Execute(ChildAgentOperation.Status, "").Contains("GameObserved"),
+                    "stream returns around same observed game and original pairing without duplicate launch");
+                app.Execute(ChildAgentOperation.StopSteam, ""); presenter.Stop(); app.Stop();
+            }
+            var records = new Environment(fixtures[2]);
+            using (var worker = new ChildAgentRuntime(child, 1, records, new ManualMonitor()))
+            {
+                var app = new ChildAgentController(new Bootstrap(worker, child, agentPath), 1, child,
+                    agentPath, Digest); app.Start(request);
+                var presenter = new ChildStreamingPresenter(app, child);
+                var choice = presenter.Prepare(null);
+                presenter.Commit(choice, choice.Catalog.Displays[0].Id, choice.Catalog.Audio[0], false);
+                app.Execute(ChildAgentOperation.StartSteam, ""); app.Execute(ChildAgentOperation.RequestGame, "");
+                records.Process.Current = null;
+                string steamRecord = File.ReadAllText(records.SteamRecordPath);
+                File.Delete(records.SteamRecordPath);
+                Reject(() => presenter.Recover(), "missing durable Steam record blocks Sunshine-only recovery");
+                File.WriteAllText(records.SteamRecordPath, steamRecord);
+                string gameRecord = File.ReadAllText(records.GameRecordPath);
+                File.WriteAllText(records.GameRecordPath, "corrupt");
+                Reject(() => presenter.Recover(), "corrupt durable game record blocks Sunshine-only recovery");
+                File.WriteAllText(records.GameRecordPath, gameRecord);
+                ProductProcessIdentity exactSteam = records.Process.SteamCurrent;
+                records.Process.SteamCurrent = new ProductProcessIdentity { Pid = exactSteam.Pid,
+                    SessionId = exactSteam.SessionId, StartTimeUtcTicks = exactSteam.StartTimeUtcTicks + 1,
+                    ExecutablePath = exactSteam.ExecutablePath, ExecutableSha256 = exactSteam.ExecutableSha256 };
+                Reject(() => presenter.Recover(), "reused Steam PID blocks Sunshine-only recovery");
+                records.Process.SteamCurrent = exactSteam;
+                ProductProcessIdentity exactGame = records.Process.GameCurrent;
+                records.Process.GameCurrent = new ProductProcessIdentity { Pid = exactGame.Pid,
+                    SessionId = exactGame.SessionId, StartTimeUtcTicks = exactGame.StartTimeUtcTicks + 1,
+                    ExecutablePath = exactGame.ExecutablePath, ExecutableSha256 = exactGame.ExecutableSha256 };
+                Reject(() => presenter.Recover(), "reused game PID blocks Sunshine-only recovery");
+                records.Process.GameCurrent = exactGame;
+                records.Process.Generation = 124;
+                Reject(() => presenter.Recover(), "reused child session ID with new logon blocks recovery");
+                records.Process.Generation = 123;
+                ProductProcessIdentity started = records.LastStarted;
+                records.LastStarted = null;
+                Reject(() => presenter.Recover(), "missing durable Sunshine owner blocks recovery");
+                records.LastStarted = started;
+                Check(records.Process.Stops == 0 && records.Process.GameStops == 0 &&
+                    records.Process.SteamStops == 0 && records.Process.UnrelatedTouched == 0,
+                    "record and identity failures perform no destructive operation");
+                presenter.Recover();
+                app.Execute(ChildAgentOperation.StopSteam, ""); app.Stop();
+            }
+            var pending = new Environment(fixtures[3]); pending.Process.DelayGame = true;
+            using (var worker = new ChildAgentRuntime(child, 1, pending, new ManualMonitor()))
+            {
+                var app = new ChildAgentController(new Bootstrap(worker, child, agentPath), 1, child,
+                    agentPath, Digest); app.Start(request);
+                var presenter = new ChildStreamingPresenter(app, child);
+                var choice = presenter.Prepare(null);
+                presenter.Commit(choice, choice.Catalog.Displays[0].Id, choice.Catalog.Audio[0], false);
+                app.Execute(ChildAgentOperation.StartSteam, ""); app.Execute(ChildAgentOperation.RequestGame, "");
+                pending.Process.Current = null;
+                Reject(() => presenter.Recover(), "unobserved game launch remains separate from Sunshine loss");
+                Check(pending.Process.Stops == 0 && pending.Process.GameStops == 0 &&
+                    File.Exists(pending.GameIntentPath) && !File.Exists(pending.GameRecordPath),
+                    "uncertain game request retains its durable intent and is never guessed away");
+            }
+            var lan = new Environment(fixtures[4]) { LanApproved = true };
+            var monitor = new ManualMonitor();
+            using (var worker = new ChildAgentRuntime(child, 1, lan, monitor))
+            {
+                var app = new ChildAgentController(new Bootstrap(worker, child, agentPath), 1, child,
+                    agentPath, Digest); app.Start(request);
+                var presenter = new ChildStreamingPresenter(app, child);
+                var choice = presenter.Prepare("192.168.50.10");
+                presenter.Commit(choice, choice.Catalog.Displays[0].Id, choice.Catalog.Audio[0], false);
+                app.Execute(ChildAgentOperation.StartSteam, ""); app.Execute(ChildAgentOperation.RequestGame, "");
+                ProductProcessIdentity originalGame = lan.Process.GameCurrent;
+                lan.LanApproved = false;
+                Task observer = Task.Run(() => monitor.Fire());
+                Task stopper = Task.Run(() => {
+                    try { presenter.Stop(); }
+                    catch (InvalidOperationException) { } // Monitor may have already withdrawn the stream.
+                });
+                Task.WaitAll(observer, stopper);
+                Check(presenter.Observe()["stage"].Equals("SunshineWithdrawn") &&
+                    lan.Process.Stops == 1 && lan.Process.GameCurrent == originalGame &&
+                    lan.Process.GameStops == 0 && lan.Process.SteamStops == 0 &&
+                    lan.Process.UnrelatedTouched == 0,
+                    "idle LAN withdrawal and UI stop serialize to one exact stop while game remains owned");
+                lan.LanApproved = true;
+                choice = presenter.Prepare("192.168.50.10");
+                presenter.Commit(choice, choice.Catalog.Displays[0].Id, choice.Catalog.Audio[0], false);
+                Check(lan.Process.Starts == 2 && lan.Process.GameCurrent == originalGame &&
+                    lan.Pairing.Bootstraps == 1,
+                    "readmitted LAN streaming returns around same game and pairing identity");
+                app.Execute(ChildAgentOperation.StopSteam, ""); presenter.Stop(); app.Stop();
+            }
+        }
+        finally
+        {
+            foreach (string fixture in fixtures)
+                if (Directory.Exists(fixture)) Directory.Delete(fixture, true);
+        }
+    }
     public static int Main()
     {
         string root = Path.Combine(Path.GetTempPath(), "ChildStreamIntegrated-" + Guid.NewGuid().ToString("N"));
@@ -626,6 +837,7 @@ static class IntegratedRuntimeTests
             Check(File.Exists(interrupted.GameRecordPath) && interrupted.Process.GameStops == 0,
                 "interrupted record evidence is preserved for review");
         }
+        GamePreservingRecovery(root, child, agentPath, request);
         string temporary = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar) +
             Path.DirectorySeparatorChar + "ChildStreamIntegrated-";
         foreach (string fixture in new [] { root, root + "-cold", root + "-replaced", root + "-exited",

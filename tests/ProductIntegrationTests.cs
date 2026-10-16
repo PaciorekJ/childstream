@@ -177,6 +177,61 @@ internal static class ProductIntegrationTests
             "partial record is preserved rather than silently deleted");
     }
 
+    private static void SteamRecoveryRecords(string root)
+    {
+        string data = Path.Combine(root, "steam-recovery-records", "ChildStream");
+        var child = new ChildSessionIdentity(2, 123);
+        string session = Path.Combine(data, "sessions", "2-123");
+        Directory.CreateDirectory(session);
+        var environment = new WindowsChildRuntimeEnvironment(data,
+            Path.Combine(root, "fake-owned", "sunshine.exe"),
+            new FakeProcesses { CurrentSessionId = 2 });
+        var steam = new ProductProcessIdentity { Pid = 130, SessionId = 2,
+            StartTimeUtcTicks = 3000, ExecutablePath = Path.Combine(root, "Steam", "steam.exe"),
+            ExecutableSha256 = SteamDigest };
+        var game = new ProductProcessIdentity { Pid = 140, SessionId = 2,
+            StartTimeUtcTicks = 4000, ExecutablePath = Path.Combine(root, "Game", "Dungeons.exe"),
+            ExecutableSha256 = GameDigest };
+        environment.VerifySteamRecoveryState(child, SteamChildStage.NotStarted, null, null);
+        Check(true, "production no-Steam recovery requires no detached durable state");
+        environment.RecordSteamIntent(child);
+        environment.RecordSteamStarted(child, steam);
+        environment.VerifySteamRecoveryState(child, SteamChildStage.BigPictureStarted, steam, null);
+        Check(true, "production record store admits exact healthy Steam without game intent");
+        Reject(() => environment.VerifySteamRecoveryState(child, SteamChildStage.NotStarted, null, null),
+            "detached durable Steam record blocks Sunshine-only recovery");
+        string steamRecord = Path.Combine(session, "steam.record");
+        string savedSteam = File.ReadAllText(steamRecord);
+        File.Delete(steamRecord);
+        Reject(() => environment.VerifySteamRecoveryState(child, SteamChildStage.BigPictureStarted, steam, null),
+            "missing production Steam record blocks recovery");
+        File.WriteAllText(steamRecord, savedSteam);
+        environment.RecordGameRequest(child);
+        Reject(() => environment.VerifySteamRecoveryState(child, SteamChildStage.BigPictureStarted, steam, null),
+            "pending durable game intent is not treated as no game");
+        environment.RecordGameObserved(child, game);
+        environment.VerifySteamRecoveryState(child, SteamChildStage.GameObserved, steam, game);
+        Check(true, "production record store admits exact observed game alongside Steam");
+        string gameRecord = Path.Combine(session, "game.record");
+        string savedGame = File.ReadAllText(gameRecord);
+        File.WriteAllText(gameRecord, "partial");
+        Reject(() => environment.VerifySteamRecoveryState(child, SteamChildStage.GameObserved, steam, game),
+            "corrupt production game record blocks recovery");
+        File.WriteAllText(gameRecord, savedGame);
+        var reused = new ProductProcessIdentity { Pid = game.Pid, SessionId = game.SessionId,
+            StartTimeUtcTicks = game.StartTimeUtcTicks + 1, ExecutablePath = game.ExecutablePath,
+            ExecutableSha256 = game.ExecutableSha256 };
+        Reject(() => environment.VerifySteamRecoveryState(child, SteamChildStage.GameObserved, steam, reused),
+            "reused game process identity differs from durable exact record");
+        environment.RecordRuntimeUncertainty(child, "GameRequestUnknown");
+        Reject(() => environment.VerifySteamRecoveryState(child, SteamChildStage.GameObserved, steam, game),
+            "durable game uncertainty cannot be erased by Sunshine recovery");
+        File.Delete(Path.Combine(session, "runtime.uncertain"));
+        environment.ResolveSteamStopped(child, steam, game);
+        environment.VerifySteamRecoveryState(child, SteamChildStage.NotStarted, null, null);
+        Check(true, "exact resolved Steam/game files no longer obstruct streaming-only recovery");
+    }
+
     private static void Processes(string root)
     {
         string path = Path.Combine(root, "sunshine.exe");
@@ -607,7 +662,7 @@ internal static class ProductIntegrationTests
         {
             Configuration(root); Processes(root); Archives(); Extraction(root); ExtractionRecovery(root);
             Conflicts(); OwnedFileTransaction(root); ProductInstallation(root);
-            SunshineRecoveryRecords(root);
+            SunshineRecoveryRecords(root); SteamRecoveryRecords(root);
             Acceptance(); Steam(root); ChildBootstrap(root);
             if (args.Length == 1) PinnedArchive(args[0]);
             Console.WriteLine("Product integration offline assertions passed: " + assertions);

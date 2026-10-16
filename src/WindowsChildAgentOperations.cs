@@ -383,6 +383,35 @@ internal sealed class WindowsChildRuntimeEnvironment : IChildRuntimeEnvironment
         }
         File.Delete(StateFile(child, "steam.record")); File.Delete(StateFile(child, "steam.intent"));
     }
+    public void VerifySteamRecoveryState(ChildSessionIdentity child, SteamChildStage stage,
+        ProductProcessIdentity steam, ProductProcessIdentity game)
+    {
+        string steamIntent = StateFile(child, "steam.intent"), steamRecord = StateFile(child, "steam.record");
+        string gameIntent = StateFile(child, "game.intent"), gameRecord = StateFile(child, "game.record");
+        string uncertainty = StateFile(child, "runtime.uncertain");
+        if (File.Exists(uncertainty) &&
+            File.ReadAllText(uncertainty) != ChildText(child) + "|LanWithdrawalUnknown")
+            throw new InvalidOperationException("A non-Sunshine runtime uncertainty requires separate recovery.");
+        if (stage == SteamChildStage.NotStarted)
+        {
+            if (steam != null || game != null || File.Exists(steamIntent) || File.Exists(steamRecord) ||
+                File.Exists(gameIntent) || File.Exists(gameRecord))
+                throw new InvalidOperationException("Durable Steam or game state is not attached to this agent.");
+            return;
+        }
+        if ((stage != SteamChildStage.BigPictureStarted && stage != SteamChildStage.GameObserved) ||
+            steam == null || File.ReadAllText(steamIntent) != ChildText(child) ||
+            File.ReadAllText(steamRecord) != RecordText(child, steam))
+            throw new InvalidOperationException("Exact owned Steam recovery record is missing or changed.");
+        if (stage == SteamChildStage.BigPictureStarted)
+        {
+            if (game != null || File.Exists(gameIntent) || File.Exists(gameRecord))
+                throw new InvalidOperationException("A game request exists without an exact observed game.");
+        }
+        else if (game == null || File.ReadAllText(gameIntent) != ChildText(child) ||
+            File.ReadAllText(gameRecord) != RecordText(child, game))
+            throw new InvalidOperationException("Exact owned game recovery record is missing or changed.");
+    }
     public void RecordRuntimeUncertainty(ChildSessionIdentity child, string reason)
     {
         if (reason != "SteamStartUnknown" && reason != "GameRequestUnknown" &&

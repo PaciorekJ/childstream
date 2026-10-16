@@ -614,6 +614,15 @@ internal sealed class SteamChildRuntime
     internal ProductProcessIdentity SteamIdentity { get { return steam == null ? null : steam.Identity; } }
     internal ProductProcessIdentity GameIdentity { get { return game == null ? null : game.Identity; } }
 
+    internal void AssertHealthyForStreamingRecovery()
+    {
+        if ((Stage != SteamChildStage.BigPictureStarted && Stage != SteamChildStage.GameObserved) ||
+            steam == null || !steam.VerifyRunning() ||
+            (Stage == SteamChildStage.GameObserved && (game == null || !game.VerifyRunning())))
+            throw new InvalidOperationException(
+                "Steam or game ownership is unresolved; Sunshine-only recovery cannot change it.");
+    }
+
     internal SteamChildRuntime(IProductProcessHost host, ChildSessionIdentity child,
         string steamPath, string steamDigest, string gamePath, string gameDigest)
     {

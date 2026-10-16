@@ -2,6 +2,42 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 
+internal sealed class StrictFirewallProfileValues
+{
+    internal readonly Dictionary<int, object> Values = new Dictionary<int, object>();
+    internal readonly List<int> Requested = new List<int>();
+    internal int FailingProfile;
+    public object this[int profile]
+    {
+        get
+        {
+            Requested.Add(profile);
+            if (profile == FailingProfile) throw new InvalidOperationException("Injected profile getter failure.");
+            object value;
+            if (!Values.TryGetValue(profile, out value)) throw new InvalidOperationException("Unexpected native profile index.");
+            return value;
+        }
+    }
+}
+internal sealed class StrictFirewallPolicy
+{
+    public readonly StrictFirewallProfileValues FirewallEnabled = new StrictFirewallProfileValues();
+    public readonly StrictFirewallProfileValues DefaultInboundAction = new StrictFirewallProfileValues();
+    public readonly StrictFirewallProfileValues BlockAllInboundTraffic = new StrictFirewallProfileValues();
+    public readonly StrictFirewallProfileValues ExcludedInterfaces = new StrictFirewallProfileValues();
+    internal StrictFirewallPolicy()
+    {
+        foreach (int profile in new [] { WindowsFirewallProfile.Domain,
+            WindowsFirewallProfile.Private, WindowsFirewallProfile.Public })
+        {
+            FirewallEnabled.Values[profile] = true;
+            DefaultInboundAction.Values[profile] = 0;
+            BlockAllInboundTraffic.Values[profile] = false;
+            ExcludedInterfaces.Values[profile] = new string[0];
+        }
+    }
+}
+
 internal static class LanFirewallTests
 {
     private static int checks;
@@ -37,6 +73,84 @@ internal static class LanFirewallTests
             Rules.Remove(rule.Name);
         }
     }
+    private static WildcardInterfaceEvidence Raw(StrictFirewallPolicy policy, string identity,
+        string alias, int? category, bool selected, int activeProfiles = 7,
+        bool duplicate = false, string profileAlias = null)
+    {
+        var rows = new List<Tuple<string, int>>();
+        if (category.HasValue) rows.Add(Tuple.Create(profileAlias ?? alias, category.Value));
+        if (duplicate) rows.Add(Tuple.Create(alias, category ?? 1));
+        return WindowsLanFirewallHost.AssessInterface(identity, "192.0.2." + (selected ? "10" : "11"),
+            alias, selected, rows, activeProfiles, policy, true);
+    }
+    private static void NativeProfileRegressions(string selectedIdentity, string anotherIdentity)
+    {
+        var policy = new StrictFirewallPolicy();
+        WildcardInterfaceEvidence selected = Raw(policy, selectedIdentity, "Wi-Fi", 1, true, 6);
+        WildcardInterfaceEvidence publicPath = Raw(policy, anotherIdentity, "Public NIC", 0, false, 6);
+        Check(selected.Profile == 2 && publicPath.Profile == 4 &&
+            WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected, publicPath }) &&
+            policy.ExcludedInterfaces.Requested.Contains(4) &&
+            !policy.ExcludedInterfaces.Requested.Contains(1),
+            "raw Private plus Public uses profile 2 and profile 4, never absent Domain");
+        WildcardInterfaceEvidence domainPath = Raw(policy, anotherIdentity, "Domain NIC", 2, false);
+        Check(domainPath.Profile == 1 &&
+            WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected, domainPath }) &&
+            policy.ExcludedInterfaces.Requested.Contains(1),
+            "raw DomainAuthenticated uses firewall Domain profile 1");
+        Check(WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected, publicPath,
+            Raw(policy, "third", "Domain NIC", 2, false) }),
+            "all three native categories are assessed without profile substitution");
+        Check(WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected,
+            Raw(policy, anotherIdentity, "Second Private", 1, false) }),
+            "multiple raw Private interfaces each use their own exact alias");
+        Check(!WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected,
+            Raw(policy, anotherIdentity, "Unknown NIC", null, false) }) &&
+            !WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected,
+                Raw(policy, anotherIdentity, "Unknown NIC", 99, false) }),
+            "missing and invalid network categories fail closed without policy coercion");
+        Check(!WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected,
+            Raw(policy, anotherIdentity, "Public NIC", 0, false, 2) }),
+            "assigned category absent from active firewall profiles fails closed");
+        Check(!WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected,
+            Raw(policy, anotherIdentity, "Public NIC", 0, false, 7, false, "Renamed NIC") }) &&
+            !WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected,
+                Raw(policy, anotherIdentity, "Public NIC", 0, false, 7, true) }),
+            "profile alias drift and duplicate profile rows fail closed");
+        policy.ExcludedInterfaces.Values[4] = new [] { "Public NIC" };
+        Check(!WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected,
+            Raw(policy, anotherIdentity, "Public NIC", 0, false) }) &&
+            WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected,
+                Raw(policy, anotherIdentity, "Other Public NIC", 0, false) }),
+            "Public exclusion is read from profile 4 and matched to the exact alias");
+        policy.ExcludedInterfaces.Values[4] = new string[0];
+        policy.ExcludedInterfaces.Values[1] = new [] { "Domain NIC" };
+        Check(!WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected,
+            Raw(policy, anotherIdentity, "Domain NIC", 2, false) }),
+            "Domain exclusion is read from profile 1, not Private profile 2");
+        policy.ExcludedInterfaces.Values[1] = new string[0];
+        policy.FirewallEnabled.Values[4] = false;
+        Check(!WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected,
+            Raw(policy, anotherIdentity, "Public NIC", 0, false) }),
+            "raw Public profile disabled blocks wildcard admission");
+        policy.FirewallEnabled.Values[4] = true;
+        policy.DefaultInboundAction.Values[1] = 1;
+        Check(!WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected,
+            Raw(policy, anotherIdentity, "Domain NIC", 2, false) }),
+            "raw Domain default inbound allow blocks wildcard admission");
+        policy.DefaultInboundAction.Values[1] = 0;
+        policy.ExcludedInterfaces.Values[4] = null;
+        Check(!WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected,
+            Raw(policy, anotherIdentity, "Public NIC", 0, false) }),
+            "unsupported empty provider shape cannot become a safe empty exclusion list");
+        policy.ExcludedInterfaces.Values[4] = new object[] { 17 };
+        Check(!WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected,
+            Raw(policy, anotherIdentity, "Public NIC", 0, false) }),
+            "non-string provider shape fails closed");
+        policy.ExcludedInterfaces.FailingProfile = 4;
+        Reject(() => Raw(policy, anotherIdentity, "Public NIC", 0, false),
+            "profile-specific native getter failure blocks wildcard assessment");
+    }
     public static int Main()
     {
         const string nic = "29d8a111-4468-4e16-a341-607183241104";
@@ -59,11 +173,12 @@ internal static class LanFirewallTests
             "Wi-Fi", 0, 2) &&
             !WindowsLanFirewallHost.IsSelectedPrivateProfileEvidence(7, "Wi-Fi", 7,
             "Wi-Fi", 1, 1), "another private profile cannot substitute for selected interface");
+        NativeProfileRegressions(nic, another);
         var selected = new WildcardInterfaceEvidence { Identity = nic, Address = "192.168.50.10",
             Selected = true, Profile = 2, ProfileKnown = true, FirewallEnabled = true,
             DefaultInboundBlocked = true, InterfaceProtected = true, LocalRulesEffective = true };
         var second = new WildcardInterfaceEvidence { Identity = another, Address = "10.0.0.2",
-            Profile = 1, ProfileKnown = true, FirewallEnabled = true,
+            Profile = 4, ProfileKnown = true, FirewallEnabled = true,
             DefaultInboundBlocked = true, InterfaceProtected = true, LocalRulesEffective = true };
         Check(WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected, second }),
             "all wildcard-reachable profiles require individual protected observations");
@@ -76,14 +191,14 @@ internal static class LanFirewallTests
         second.DefaultInboundBlocked = true; second.InterfaceProtected = false;
         Check(!WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected, second }),
             "firewall-excluded alternate interface blocks wildcard binding");
-        second.InterfaceProtected = true; second.Profile = 4; second.ProfileKnown = false;
+        second.InterfaceProtected = true; second.Profile = 1; second.ProfileKnown = false;
         Check(!WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected, second }),
             "unattributed Domain path fails closed");
         second.ProfileKnown = true; second.Profile = 2;
         Check(WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected, second }),
             "multiple same-profile interfaces are each assessed");
-        Check(WindowsLanFirewallHost.RuleIntersectsWildcard(1, 3) &&
-            WindowsLanFirewallHost.RuleIntersectsWildcard(4, 6) &&
+        Check(WindowsLanFirewallHost.RuleIntersectsWildcard(4, 6) &&
+            WindowsLanFirewallHost.RuleIntersectsWildcard(1, 3) &&
             WindowsLanFirewallHost.RuleIntersectsWildcard(0, 2) &&
             !WindowsLanFirewallHost.RuleIntersectsWildcard(4, 3),
             "Public, Domain and unknown-profile broad rules are assessed against all reachable profiles");

@@ -37,6 +37,8 @@ internal interface IChildRuntimeEnvironment
     void RecordGameObserved(ChildSessionIdentity child, ProductProcessIdentity process);
     void ResolveSteamStopped(ChildSessionIdentity child, ProductProcessIdentity steam,
         ProductProcessIdentity game);
+    void VerifySteamRecoveryState(ChildSessionIdentity child, SteamChildStage stage,
+        ProductProcessIdentity steam, ProductProcessIdentity game);
     void RecordRuntimeUncertainty(ChildSessionIdentity child, string reason);
 }
 
@@ -519,11 +521,26 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
     }
     private void RecoverSunshine()
     {
-        if (steam != null)
-            throw new InvalidOperationException("Steam or game state requires separate reviewed recovery.");
-        ProductProcessIdentity exact = sunshineIdentity ?? environment.ReadStarted(child);
+        SteamChildStage steamStage = steam == null ? SteamChildStage.NotStarted : steam.Stage;
+        if (steam != null) steam.AssertHealthyForStreamingRecovery();
+        environment.VerifySteamRecoveryState(child, steamStage,
+            steam == null ? null : steam.SteamIdentity, steam == null ? null : steam.GameIdentity);
+        ProductProcessIdentity exact = environment.ReadStarted(child);
         if (exact == null)
             throw new InvalidOperationException("No durable exact Sunshine identity exists; an intent-only start needs reviewed process enumeration.");
+        if (sunshineIdentity != null && (exact.Pid != sunshineIdentity.Pid ||
+            exact.StartTimeUtcTicks != sunshineIdentity.StartTimeUtcTicks ||
+            exact.SessionId != sunshineIdentity.SessionId ||
+            !String.Equals(exact.ExecutablePath, sunshineIdentity.ExecutablePath, StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(exact.ExecutableSha256, sunshineIdentity.ExecutableSha256, StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidOperationException("In-memory Sunshine owner differs from its durable exact record.");
+        if (!uncertain && sunshine != null && sunshine.VerifyRunning() && owner != null)
+        {
+            bool healthy = false;
+            try { owner.AssertStillOwned(); healthy = true; }
+            catch (InvalidOperationException) { }
+            if (healthy) throw new InvalidOperationException("Verified healthy Sunshine does not require recovery.");
+        }
         ChildOwnedProcess controlled = sunshine;
         if (controlled == null)
         {
