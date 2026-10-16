@@ -101,13 +101,13 @@ internal sealed class FirstRunForm : Form
 {
     private readonly FirstRunController controller;
     private readonly Label feature, token, guidance;
-    private readonly Button start, refresh, setup;
+    private readonly Button start, refresh, setup, maintain;
     internal bool StartSelected { get; private set; }
     internal FirstRunForm(FirstRunController controller, bool simulated = false)
     {
         this.controller = controller;
         Text = simulated ? "ChildStream — simulated test environment" : "ChildStream";
-        Width = 620; Height = 310; MinimumSize = new Size(560, 290);
+        Width = 620; Height = 355; MinimumSize = new Size(560, 335);
         StartPosition = FormStartPosition.CenterScreen;
         var title = new Label { Left = 20, Top = 18, Width = 555, Height = 32,
             Font = new Font(SystemFonts.MessageBoxFont, FontStyle.Bold), Text = "ChildStream setup and session" };
@@ -117,8 +117,11 @@ internal sealed class FirstRunForm : Form
         start = new Button { Left = 20, Top = 205, Width = 160, Height = 32, Text = "Start child desktop" };
         refresh = new Button { Left = 190, Top = 205, Width = 130, Height = 32, Text = "Refresh status" };
         setup = new Button { Left = 330, Top = 205, Width = 105, Height = 32, Text = "Setup…" };
+        maintain = new Button { Left = 20, Top = 247, Width = 210, Height = 32,
+            Text = "Install or maintain files…" };
         var close = new Button { Left = 445, Top = 205, Width = 130, Height = 32, Text = "Close" };
-        Controls.AddRange(new Control[] { title, feature, token, guidance, start, refresh, setup, close });
+        Controls.AddRange(new Control[] { title, feature, token, guidance, start, refresh,
+            setup, maintain, close });
         start.Click += (s, e) => { controller.Refresh(); RenderState(); if (!controller.CanStart) return;
             StartSelected = true; DialogResult = DialogResult.OK; Close(); };
         refresh.Click += (s, e) => { controller.Refresh(); RenderState(); };
@@ -134,6 +137,10 @@ internal sealed class FirstRunForm : Form
                   dialog.ShowDialog(this); }
             controller.Refresh(); RenderState();
         };
+        maintain.Click += (s, e) =>
+        { using (var dialog = new ProductInstallDialog(new WindowsProductInstallWorkflow(), simulated))
+              dialog.ShowDialog(this);
+          controller.Refresh(); RenderState(); };
         close.Click += (s, e) => Close();
         Shown += (s, e) => { controller.Refresh(); RenderState(); };
         RenderState();
@@ -144,6 +151,7 @@ internal sealed class FirstRunForm : Form
         token.Text = "Runtime token: " + controller.Token + ".";
         start.Enabled = controller.CanStart;
         setup.Enabled = controller.Token == RuntimeTokenStatus.Limited;
+        maintain.Enabled = controller.Token == RuntimeTokenStatus.Limited;
         guidance.Text = controller.Token != RuntimeTokenStatus.Limited
             ? "Open the normal ChildStream application without elevation. Setup is a separate, explicit operation."
             : controller.Feature != null && controller.Feature.Status == ChildFeatureStatus.Disabled

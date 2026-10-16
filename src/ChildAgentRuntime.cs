@@ -24,7 +24,10 @@ internal interface IChildRuntimeEnvironment
     string EnsureGenerationFile(ChildSessionIdentity child, string name, string content);
     void RecordStartIntent(ChildSessionIdentity child);
     void RecordStarted(ChildSessionIdentity child, ProductProcessIdentity process);
+    bool HasUnresolvedStartIntent(ChildSessionIdentity child);
     void ResolveStopped(ChildSessionIdentity child, ProductProcessIdentity process);
+    ProductProcessIdentity ReadStarted(ChildSessionIdentity child);
+    void ResolveFailedStart(ChildSessionIdentity child, ProductProcessIdentity process);
     SteamInstallation ReadSteamInstallation();
     SteamLaunchObservation ReadSteamObservation(ChildSessionIdentity child, uint parentSessionId);
     ProductProcessIdentity ReadGameProcess(ChildSessionIdentity child, SteamInstallation installation);
@@ -44,6 +47,33 @@ internal sealed class SteamInstallation
 internal sealed class SteamLaunchObservation
 {
     internal bool Complete, ParentSteam, UnrelatedSteam, ChildSteam;
+}
+
+internal sealed class SunshineNotReadyException : InvalidOperationException
+{
+    internal SunshineNotReadyException(string message) : base(message) { }
+}
+
+internal interface IRuntimeMonitor : IDisposable
+{
+    void Start(Action tick);
+    void Stop();
+}
+
+internal sealed class PeriodicRuntimeMonitor : IRuntimeMonitor
+{
+    private Timer timer;
+    public void Start(Action tick)
+    {
+        if (timer != null) throw new InvalidOperationException("Runtime monitor already started.");
+        timer = new Timer(state => tick(), null, 1000, 1000);
+    }
+    public void Stop()
+    {
+        Timer old = timer; timer = null;
+        if (old != null) old.Dispose();
+    }
+    public void Dispose() { Stop(); }
 }
 
 internal sealed class VerifiedChildSunshineRuntime : IVerifiedChildSunshine
@@ -90,12 +120,14 @@ internal sealed class VerifiedChildSunshineRuntime : IVerifiedChildSunshine
         IList<SunshineListener> listeners = environment.ReadListeners(expected.Pid, family, out complete);
         string expectedBind = lanAddress == null ? "127.0.0.1" : "0.0.0.0";
         string problem = SunshineRuntimeGate.CheckCandidate(complete, expected.Pid, expectedBind, family, listeners);
+        if (problem == "Candidate Sunshine opened no verifiable listener.")
+            throw new SunshineNotReadyException(problem);
         if (problem != null) throw new InvalidOperationException(problem);
         bool webUi = false;
         foreach (var endpoint in listeners)
             if (endpoint.Protocol == "TCP" && endpoint.Port == family.BasePort + 1 &&
                 endpoint.Pid == expected.Pid && endpoint.LocalAddress == expectedBind) webUi = true;
-        if (!webUi) throw new InvalidOperationException("ChildStream HTTPS pairing listener is not owned by this process.");
+        if (!webUi) throw new SunshineNotReadyException("ChildStream HTTPS pairing listener has not appeared yet.");
     }
 }
 
@@ -105,6 +137,9 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
     private readonly uint parentSessionId;
     private readonly IChildRuntimeEnvironment environment;
     private readonly SunshinePortFamily family = new SunshinePortFamily(48089);
+    private readonly object gate = new object();
+    private readonly IRuntimeMonitor monitor;
+    private bool monitoringLan, boundaryWithdrawn;
     private string lanAddress;
     private ChildOwnedProcess sunshine;
     private ProductProcessIdentity sunshineIdentity;
@@ -114,12 +149,14 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
     private bool uncertain;
     private SteamChildRuntime steam;
     private SteamInstallation steamInstallation;
-    internal ChildAgentRuntime(ChildSessionIdentity child, uint parentSessionId, IChildRuntimeEnvironment environment)
+    internal ChildAgentRuntime(ChildSessionIdentity child, uint parentSessionId,
+        IChildRuntimeEnvironment environment, IRuntimeMonitor monitor = null)
     {
         if (child.SessionId == 0 || child.LogonTime <= 0 || parentSessionId == 0 ||
             parentSessionId == child.SessionId || environment == null)
             throw new InvalidDataException("Exact child and production environment are required.");
         this.child = child; this.parentSessionId = parentSessionId; this.environment = environment;
+        this.monitor = monitor ?? new PeriodicRuntimeMonitor();
     }
     private void RequireChild()
     {
@@ -128,9 +165,15 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
             throw new InvalidOperationException("Runtime left the exact child logon generation.");
     }
     public string Execute(ChildAgentOperation operation, string payload)
+    { lock (gate) { return ExecuteLocked(operation, payload); } }
+    private string ExecuteLocked(ChildAgentOperation operation, string payload)
     {
         RequireChild();
-        if (uncertain) throw new InvalidOperationException("Runtime ownership is uncertain; reviewed recovery is required.");
+        if (monitoringLan) SuperviseLanLocked();
+        if (sunshineIdentity == null && environment.HasUnresolvedStartIntent(child)) uncertain = true;
+        if (uncertain && operation != ChildAgentOperation.Status &&
+            operation != ChildAgentOperation.RecoverSunshine)
+            throw new InvalidOperationException("Runtime ownership is uncertain; exact owned recovery is required.");
         if (payload == null) payload = "";
         switch (operation)
         {
@@ -148,6 +191,9 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
             case ChildAgentOperation.StopSunshine:
                 if (payload.Length != 0) throw new InvalidDataException("Sunshine stop has no payload.");
                 StopSunshine(); return Status();
+            case ChildAgentOperation.RecoverSunshine:
+                if (payload.Length != 0) throw new InvalidDataException("Recovery has no payload.");
+                RecoverSunshine(); return Status();
             case ChildAgentOperation.PairingGet:
                 if (payload.Length != 0 || pairing == null) throw new InvalidOperationException("Verified Sunshine is required for pairing refresh.");
                 owner.AssertStillOwned(); return pairing.Send("GET", "/api/pin", null);
@@ -206,8 +252,10 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
     }
     private string Status()
     {
-        ObservePendingGame();
-        string state = uncertain ? "Uncertain" : sunshineIdentity == null ? "NoSunshine" :
+        if (sunshineIdentity == null && environment.HasUnresolvedStartIntent(child)) uncertain = true;
+        if (!uncertain) ObservePendingGame();
+        string state = uncertain ? "Uncertain" : sunshineIdentity == null ?
+            (boundaryWithdrawn ? "SunshineWithdrawn" : "NoSunshine") :
             sunshine != null && sunshine.VerifyRunning() ? "SunshineReady" : "SunshineLost";
         if (state == "SunshineReady")
             try { owner.AssertStillOwned(); }
@@ -216,7 +264,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
             { "stage", state }, { "childSession", child.SessionId }, { "childLogon", child.LogonTime },
             { "host", "ChildStream" }, { "manualAddress", state == "SunshineReady" ?
                 (lanAddress ?? "127.0.0.1") + ":" + family.BasePort : "" },
-            { "lanPosture", lanAddress == null ? "LocalOnly" :
+            { "lanPosture", boundaryWithdrawn ? "Withdrawn" : lanAddress == null ? "LocalOnly" :
                 state == "SunshineReady" ? "ScopedRulesVerified" : "ChangedOrUnavailable" },
             { "steamStage", steam == null ? "NotStarted" : steam.Stage.ToString() }
         });
@@ -346,7 +394,9 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
                     Child = child, BindAddress = requestedLanAddress, Port = family.BasePort,
                     BoundaryVerified = true } };
             environment.EnsureGenerationFile(child, "apps.json", ChildProductConfiguration.BuildApps());
-            string config = environment.EnsureGenerationFile(child, "sunshine.conf", ChildProductConfiguration.BuildSunshine(options));
+            string config = environment.EnsureGenerationFile(child,
+                requestedLanAddress == null ? "sunshine.conf" : "sunshine-lan.conf",
+                ChildProductConfiguration.BuildSunshine(options));
             environment.RecordStartIntent(child);
             startIntentRecorded = true;
             sunshine = new ChildOwnedProcess(environment.Processes, child,
@@ -369,9 +419,9 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
                         throw new InvalidOperationException("Existing owned Sunshine certificate changed on startup.");
                     break;
                 }
+                catch (SunshineNotReadyException) { }
                 catch (FileNotFoundException) { if (establishedCertificate != null) throw; }
                 catch (InvalidDataException) { if (establishedCertificate != null) throw; }
-                catch (InvalidOperationException) { if (establishedCertificate != null) throw; }
                 Thread.Sleep(100);
             }
             if (readyCertificate == null)
@@ -387,6 +437,12 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
             }
             pairing.Send("GET", "/api/pin", null); // Authenticated readiness, never native Sunshine.
             lanAddress = requestedLanAddress;
+            boundaryWithdrawn = false;
+            if (requestedLanAddress != null)
+            {
+                monitoringLan = true;
+                monitor.Start(SuperviseLan);
+            }
             return Status();
         }
         catch
@@ -405,13 +461,75 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
             // if the LAN boundary has drifted and pairing/status are blocked.
             sunshine.Stop(5000);
             environment.ResolveStopped(child, sunshineIdentity);
+            monitoringLan = false; monitor.Stop();
             sunshine = null; sunshineIdentity = null; pairing = null; owner = null; lanAddress = null;
             identity.Dispose(); identity = null;
         }
         catch { uncertain = true; throw; }
     }
+    private void SuperviseLan()
+    {
+        lock (gate)
+        {
+            try { if (monitoringLan) SuperviseLanLocked(); }
+            catch { /* The durable uncertainty and command status retain the failure. */ }
+        }
+    }
+    private void SuperviseLanLocked()
+    {
+        if (!monitoringLan || sunshine == null || owner == null) return;
+        try { owner.AssertStillOwned(); return; }
+        catch
+        {
+            // Invalidate pairing before attempting an exact-owned stop. A
+            // changed PID, generation or token can never be killed by name.
+            pairing = null; owner = null; monitoringLan = false; monitor.Stop();
+            try
+            {
+                sunshine.Stop(5000);
+                environment.ResolveStopped(child, sunshineIdentity);
+                sunshine = null; sunshineIdentity = null; lanAddress = null;
+                if (identity != null) { identity.Dispose(); identity = null; }
+                boundaryWithdrawn = true;
+            }
+            catch
+            {
+                uncertain = true;
+                environment.RecordRuntimeUncertainty(child, "LanWithdrawalUnknown");
+            }
+        }
+    }
+    private void RecoverSunshine()
+    {
+        if (steam != null)
+            throw new InvalidOperationException("Steam or game state requires separate reviewed recovery.");
+        ProductProcessIdentity exact = sunshineIdentity ?? environment.ReadStarted(child);
+        if (exact == null)
+            throw new InvalidOperationException("No durable exact Sunshine identity exists; an intent-only start needs reviewed process enumeration.");
+        ChildOwnedProcess controlled = sunshine;
+        if (controlled == null)
+        {
+            controlled = new ChildOwnedProcess(environment.Processes, child,
+                environment.SunshineExecutable, SunshineReleasePin.ExecutableSha256);
+            ProductProcessIdentity current = environment.Processes.Read(exact.Pid);
+            if (current != null) controlled.Attach(exact);
+        }
+        // Stop validates PID, creation time, session, path and digest before a
+        // close request. An absent PID is handled by the durable record check.
+        if (environment.Processes.Read(exact.Pid) != null) controlled.Stop(5000);
+        environment.ResolveFailedStart(child, exact);
+        monitoringLan = false; monitor.Stop();
+        sunshine = null; sunshineIdentity = null; pairing = null; owner = null; lanAddress = null;
+        if (identity != null) { identity.Dispose(); identity = null; }
+        uncertain = false;
+    }
     public void Dispose()
     {
+        lock (gate) DisposeLocked();
+    }
+    private void DisposeLocked()
+    {
+        monitoringLan = false; monitor.Dispose();
         if (steam != null)
             try { StopSteam(); }
             catch { try { environment.RecordRuntimeUncertainty(child, "AgentExitWithSteamUnknown"); } catch { } }

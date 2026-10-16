@@ -4,6 +4,15 @@ using System.IO;
 
 static class IntegratedRuntimeTests
 {
+    private sealed class ManualMonitor : IRuntimeMonitor
+    {
+        internal Action Tick;
+        internal int Starts, Stops;
+        public void Start(Action tick) { Tick = tick; Starts++; }
+        public void Stop() { Tick = null; Stops++; }
+        public void Dispose() { Stop(); }
+        internal void Fire() { Action action = Tick; if (action != null) action(); }
+    }
     private const string Digest = SunshineReleasePin.ExecutableSha256;
     private sealed class ProcessHost : IProductProcessHost
     {
@@ -101,6 +110,7 @@ static class IntegratedRuntimeTests
         internal int Intents, Records, Resolved, Discoveries;
         internal int SteamIntents, SteamRecords, GameIntents, GameRecords, SteamResolved, UncertainRecords;
         internal bool WrongListener, Elevated, ParentSteam, LanApproved, LanRequested;
+        internal int ListenerDelay, ListenerReads;
         internal bool MultipleDevices;
         internal bool FailGameRecord;
         internal string SunshineConfiguration;
@@ -129,7 +139,9 @@ static class IntegratedRuntimeTests
         public bool VerifyLanBoundary(string address, SunshinePortFamily family)
         { LanRequested = true; return LanApproved && address == "192.168.50.10" && family.BasePort == 48089; }
         public IList<SunshineListener> ReadListeners(int pid, SunshinePortFamily family, out bool complete)
-        { complete = true; return new [] { new SunshineListener { Protocol = "TCP", Port = family.BasePort + 1,
+        { complete = true; ListenerReads++;
+          if (ListenerReads <= ListenerDelay) return new SunshineListener[0];
+          return new [] { new SunshineListener { Protocol = "TCP", Port = family.BasePort + 1,
             Pid = WrongListener ? 999 : pid, LocalAddress = LanRequested ? "0.0.0.0" : "127.0.0.1" } }; }
         public IChildSunshineIdentity OpenIdentity() { return Identity; }
         public IChildSunshineTransport CreatePairingTransport(Uri endpoint, string certificateSha256,
@@ -142,8 +154,16 @@ static class IntegratedRuntimeTests
           if (name == "sunshine.conf") SunshineConfiguration = content;
           return Path.Combine(Root, "sessions", child.SessionId + "-" + child.LogonTime, name); }
         public void RecordStartIntent(ChildSessionIdentity child) { Intents++; }
-        public void RecordStarted(ChildSessionIdentity child, ProductProcessIdentity process) { Records++; }
+        public void RecordStarted(ChildSessionIdentity child, ProductProcessIdentity process) { Records++; LastStarted = process; }
+        public bool HasUnresolvedStartIntent(ChildSessionIdentity child) { return Intents > Resolved; }
         public void ResolveStopped(ChildSessionIdentity child, ProductProcessIdentity process) { Resolved++; }
+        public ProductProcessIdentity ReadStarted(ChildSessionIdentity child)
+        { return Records > Resolved ? LastStarted : null; }
+        internal ProductProcessIdentity LastStarted;
+        public void ResolveFailedStart(ChildSessionIdentity child, ProductProcessIdentity process)
+        { if (Process.Read(process.Pid) != null || process != LastStarted)
+              throw new InvalidOperationException("Recovery must reconcile the exact absent process.");
+          Resolved++; }
         public SteamInstallation ReadSteamInstallation()
         { return new SteamInstallation { SteamPath = Process.SteamPath, SteamSha256 = Digest,
             GamePath = Process.GamePath, GameSha256 = Digest }; }
@@ -282,24 +302,62 @@ static class IntegratedRuntimeTests
                 cold.Identity.Reads >= 3, "first-start missing and partial certificate waits for complete owned identity");
             first.Execute(ChildAgentOperation.StopSunshine, "");
         }
+        var warmDelayed = new Environment(root + "-warm-delayed") { ListenerDelay = 3 };
+        using (var worker = new ChildAgentRuntime(child, 1, warmDelayed))
+        {
+            Check(worker.Execute(ChildAgentOperation.StartSunshine, "").Contains("SunshineReady") &&
+                warmDelayed.ListenerReads >= 4,
+                "existing certificate waits for its own delayed pairing listener");
+            worker.Execute(ChildAgentOperation.StopSunshine, "");
+        }
         var replaced = new Environment(root + "-replaced");
         replaced.Identity.ChangeAfterFirstRead = true;
         using (var first = new ChildAgentRuntime(child, 1, replaced))
+        {
             Reject(() => first.Execute(ChildAgentOperation.StartSunshine, ""),
                 "existing certificate replacement is rejected before pairing");
+            Check(first.Execute(ChildAgentOperation.Status, "").Contains("Uncertain"),
+                "failed startup remains observable without allowing a second launch");
+            Reject(() => first.Execute(ChildAgentOperation.StartSunshine, ""),
+                "failed startup cannot duplicate the owned process");
+            Check(first.Execute(ChildAgentOperation.RecoverSunshine, "").Contains("NoSunshine") &&
+                replaced.Process.Stops == 1 && replaced.Resolved == 1,
+                "exact failed-start process can be stopped and reconciled through the agent");
+            replaced.Identity.ChangeAfterFirstRead = false;
+            Check(first.Execute(ChildAgentOperation.StartSunshine, "").Contains("SunshineReady"),
+                "reconciled failed start can be retried in the same child generation");
+            first.Execute(ChildAgentOperation.StopSunshine, "");
+        }
         var exited = new Environment(root + "-exited");
         exited.Identity.MissingReads = 5;
         exited.Identity.DuringRead = read => { if (read == 2) exited.Process.Current = null; };
         using (var first = new ChildAgentRuntime(child, 1, exited))
             Reject(() => first.Execute(ChildAgentOperation.StartSunshine, ""),
                 "owned process exit during first-start certificate wait is rejected");
+        var resumed = new Environment(root + "-resumed");
+        resumed.Intents = 1; resumed.Records = 1;
+        resumed.Process.Current = new ProductProcessIdentity { Pid = 120, SessionId = 2,
+            StartTimeUtcTicks = 5000, ExecutablePath = resumed.Process.Path,
+            ExecutableSha256 = Digest };
+        resumed.LastStarted = resumed.Process.Current;
+        using (var worker = new ChildAgentRuntime(child, 1, resumed))
+        {
+            Check(worker.Execute(ChildAgentOperation.Status, "").Contains("Uncertain"),
+                "new agent exposes previously interrupted exact start instead of reporting no runtime");
+            Reject(() => worker.Execute(ChildAgentOperation.StartSunshine, ""),
+                "new agent never duplicates an interrupted prior process");
+            Check(worker.Execute(ChildAgentOperation.RecoverSunshine, "").Contains("NoSunshine") &&
+                resumed.Process.Stops == 1 && resumed.Resolved == 1,
+                "new agent attaches only the durable exact process for reviewed recovery");
+        }
         var never = new Environment(root + "-never");
         never.Identity.MissingReads = 100;
         using (var first = new ChildAgentRuntime(child, 1, never))
             Reject(() => first.Execute(ChildAgentOperation.StartSunshine, ""),
                 "first-start identity never appearing reaches a bounded failure");
         var lan = new Environment(root + "-lan");
-        using (var worker = new ChildAgentRuntime(child, 1, lan))
+        var monitor = new ManualMonitor();
+        using (var worker = new ChildAgentRuntime(child, 1, lan, monitor))
         {
             string lanSelection = "{\"display\":\"{6b4f23ba-ef14-45ab-9c90-5d6c8f859f24}\"," +
                 "\"audio\":\"{child-audio}\",\"address\":\"192.168.50.10\"}";
@@ -309,15 +367,66 @@ static class IntegratedRuntimeTests
             lan.LanApproved = true;
             string observed = worker.Execute(ChildAgentOperation.StartSunshineLan, lanSelection);
             Check(observed.Contains("192.168.50.10:48089") && observed.Contains("ScopedRulesVerified") &&
-                lan.Process.Starts == 1, "real child runtime uses admitted LAN address and distinct GameStream port");
+                lan.Process.Starts == 1 && monitor.Starts == 1,
+                "real child runtime uses admitted LAN address and starts agent-side monitor");
             lan.LanApproved = false;
-            Check(worker.Execute(ChildAgentOperation.Status, "").Contains("SunshineBoundaryLost"),
-                "LAN rule drift removes readiness while retaining exact-stop access");
+            monitor.Fire(); // No UI command or poll triggers this transition.
+            Check(worker.Execute(ChildAgentOperation.Status, "").Contains("SunshineWithdrawn") &&
+                lan.Process.Stops == 1 && lan.Resolved == 1,
+                "idle agent withdraws exact owned LAN Sunshine when boundary is lost");
             Reject(() => worker.Execute(ChildAgentOperation.PairingGet, ""),
                 "LAN rule drift blocks authenticated pairing operations");
-            worker.Execute(ChildAgentOperation.StopSunshine, "");
-            Check(lan.Process.UnrelatedTouched == 0 && lan.Resolved == 1,
-                "exact owned Sunshine can stop after LAN admission drift");
+            Check(lan.Process.UnrelatedTouched == 0 && monitor.Tick == null,
+                "boundary withdrawal stops monitoring and never touches unrelated processes");
+        }
+        var reusedLan = new Environment(root + "-reused-lan") { LanApproved = true };
+        var reusedMonitor = new ManualMonitor();
+        using (var worker = new ChildAgentRuntime(child, 1, reusedLan, reusedMonitor))
+        {
+            string chosen = "{\"display\":\"{6b4f23ba-ef14-45ab-9c90-5d6c8f859f24}\"," +
+                "\"audio\":\"{child-audio}\",\"address\":\"192.168.50.10\"}";
+            worker.Execute(ChildAgentOperation.StartSunshineLan, chosen);
+            ProductProcessIdentity old = reusedLan.Process.Current;
+            reusedLan.Process.Current = new ProductProcessIdentity { Pid = old.Pid, SessionId = old.SessionId,
+                StartTimeUtcTicks = old.StartTimeUtcTicks + 1, ExecutablePath = old.ExecutablePath,
+                ExecutableSha256 = old.ExecutableSha256 };
+            reusedLan.LanApproved = false;
+            reusedMonitor.Fire();
+            Check(worker.Execute(ChildAgentOperation.Status, "").Contains("Uncertain") &&
+                reusedLan.Process.Stops == 0 && reusedLan.Resolved == 0 &&
+                reusedLan.UncertainRecords == 1,
+                "idle boundary loss with PID reuse latches uncertainty and preserves records");
+            Reject(() => worker.Execute(ChildAgentOperation.RecoverSunshine, ""),
+                "recovery cannot stop a reused Sunshine PID");
+            Check(reusedLan.Process.UnrelatedTouched == 0,
+                "boundary monitor never closes an unrelated reused process");
+        }
+        var transition = new Environment(root + "-transition");
+        using (var worker = new ChildAgentRuntime(child, 1, transition, new ManualMonitor()))
+        {
+            var host = new Bootstrap(worker, child, agentPath);
+            var app = new ChildAgentController(host, 1, child, agentPath, Digest);
+            app.Start(request);
+            var journey = new ChildStreamingJourney(app, child);
+            Check(journey.Start("", false).ManualAddress == "127.0.0.1:48089",
+                "normal application establishes local child-owned pairing runtime");
+            Check(journey.Start("", false).ManualAddress == "127.0.0.1:48089" &&
+                transition.Process.Starts == 1,
+                "repeat local action reuses the exact verified runtime without a duplicate process");
+            transition.LanApproved = true;
+            string chosen = "{\"display\":\"{6b4f23ba-ef14-45ab-9c90-5d6c8f859f24}\"," +
+                "\"audio\":\"{child-audio}\",\"address\":\"192.168.50.10\"}";
+            Check(journey.Start(chosen, true).ManualAddress == "192.168.50.10:48089" &&
+                transition.Process.Starts == 2 && transition.Process.Stops == 1 &&
+                transition.Identity.Credentials,
+                "app switches exact owned local process to approved LAN without recreating child or pairing identity");
+            Check(journey.Start(chosen, true).ManualAddress == "192.168.50.10:48089" &&
+                transition.Process.Starts == 2,
+                "repeat approved LAN action reuses the exact verified runtime");
+            journey.Stop();
+            Check(transition.Process.Stops == 2 && transition.Process.UnrelatedTouched == 0,
+                "normal application stops only its exact second Sunshine process");
+            app.Stop();
         }
         var multiple = new Environment(root + "-multiple") { MultipleDevices = true };
         using (var worker = new ChildAgentRuntime(child, 1, multiple))
@@ -391,7 +500,7 @@ static class IntegratedRuntimeTests
         string temporary = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar) +
             Path.DirectorySeparatorChar + "ChildStreamIntegrated-";
         foreach (string fixture in new [] { root, root + "-cold", root + "-replaced", root + "-exited",
-            root + "-never", root + "-lan", root + "-multiple", root + "-delayed", root + "-vanished", root + "-reused", root + "-interrupted" })
+            root + "-never", root + "-warm-delayed", root + "-resumed", root + "-lan", root + "-reused-lan", root + "-transition", root + "-multiple", root + "-delayed", root + "-vanished", root + "-reused", root + "-interrupted" })
         { if (!Path.GetFullPath(fixture).StartsWith(temporary, StringComparison.OrdinalIgnoreCase))
               throw new InvalidOperationException("Fixture cleanup escaped ChildStream temp root.");
           if (Directory.Exists(fixture)) Directory.Delete(fixture, true); }

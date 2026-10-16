@@ -19,8 +19,9 @@ internal sealed class LanFirewallRule
 internal sealed class LanFirewallObservation
 {
     internal string LocalAddress, RemoteSubnet, NetworkIdentity;
-    internal bool PhysicalInterfaceUp, PrivateProfileActive, FirewallEnabled, DefaultInboundBlocked, Complete;
-    internal int ForeignAllowRules;
+    internal bool PhysicalInterfaceUp, PrivateProfileActive, FirewallEnabled, DefaultInboundBlocked,
+        LocalRulesEffective, InterfaceFirewallApplies, Complete;
+    internal int ForeignAllowRules, ConflictingBlockRules;
     internal readonly List<LanFirewallRule> OwnedRules = new List<LanFirewallRule>();
 }
 internal interface ILanFirewallHost
@@ -65,7 +66,9 @@ internal sealed class LanFirewallTransaction
     {
         if (state == null || !state.Complete || !state.PhysicalInterfaceUp ||
             !state.PrivateProfileActive || !state.FirewallEnabled || !state.DefaultInboundBlocked ||
-            state.ForeignAllowRules != 0 || state.OwnedRules.Count != 0 ||
+            !state.LocalRulesEffective || !state.InterfaceFirewallApplies ||
+            state.ForeignAllowRules != 0 || state.ConflictingBlockRules != 0 ||
+            state.OwnedRules.Count != 0 ||
             !String.Equals(state.LocalAddress, address, StringComparison.Ordinal) ||
             String.IsNullOrEmpty(state.RemoteSubnet) || String.IsNullOrEmpty(state.NetworkIdentity))
             throw new InvalidOperationException("Connected LAN exposure baseline is incomplete, changed, or already permissive.");
@@ -174,7 +177,9 @@ internal sealed class LanFirewallTransaction
             return false;
         LanFirewallObservation state = host.Read(address, family, executable);
         return state != null && state.Complete && state.PhysicalInterfaceUp && state.PrivateProfileActive &&
-            state.FirewallEnabled && state.DefaultInboundBlocked && state.ForeignAllowRules == 0 &&
+            state.FirewallEnabled && state.DefaultInboundBlocked && state.LocalRulesEffective &&
+            state.InterfaceFirewallApplies && state.ForeignAllowRules == 0 &&
+            state.ConflictingBlockRules == 0 &&
             state.NetworkIdentity == plan.NetworkIdentity && state.RemoteSubnet == plan.Subnet &&
             state.OwnedRules.Count == 2 && state.OwnedRules.Any(r => Exact(r, plan.Tcp)) &&
             state.OwnedRules.Any(r => Exact(r, plan.Udp));

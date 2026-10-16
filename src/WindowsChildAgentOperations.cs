@@ -22,11 +22,21 @@ internal sealed class WindowsChildAgentOperations : IChildAgentOperations
 
 internal sealed class WindowsChildRuntimeEnvironment : IChildRuntimeEnvironment
 {
-    private readonly WindowsProductProcessHost processes = new WindowsProductProcessHost();
+    private readonly IProductProcessHost processes;
     private readonly string root;
     private readonly string sunshine;
+#if TEST_ONLY
+    private readonly string testSunshine;
+    internal WindowsChildRuntimeEnvironment(string testRoot, string testExecutable,
+        IProductProcessHost testProcesses)
+    {
+        root = testRoot; sunshine = testExecutable; testSunshine = testExecutable;
+        processes = testProcesses;
+    }
+#endif
     internal WindowsChildRuntimeEnvironment()
     {
+        processes = new WindowsProductProcessHost();
         string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         if (!Path.IsPathRooted(local)) throw new InvalidOperationException("ChildStream user data location is unavailable.");
         root = Path.Combine(local, "ChildStream");
@@ -38,6 +48,9 @@ internal sealed class WindowsChildRuntimeEnvironment : IChildRuntimeEnvironment
     {
         get
         {
+#if TEST_ONLY
+            if (testSunshine != null) return testSunshine;
+#endif
             if (!File.Exists(sunshine)) throw new FileNotFoundException("ChildStream-owned portable Sunshine is not installed.", sunshine);
             string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
             string trustedRoot = Path.Combine(programFiles, "ChildStream") + Path.DirectorySeparatorChar;
@@ -92,7 +105,8 @@ internal sealed class WindowsChildRuntimeEnvironment : IChildRuntimeEnvironment
     }
     public string EnsureGenerationFile(ChildSessionIdentity child, string name, string content)
     {
-        if (name != "apps.json" && name != "sunshine.conf" && name != "sunshine-discovery.conf")
+        if (name != "apps.json" && name != "sunshine.conf" && name != "sunshine-lan.conf" &&
+            name != "sunshine-discovery.conf")
             throw new InvalidOperationException("Child generation file is outside the fixed allowlist.");
         string path = Path.Combine(SessionRoot(child), name);
         InstallerPolicy.ValidateCanonicalFilePath(path);
@@ -196,6 +210,21 @@ internal sealed class WindowsChildRuntimeEnvironment : IChildRuntimeEnvironment
         using (var stream = new FileStream(file, FileMode.CreateNew, FileAccess.Write, FileShare.None))
         { stream.Write(bytes, 0, bytes.Length); stream.Flush(true); }
     }
+    public bool HasUnresolvedStartIntent(ChildSessionIdentity child)
+    {
+        string session = SessionRoot(child);
+        string intent = Path.Combine(session, "start.intent");
+        string record = Path.Combine(session, "started.record");
+        if (!File.Exists(intent))
+        {
+            if (File.Exists(record)) throw new InvalidDataException("Orphan Sunshine start record requires review.");
+            return false;
+        }
+        if (new FileInfo(intent).Length > 64 ||
+            File.ReadAllText(intent) != child.SessionId + "|" + child.LogonTime)
+            throw new InvalidDataException("Sunshine start intent is incomplete or changed.");
+        return true;
+    }
     public void ResolveStopped(ChildSessionIdentity child, ProductProcessIdentity process)
     {
         string session = SessionRoot(child);
@@ -205,6 +234,44 @@ internal sealed class WindowsChildRuntimeEnvironment : IChildRuntimeEnvironment
             File.ReadAllText(intent) != child.SessionId + "|" + child.LogonTime)
             throw new InvalidOperationException("Owned Sunshine stop record or process state changed.");
         File.Delete(record); File.Delete(intent);
+    }
+    public ProductProcessIdentity ReadStarted(ChildSessionIdentity child)
+    {
+        string session = SessionRoot(child);
+        string record = Path.Combine(session, "started.record");
+        string intent = Path.Combine(session, "start.intent");
+        if (!File.Exists(record)) return null;
+        if (new FileInfo(record).Length > 256 ||
+            File.ReadAllText(intent) != child.SessionId + "|" + child.LogonTime)
+            throw new InvalidDataException("Sunshine recovery intent or record changed.");
+        string[] fields = File.ReadAllText(record).Split('|');
+        int pid; long started;
+        if (fields.Length != 5 || fields[0] != child.SessionId.ToString() ||
+            fields[1] != child.LogonTime.ToString() ||
+            !Int32.TryParse(fields[2], out pid) || pid <= 0 ||
+            !Int64.TryParse(fields[3], out started) || started <= 0 ||
+            !String.Equals(fields[4], SunshineReleasePin.ExecutableSha256,
+                StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("Sunshine recovery record is not the exact child process.");
+        var observed = new ProductProcessIdentity { Pid = pid, SessionId = (int)child.SessionId,
+            StartTimeUtcTicks = started, ExecutablePath = SunshineExecutable,
+            ExecutableSha256 = SunshineReleasePin.ExecutableSha256 };
+        if (File.ReadAllText(record) != RecordText(child, observed))
+            throw new InvalidDataException("Sunshine recovery record is noncanonical.");
+        return observed;
+    }
+    public void ResolveFailedStart(ChildSessionIdentity child, ProductProcessIdentity process)
+    {
+        if (process == null) throw new InvalidOperationException("Exact failed-start process identity is required.");
+        string session = SessionRoot(child);
+        string record = Path.Combine(session, "started.record");
+        string intent = Path.Combine(session, "start.intent");
+        if (processes.Read(process.Pid) != null ||
+            File.ReadAllText(intent) != child.SessionId + "|" + child.LogonTime ||
+            (File.Exists(record) && File.ReadAllText(record) != RecordText(child, process)))
+            throw new InvalidOperationException("Failed-start process or durable record cannot be reconciled.");
+        if (File.Exists(record)) File.Delete(record);
+        File.Delete(intent);
     }
     public SteamInstallation ReadSteamInstallation()
     { return WindowsSteamDiscovery.ReadInstallation(); }
@@ -272,7 +339,8 @@ internal sealed class WindowsChildRuntimeEnvironment : IChildRuntimeEnvironment
     public void RecordRuntimeUncertainty(ChildSessionIdentity child, string reason)
     {
         if (reason != "SteamStartUnknown" && reason != "GameRequestUnknown" &&
-            reason != "SteamStopUnknown" && reason != "AgentExitWithSteamUnknown")
+            reason != "SteamStopUnknown" && reason != "AgentExitWithSteamUnknown" &&
+            reason != "LanWithdrawalUnknown")
             throw new InvalidOperationException("Unrecognized runtime uncertainty.");
         string path = StateFile(child, "runtime.uncertain");
         if (!File.Exists(path)) CreateDurable(path, ChildText(child) + "|" + reason);

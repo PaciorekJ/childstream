@@ -24,6 +24,84 @@ public class RdpBox : AxHost
     public object Ocx { get { return GetOcx(); } }
 }
 
+internal static class StreamingActionBar
+{
+    internal static ToolStrip Create(params ToolStripMenuItem[] actions)
+    {
+        var bar = new ToolStrip { Dock = DockStyle.Top, GripStyle = ToolStripGripStyle.Hidden,
+            AccessibleName = "ChildStream guided streaming actions" };
+        foreach (ToolStripMenuItem action in actions)
+        {
+            ToolStripMenuItem selected = action;
+            var button = new ToolStripButton(action.Text) { Enabled = action.Enabled,
+                ToolTipText = action.Text, DisplayStyle = ToolStripItemDisplayStyle.Text };
+            selected.EnabledChanged += (s, e) => button.Enabled = selected.Enabled;
+            button.Click += (s, e) => selected.PerformClick();
+            bar.Items.Add(button);
+        }
+        return bar;
+    }
+}
+
+internal sealed class ChildStreamGuideForm : Form
+{
+    private readonly Func<string> currentStatus;
+    private readonly Label status;
+    private readonly ToolStripMenuItem[] actions;
+    private readonly Button[] buttons;
+    private readonly Timer refresh;
+    internal ChildStreamGuideForm(Func<string> currentStatus, ToolStripMenuItem[] actions,
+        bool simulated = false)
+    {
+        if (currentStatus == null || actions == null || actions.Length != 8)
+            throw new ArgumentException("Eight guided ChildStream actions are required.");
+        this.currentStatus = currentStatus; this.actions = actions;
+        Text = simulated ? "ChildStream guided play — simulated" : "ChildStream guided play";
+        Width = 670; Height = 600; MinimumSize = new Size(620, 550);
+        AutoScroll = true; StartPosition = FormStartPosition.CenterParent;
+        var title = new Label { Left = 20, Top = 18, Width = 610, Height = 32,
+            Font = new Font(SystemFonts.MessageBoxFont, FontStyle.Bold),
+            Text = "Set up, stream, and recover the child desktop" };
+        status = new Label { Left = 20, Top = 56, Width = 610, Height = 54,
+            BorderStyle = BorderStyle.FixedSingle };
+        var instructions = new [] {
+            "1. Review the separate Windows setup plan. Feature changes need approval.",
+            "2. Start ChildStream Sunshine in the verified child session.",
+            "3. Approve a scoped LAN plan, then switch to the phone/TV address.",
+            "4. Open Moonlight on the phone or Fire TV and approve its PIN here.",
+            "5. Start Steam Big Picture only after the child stream is verified.",
+            "6. Request Minecraft Dungeons and observe it in the child session.",
+            "Stop only ChildStream-owned streaming. The child desktop stays open.",
+            "If startup failed, reconcile the exact owned process before retrying." };
+        var shortNames = new [] { "Review setup", "Start local", "Switch to LAN",
+            "Pair Moonlight", "Start Steam", "Launch game", "Stop streaming", "Recover start" };
+        buttons = new Button[8];
+        for (int i = 0; i < actions.Length; i++)
+        {
+            int row = i;
+            int top = 122 + i * 51;
+            var label = new Label { Left = 20, Top = top, Width = 408, Height = 40,
+                Text = instructions[i] };
+            var button = new Button { Left = 444, Top = top + 2, Width = 185,
+                Height = 34, Text = shortNames[i], Enabled = actions[i].Enabled };
+            button.Click += (s, e) => this.actions[row].PerformClick();
+            buttons[i] = button;
+            Controls.Add(label); Controls.Add(button);
+        }
+        Controls.Add(title); Controls.Add(status);
+        RefreshState();
+        refresh = new Timer { Interval = 1000 };
+        refresh.Tick += (s, e) => RefreshState();
+        Shown += (s, e) => refresh.Start();
+        FormClosed += (s, e) => { refresh.Stop(); refresh.Dispose(); };
+    }
+    internal void RefreshState()
+    {
+        status.Text = currentStatus();
+        for (int i = 0; i < actions.Length; i++) buttons[i].Enabled = actions[i].Enabled;
+    }
+}
+
 static class Program
 {
     [DllImport("wtsapi32.dll", SetLastError = true)]
@@ -255,6 +333,10 @@ static class Program
         statusBar.Items.Add(statusText);
         var menu = new ContextMenuStrip();
         menu.Items.Add("Show", null, (s, e) => { f.Show(); f.WindowState = FormWindowState.Normal; f.Activate(); });
+        var setupItem = new ToolStripMenuItem("Review Windows setup…");
+        menu.Items.Add(setupItem);
+        setupItem.Click += (s, e) =>
+        { using (var dialog = new SetupDialog(new WindowsSetupWorkflow())) dialog.ShowDialog(f); };
         ToolStripMenuItem reconnectItem = new ToolStripMenuItem("Reconnect now");
         menu.Items.Add(reconnectItem);
         menu.Items.Add("Streaming readiness", null, (s, e) =>
@@ -276,6 +358,9 @@ static class Program
         menu.Items.Add(sunshineItem);
         var lanSunshineItem = new ToolStripMenuItem("Start Sunshine on approved LAN…") { Enabled = false };
         menu.Items.Add(lanSunshineItem);
+        var stopSunshineItem = new ToolStripMenuItem("Stop ChildStream streaming") { Enabled = false };
+        var recoverSunshineItem = new ToolStripMenuItem("Recover failed ChildStream start") { Enabled = false };
+        menu.Items.Add(stopSunshineItem); menu.Items.Add(recoverSunshineItem);
         var steamItem = new ToolStripMenuItem("Start Steam Big Picture in child") { Enabled = false };
         var gameItem = new ToolStripMenuItem("Request Minecraft Dungeons in child") { Enabled = false };
         var stopSteamItem = new ToolStripMenuItem("Stop exact owned child Steam/game") { Enabled = false };
@@ -312,10 +397,13 @@ static class Program
                     Convert.ToString(observed["stage"]) == "SunshineBoundaryLost" ||
                     Convert.ToString(observed["stage"]) == "SunshineLost")
                     await Task.Run(() => selected.Execute(ChildAgentOperation.StopSunshine, ""));
+                if (Convert.ToString(observed["stage"]) == "Uncertain")
+                    throw new InvalidOperationException("Resolve exact owned runtime uncertainty before closing the agent.");
                 await Task.Run(() => selected.Stop());
                 if (agentHost != null) agentHost.Dispose();
                 agentHost = null; agent = null; pairingCoordinator = null;
                 pairItem.Enabled = false; sunshineItem.Enabled = false; lanSunshineItem.Enabled = false;
+                stopSunshineItem.Enabled = false; recoverSunshineItem.Enabled = false;
                 steamItem.Enabled = false; gameItem.Enabled = false; stopSteamItem.Enabled = false;
                 statusText.Text = "Child agent and owned Sunshine stopped. Child desktop remains available.";
                 return true;
@@ -377,6 +465,8 @@ static class Program
         var rdp = new RdpBox { Dock = DockStyle.Fill };
         f.Controls.Add(rdp);
         f.Controls.Add(statusBar);
+        f.Controls.Add(StreamingActionBar.Create(setupItem, sunshineItem, lanSunshineItem,
+            pairItem, steamItem, gameItem, stopSunshineItem, recoverSunshineItem));
         rdp.CreateControl();
         ocx = rdp.Ocx;
 
@@ -418,6 +508,7 @@ static class Program
                     agentHost = task.Result.Item1; agent = task.Result.Item2;
                     sunshineItem.Enabled = true;
                     lanSunshineItem.Enabled = true;
+                    recoverSunshineItem.Enabled = false;
                     statusText.Text = "Limited child agent verified. Start ChildStream Sunshine when ready.";
                 }));
             });
@@ -427,6 +518,8 @@ static class Program
             if (agent == null || lifecycle.State != ChildLifecycleState.Connected ||
                 !lifecycle.CheckConnectedIdentity()) return;
             sunshineItem.Enabled = false; lanSunshineItem.Enabled = false;
+            stopSunshineItem.Enabled = false; recoverSunshineItem.Enabled = false;
+            pairItem.Enabled = false; pairingCoordinator = null;
             statusText.Text = "Reading child display and audio choices…";
             bool started = false;
             try
@@ -443,15 +536,12 @@ static class Program
                 }
                 string selection = catalog.SelectionPayload(selectedDisplay, selectedAudio, address);
                 statusText.Text = "Verifying selected child devices and starting owned Sunshine…";
-                await Task.Run(() => selectedAgent.Execute(address == null ?
-                    ChildAgentOperation.StartSunshine : ChildAgentOperation.StartSunshineLan,
-                    selection));
+                var journey = new ChildStreamingJourney(selectedAgent, lifecycle.ObservedChild.Value);
+                var runtime = await Task.Run(() => journey.Start(selection, address != null));
                 started = true;
-                var runtime = new VerifiedAgentSunshine(selectedAgent, lifecycle.ObservedChild.Value);
-                await Task.Run(() => runtime.AssertStillOwned());
                 pairingCoordinator = new MoonlightPairingCoordinator(runtime,
                     new AgentSunshinePairingApi(selectedAgent));
-                pairItem.Enabled = true;
+                pairItem.Enabled = true; stopSunshineItem.Enabled = true;
                 steamItem.Enabled = true;
                 statusText.Text = address == null
                     ? "ChildStream Sunshine verified locally. Select approved LAN streaming for phone or Fire TV."
@@ -459,14 +549,57 @@ static class Program
             }
             catch (Exception ex)
             { statusText.Text = "ChildStream Sunshine unavailable: " + ex.Message; Log(statusText.Text); }
-            finally { sunshineItem.Enabled = lanSunshineItem.Enabled =
-                !started && agent != null && agent.Stage == ChildAgentStage.Ready; }
+            finally
+            {
+                if (started)
+                { sunshineItem.Enabled = false; lanSunshineItem.Enabled = address == null;
+                  recoverSunshineItem.Enabled = false; }
+                else if (agent != null && agent.Stage == ChildAgentStage.Ready)
+                {
+                    try
+                    {
+                        string current = agent.Execute(ChildAgentOperation.Status, "");
+                        bool uncertainRuntime = current.Contains("\"stage\":\"Uncertain\"");
+                        recoverSunshineItem.Enabled = uncertainRuntime;
+                        sunshineItem.Enabled = lanSunshineItem.Enabled = !uncertainRuntime;
+                    }
+                    catch { recoverSunshineItem.Enabled = true; }
+                }
+            }
         };
         sunshineItem.Click += async (s, e) => await startOwnedSunshine(null);
         lanSunshineItem.Click += async (s, e) =>
         {
             string address = PromptLanAddress(f);
             if (address != null) await startOwnedSunshine(address);
+        };
+        stopSunshineItem.Click += async (s, e) =>
+        {
+            if (agent == null || !lifecycle.CheckConnectedIdentity()) return;
+            stopSunshineItem.Enabled = false; pairItem.Enabled = false; pairingCoordinator = null;
+            try
+            {
+                var journey = new ChildStreamingJourney(agent, lifecycle.ObservedChild.Value);
+                await Task.Run(() => journey.Stop());
+                sunshineItem.Enabled = lanSunshineItem.Enabled = true;
+                statusText.Text = "Exact owned Sunshine stopped; child desktop remains connected.";
+            }
+            catch (Exception ex)
+            { recoverSunshineItem.Enabled = true; statusText.Text = "Streaming stop needs recovery: " + ex.Message; }
+        };
+        recoverSunshineItem.Click += async (s, e) =>
+        {
+            if (agent == null || !lifecycle.CheckConnectedIdentity()) return;
+            recoverSunshineItem.Enabled = false;
+            try
+            {
+                var journey = new ChildStreamingJourney(agent, lifecycle.ObservedChild.Value);
+                await Task.Run(() => journey.RecoverFailedStart());
+                sunshineItem.Enabled = lanSunshineItem.Enabled = true;
+                statusText.Text = "Exact failed start reconciled; choose streaming posture again.";
+            }
+            catch (Exception ex)
+            { recoverSunshineItem.Enabled = true; statusText.Text = "Recovery requires review: " + ex.Message; }
         };
         steamItem.Click += async (s, e) =>
         {
@@ -505,6 +638,19 @@ static class Program
             catch (Exception ex)
             { statusText.Text = "Child Steam stop uncertain: " + ex.Message; Log(statusText.Text); stopSteamItem.Enabled = true; }
         };
+
+        ChildStreamGuideForm guide = null;
+        var guideItem = new ToolStripMenuItem("Guided steps…");
+        guideItem.Click += (s, e) =>
+        {
+            if (guide == null || guide.IsDisposed)
+                guide = new ChildStreamGuideForm(() => statusText.Text,
+                    new[] { setupItem, sunshineItem, lanSunshineItem, pairItem,
+                        steamItem, gameItem, stopSunshineItem, recoverSunshineItem });
+            guide.Show(f); guide.BringToFront();
+        };
+        menu.Items.Insert(1, guideItem);
+        f.BeginInvoke((Action)(() => guideItem.PerformClick()));
 
         int last = -1;
         DateTime lastAttempt = DateTime.MinValue;
@@ -582,6 +728,7 @@ static class Program
             catch (Exception ex) { lifecycle.UnrecoverableError(); Log("reconnect: " + ex.Message); MessageBox.Show(ex.Message, "ChildStream"); }
         };
 
+        bool runtimePollPending = false;
         var timer = new Timer { Interval = 2000 };
         timer.Tick += delegate
         {
@@ -628,6 +775,48 @@ static class Program
                 {
                     reconnectItem.Enabled = false;
                     signOutItem.Enabled = false;
+                }
+                if (state == 1 && lifecycle.State == ChildLifecycleState.Connected &&
+                    agent != null && !runtimePollPending)
+                {
+                    runtimePollPending = true;
+                    ChildAgentController selectedAgent = agent;
+                    Task.Run(() => selectedAgent.Execute(ChildAgentOperation.Status, ""))
+                        .ContinueWith(task =>
+                    {
+                        if (f.IsDisposed) return;
+                        f.BeginInvoke((Action)(() =>
+                        {
+                            runtimePollPending = false;
+                            if (agent != selectedAgent || lifecycle.State != ChildLifecycleState.Connected) return;
+                            if (task.IsFaulted || task.IsCanceled)
+                            {
+                                pairItem.Enabled = false; pairingCoordinator = null;
+                                stopSunshineItem.Enabled = false; recoverSunshineItem.Enabled = true;
+                                statusText.Text = "Child runtime status uncertain; review exact owned recovery.";
+                                return;
+                            }
+                            var observed = new JavaScriptSerializer().DeserializeObject(task.Result) as
+                                System.Collections.Generic.Dictionary<string, object>;
+                            object runtimeStage;
+                            if (observed == null || !observed.TryGetValue("stage", out runtimeStage))
+                                return;
+                            if (Convert.ToString(runtimeStage) == "SunshineWithdrawn")
+                            {
+                                pairItem.Enabled = false; pairingCoordinator = null;
+                                stopSunshineItem.Enabled = false;
+                                sunshineItem.Enabled = lanSunshineItem.Enabled = true;
+                                statusText.Text = "LAN boundary changed; child agent stopped its exact Sunshine process. Review LAN setup before restart.";
+                            }
+                            else if (Convert.ToString(runtimeStage) == "Uncertain")
+                            {
+                                pairItem.Enabled = false; pairingCoordinator = null;
+                                sunshineItem.Enabled = lanSunshineItem.Enabled = false;
+                                stopSunshineItem.Enabled = false; recoverSunshineItem.Enabled = true;
+                                statusText.Text = "Child runtime outcome uncertain; exact owned recovery is required.";
+                            }
+                        }));
+                    });
                 }
             }
             catch (Exception ex)

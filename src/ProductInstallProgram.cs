@@ -62,9 +62,37 @@ internal static class ProductInstallProgram
             Path.Combine(root, "versions"), Path.Combine(root, "versions", SunshineReleasePin.Version) })
             SetupInstallTrust.VerifyProtectedAcl(Directory.GetAccessControl(path));
         foreach (string leaf in new[] { "ChildStream.exe", "ChildStreamSetup.exe",
+            "ChildStreamBootstrap.exe",
             "feasibility-inventory.ps1" }) SetupInstallTrust.RequireOwnedPath(leaf);
         string sunshine = Path.Combine(root, "versions", SunshineReleasePin.Version, "sunshine.exe");
         SetupInstallTrust.VerifyProtectedAcl(File.GetAccessControl(sunshine));
+    }
+    private static void WaitForInstalledParent(string value)
+    {
+        int pid;
+        if (!Int32.TryParse(value, out pid) || pid <= 0 || pid == Process.GetCurrentProcess().Id)
+            throw new InvalidDataException("Installed application PID is invalid.");
+        try
+        {
+            using (Process parent = Process.GetProcessById(pid))
+            {
+                if (parent.HasExited) return;
+                string expected = Path.Combine(Root(), "ChildStream.exe");
+                if (!String.Equals(Path.GetFullPath(parent.MainModule.FileName), expected,
+                    StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("Maintenance parent is not the installed ChildStream app.");
+                if (!parent.WaitForExit(120000))
+                    throw new TimeoutException("Installed ChildStream did not exit; no files were reversed.");
+            }
+        }
+        catch (ArgumentException) { } // The exact PID exited before the helper obtained a handle.
+    }
+    private static void ReverseOwnedFiles()
+    {
+        string root = Root();
+        if (File.Exists(Path.Combine(root, "lan-firewall.journal"))) Lan(root, false).Recover();
+        Coordinator(root).RecoverOrUninstall();
+        Console.WriteLine("Exact ChildStream-owned installation bytes reversed. Per-user pairing identity remains.");
     }
     internal static int Main(string[] args)
     {
@@ -73,10 +101,15 @@ internal static class ProductInstallProgram
             if (args.Length == 1 && (args[0] == "-recover" || args[0] == "-uninstall"))
             {
                 RequireAdministratorConsole();
-                string root = Root();
-                if (File.Exists(Path.Combine(root, "lan-firewall.journal"))) Lan(root, false).Recover();
-                Coordinator(root).RecoverOrUninstall();
-                Console.WriteLine("Exact ChildStream-owned installation bytes reversed. Per-user pairing identity remains.");
+                ReverseOwnedFiles();
+                return 0;
+            }
+            if (args.Length == 2 && (args[0] == "-recover-after-parent" ||
+                args[0] == "-uninstall-after-parent"))
+            {
+                RequireAdministratorConsole();
+                WaitForInstalledParent(args[1]);
+                ReverseOwnedFiles();
                 return 0;
             }
             if (args.Length == 1 && args[0] == "-recover-lan")
@@ -126,13 +159,15 @@ internal static class ProductInstallProgram
                     if (!mutation)
                     {
                         Console.WriteLine("ChildStream install plan SHA-256: " + plan.Hash);
-                        Console.WriteLine("Scope: four fixed owned files and pinned portable Sunshine. No Windows feature, task or firewall change.");
+                        Console.WriteLine("Scope: five fixed owned files and pinned portable Sunshine. No Windows feature, task or firewall change.");
                     }
                     else
                     {
                         coordinator.Apply(plan, candidate, archive, args[4]);
                         VerifyInstalledTrust(root);
-                        Console.WriteLine("Protected ChildStream payload installed and exact ACL/hash checks passed.");
+                        Console.WriteLine(args[0] == "-repair"
+                            ? "Committed ChildStream payload verified intact. Missing or changed owned files require reviewed recovery and a new plan."
+                            : "Protected ChildStream payload installed and exact ACL/hash checks passed.");
                     }
                 }
                 return 0;

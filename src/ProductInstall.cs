@@ -12,7 +12,7 @@ internal sealed class ProductInstallPayload
 {
     internal readonly Dictionary<string, byte[]> Files = new Dictionary<string, byte[]>(StringComparer.Ordinal);
     internal static readonly string[] InstalledFiles = {
-        "bin/ChildStream.exe", "bin/ChildStreamSetup.exe",
+        "bin/ChildStream.exe", "bin/ChildStreamSetup.exe", "bin/ChildStreamBootstrap.exe",
         "bin/ChildStreamFeasibilityProbe.exe", "scripts/feasibility-inventory.ps1"
     };
     internal static ProductInstallPayload ReadCandidate(string zipPath, string approvedSha256)

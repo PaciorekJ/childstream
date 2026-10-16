@@ -93,6 +93,7 @@ internal enum ChildAgentStage { Idle, StartRequested, Ready, ExitRequested, Ende
 
 internal sealed class ChildAgentController
 {
+    private readonly object commandGate = new object();
     private readonly IChildBootstrapHost host;
     private readonly uint parentSessionId;
     private readonly ChildSessionIdentity child;
@@ -131,6 +132,8 @@ internal sealed class ChildAgentController
     }
 
     internal void Start(ChildAgentRequest request)
+    { lock (commandGate) StartLocked(request); }
+    private void StartLocked(ChildAgentRequest request)
     {
         if (Stage != ChildAgentStage.Idle) throw new InvalidOperationException("Agent start is already resolved or uncertain.");
         request.Validate();
@@ -157,6 +160,8 @@ internal sealed class ChildAgentController
     }
 
     internal bool Reconcile()
+    { lock (commandGate) return ReconcileLocked(); }
+    private bool ReconcileLocked()
     {
         if (Stage != ChildAgentStage.Ready || agent == null) return false;
         try
@@ -171,8 +176,10 @@ internal sealed class ChildAgentController
     }
 
     internal string Execute(ChildAgentOperation operation, string payload)
+    { lock (commandGate) return ExecuteLocked(operation, payload); }
+    private string ExecuteLocked(ChildAgentOperation operation, string payload)
     {
-        if (!Reconcile()) throw new InvalidOperationException("A verified child agent is required for runtime operation.");
+        if (!ReconcileLocked()) throw new InvalidOperationException("A verified child agent is required for runtime operation.");
         var commands = host as IChildAgentCommandHost;
         if (commands == null) throw new InvalidOperationException("This host has no authenticated child command channel.");
         try { return commands.Exchange(operation, payload, operation == ChildAgentOperation.PairingPost ? 30000 : 15000); }
@@ -181,8 +188,10 @@ internal sealed class ChildAgentController
     }
 
     internal void Stop()
+    { lock (commandGate) StopLocked(); }
+    private void StopLocked()
     {
-        if (!Reconcile()) throw new InvalidOperationException("Exact running child agent is required for stop.");
+        if (!ReconcileLocked()) throw new InvalidOperationException("Exact running child agent is required for stop.");
         Stage = ChildAgentStage.ExitRequested;
         try
         {

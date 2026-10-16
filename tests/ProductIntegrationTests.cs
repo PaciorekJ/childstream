@@ -15,6 +15,7 @@ internal static class ProductIntegrationTests
     private static void Reject(Action action, string label)
     { bool rejected = false; try { action(); } catch (InvalidDataException) { rejected = true; }
       catch (InvalidOperationException) { rejected = true; }
+      catch (FileNotFoundException) { rejected = true; }
       Check(rejected, label); }
 
     private sealed class FakeProcesses : IProductProcessHost
@@ -117,6 +118,44 @@ internal static class ProductIntegrationTests
         option.Child = new ChildSessionIdentity(2, 123);
         option.OwnedRoot = Path.Combine(root, "native-sunshine-config");
         Reject(() => ChildProductConfiguration.BuildSunshine(option), "native config path rejected");
+    }
+
+    private static void SunshineRecoveryRecords(string root)
+    {
+        string data = Path.Combine(root, "recovery-records", "ChildStream");
+        var child = new ChildSessionIdentity(2, 123);
+        string session = Path.Combine(data, "sessions", "2-123");
+        Directory.CreateDirectory(session);
+        var processes = new FakeProcesses { CurrentSessionId = 2 };
+        string executable = Path.Combine(root, "fake-owned", "sunshine.exe");
+        var environment = new WindowsChildRuntimeEnvironment(data, executable, processes);
+        var exact = new ProductProcessIdentity { Pid = 120, SessionId = 2,
+            StartTimeUtcTicks = 54321, ExecutablePath = executable,
+            ExecutableSha256 = SunshineReleasePin.ExecutableSha256 };
+        environment.RecordStartIntent(child); environment.RecordStarted(child, exact);
+        Check(environment.HasUnresolvedStartIntent(child),
+            "production record store exposes interrupted start intent after restart");
+        var loaded = environment.ReadStarted(child);
+        Check(loaded.Pid == exact.Pid && loaded.StartTimeUtcTicks == exact.StartTimeUtcTicks &&
+            loaded.ExecutableSha256 == exact.ExecutableSha256,
+            "production durable record store reloads exact Sunshine identity from temporary files");
+        processes.Current = new ProductProcessIdentity { Pid = exact.Pid, SessionId = 2,
+            StartTimeUtcTicks = 88888, ExecutablePath = executable,
+            ExecutableSha256 = SunshineReleasePin.ExecutableSha256 };
+        Reject(() => environment.ResolveFailedStart(child, exact),
+            "reused PID blocks failed-start record reconciliation");
+        processes.Current = null;
+        environment.ResolveFailedStart(child, loaded);
+        Check(!File.Exists(Path.Combine(session, "start.intent")) &&
+            !File.Exists(Path.Combine(session, "started.record")),
+            "verified absent exact failed start removes only its own intent and record");
+        Check(!environment.HasUnresolvedStartIntent(child), "reconciled start no longer blocks a new launch");
+        environment.RecordStartIntent(child);
+        File.WriteAllText(Path.Combine(session, "started.record"), "partial");
+        Reject(() => environment.ReadStarted(child),
+            "partial durable process record cannot become recovery authority");
+        Reject(() => environment.ResolveFailedStart(child, exact),
+            "partial record is preserved rather than silently deleted");
     }
 
     private static void Processes(string root)
@@ -380,6 +419,19 @@ internal static class ProductIntegrationTests
             var committed = install.PlanCommitted(payload, archive, new FileJournalStore(journal).Load());
             Check(committed.Hash == plan.Hash, "reviewed repair retains exact committed plan");
             install.Apply(committed, payload, archive, committed.Hash);
+            string missingOwned = Path.Combine(root, "ChildStreamSetup.exe");
+            File.Delete(missingOwned);
+            Reject(() => install.Apply(committed, payload, archive, committed.Hash),
+                "verify-only repair refuses to call a missing owned file intact");
+            install.RecoverOrUninstall();
+            Check(!File.Exists(Path.Combine(root, "ChildStream.exe")) &&
+                !Directory.Exists(Path.Combine(root, "versions", SunshineReleasePin.Version)),
+                "reviewed recovery reverses exact remaining owned files after one owned file vanished");
+            archive.Position = 0;
+            var renewed = install.Plan(payload, archive);
+            install.Apply(renewed, payload, archive, renewed.Hash);
+            Check(File.Exists(missingOwned) && File.Exists(Path.Combine(root, "ChildStream.exe")),
+                "new reviewed plan reinstalls missing owned payload without overwriting foreign bytes");
             string foreign = Path.Combine(root, "native-preserve.txt");
             File.WriteAllText(foreign, "untouched");
             string portable = Path.Combine(root, "versions", SunshineReleasePin.Version, "sunshine.exe");
@@ -408,8 +460,21 @@ internal static class ProductIntegrationTests
         using (var input = File.OpenRead(candidate)) digest = ProductInstallPayload.Hex(sha.ComputeHash(input));
         Reject(() => ProductInstallPayload.ReadCandidate(candidate, new string('0', 64)),
             "candidate self-description cannot replace reviewed outer digest");
-        Check(ProductInstallPayload.ReadCandidate(candidate, digest).Files.Count == 4,
+        Check(ProductInstallPayload.ReadCandidate(candidate, digest).Files.Count == 5,
             "exact reviewed candidate payload admitted");
+        string reacquired = Path.Combine(fixture, "reacquired", "candidate.zip");
+        Directory.CreateDirectory(Path.Combine(fixture, "reacquired", "bin"));
+        File.Copy(candidate, reacquired);
+        File.WriteAllText(Path.Combine(fixture, "reacquired", "bin", "ChildStreamBootstrap.exe"),
+            "reviewed:bin/ChildStreamBootstrap.exe");
+        File.Delete(candidate);
+        Check(ProductInstallPayload.ReadCandidate(reacquired, digest).Files.Count == 5 &&
+            WindowsProductInstallWorkflow.SelectBootstrapPath(root, reacquired, root, true) ==
+                Path.Combine(fixture, "reacquired", "bin", "ChildStreamBootstrap.exe"),
+            "installed-app maintenance accepts a reacquired identical candidate and external bootstrap after original download is gone");
+        File.Delete(Path.Combine(fixture, "reacquired", "bin", "ChildStreamBootstrap.exe"));
+        Reject(() => WindowsProductInstallWorkflow.SelectBootstrapPath(root, reacquired, root, true),
+            "installed bootstrap cannot be mistaken for safe external self-uninstall helper");
     }
 
     private static void Acceptance()
@@ -523,6 +588,7 @@ internal static class ProductIntegrationTests
         {
             Configuration(root); Processes(root); Archives(); Extraction(root); ExtractionRecovery(root);
             Conflicts(); OwnedFileTransaction(root); ProductInstallation(root);
+            SunshineRecoveryRecords(root);
             Acceptance(); Steam(root); ChildBootstrap(root);
             if (args.Length == 1) PinnedArchive(args[0]);
             Console.WriteLine("Product integration offline assertions passed: " + assertions);

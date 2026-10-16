@@ -13,8 +13,9 @@ internal static class LanFirewallTests
     private sealed class FakeHost : ILanFirewallHost
     {
         internal readonly Dictionary<string, LanFirewallRule> Rules = new Dictionary<string, LanFirewallRule>();
-        internal bool Complete = true, Physical = true, Private = true, Enabled = true, Block = true;
-        internal int Foreign;
+        internal bool Complete = true, Physical = true, Private = true, Enabled = true, Block = true,
+            LocalEffective = true, InterfaceProtected = true;
+        internal int Foreign, ConflictingBlock;
         internal string Network = "physical-adapter|192.168.50.10|192.168.50.0/24";
         public LanFirewallObservation Read(string address, SunshinePortFamily family, string executable)
         {
@@ -22,7 +23,9 @@ internal static class LanFirewallTests
                 RemoteSubnet = "192.168.50.0/24", NetworkIdentity = Network,
                 PhysicalInterfaceUp = Physical, PrivateProfileActive = Private,
                 FirewallEnabled = Enabled, DefaultInboundBlocked = Block,
-                ForeignAllowRules = Foreign, Complete = Complete };
+                LocalRulesEffective = LocalEffective, InterfaceFirewallApplies = InterfaceProtected,
+                ForeignAllowRules = Foreign, ConflictingBlockRules = ConflictingBlock,
+                Complete = Complete };
             result.OwnedRules.AddRange(Rules.Values); return result;
         }
         public void Add(LanFirewallRule rule) { Rules.Add(rule.Name, rule); }
@@ -47,6 +50,14 @@ internal static class LanFirewallTests
             false, true, "ROOT\\VMS_MP"), "virtual adapter is not physical LAN evidence");
         Check(!WindowsLanFirewallHost.IsPhysicalAdapterEvidence(nic, 7, nic, 7,
             null, null, null), "unknown hardware evidence fails closed");
+        Check(WindowsLanFirewallHost.IsSelectedPrivateProfileEvidence(7, "Wi-Fi", 7,
+            "Wi-Fi", 1, 2), "selected physical interface itself is Private");
+        Check(!WindowsLanFirewallHost.IsSelectedPrivateProfileEvidence(7, "Wi-Fi", 51,
+            "vEthernet", 1, 2) &&
+            !WindowsLanFirewallHost.IsSelectedPrivateProfileEvidence(7, "Wi-Fi", 7,
+            "Wi-Fi", 0, 2) &&
+            !WindowsLanFirewallHost.IsSelectedPrivateProfileEvidence(7, "Wi-Fi", 7,
+            "Wi-Fi", 1, 1), "another private profile cannot substitute for selected interface");
         string fixture = Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
             "ChildStreamLan-" + Guid.NewGuid().ToString("N"));
         string root = Path.Combine(fixture, "ChildStream");
@@ -82,6 +93,13 @@ internal static class LanFirewallTests
             Reject(() => transaction.Plan("192.168.50.10", digest), "non-private profile blocks plan");
             host.Private = true; host.Block = false;
             Reject(() => transaction.Plan("192.168.50.10", digest), "allow-by-default firewall blocks plan");
+            host.Block = true; host.LocalEffective = false;
+            Reject(() => transaction.Plan("192.168.50.10", digest), "group policy suppression of local rules blocks plan");
+            host.LocalEffective = true; host.InterfaceProtected = false;
+            Reject(() => transaction.Plan("192.168.50.10", digest), "firewall excluded selected interface blocks plan");
+            host.InterfaceProtected = true; host.ConflictingBlock = 1;
+            Reject(() => transaction.Plan("192.168.50.10", digest), "overlapping inbound block rule blocks plan");
+            host.ConflictingBlock = 0;
             host.Block = true; host.Network = "drift";
             Reject(() => transaction.Apply(plan, plan.Hash), "network identity drift blocks apply");
             host.Network = "physical-adapter|192.168.50.10|192.168.50.0/24";

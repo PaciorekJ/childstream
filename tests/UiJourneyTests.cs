@@ -12,17 +12,23 @@ internal static class UiJourneyTests
     { checks++; if (!value) throw new Exception(label); }
     private sealed class Installer : IProductInstallWorkflow
     {
-        internal int Plans;
+        internal int Plans, Applies;
+        internal bool AllowSimulatedApply;
+        public bool IsInstalledApplication { get { return false; } }
         public string Plan(string candidateZip, string reviewedSha256, string sunshineZip)
         { Plans++; return new string('a', 64); }
         public void Apply(string candidateZip, string reviewedSha256, string sunshineZip, string planHash)
-        { throw new Exception("Mutation must not run in rendered fixture."); }
+        { if (!AllowSimulatedApply) throw new Exception("Mutation must not run in rendered fixture.");
+          Applies++; }
         public void Recover(string candidateZip, string reviewedSha256)
         { throw new Exception("Mutation must not run in rendered fixture."); }
         public void Uninstall(string candidateZip, string reviewedSha256)
         { throw new Exception("Mutation must not run in rendered fixture."); }
         public void FetchSunshine(string candidateZip, string reviewedSha256, string destination)
         { throw new Exception("Download must not run in rendered fixture."); }
+        public void LaunchMaintenanceAfterExit(string candidateZip, string reviewedSha256,
+            bool uninstall, int parentPid)
+        { throw new Exception("Maintenance must not run in rendered fixture."); }
     }
     private sealed class Setup : ISetupWorkflow
     {
@@ -104,6 +110,15 @@ internal static class UiJourneyTests
             Check(installer.Plans == 1 && planHash.Text == new string('a', 64),
                 "read-only production UI controller carries exact reviewed plan result");
             Save(form, folder, "install-plan-ready-simulated");
+            installer.AllowSimulatedApply = true;
+            var approve = Find<Button>(form, b => b.Text == "Approve install");
+            var openInstalled = Find<Button>(form, b => b.Text == "Open installed app");
+            approve.PerformClick();
+            for (int i = 0; i < 100 && (installer.Applies == 0 || !openInstalled.Enabled); i++)
+            { Application.DoEvents(); Thread.Sleep(10); }
+            Check(installer.Applies == 1 && openInstalled.Enabled,
+                "approved simulated file install exposes the installed-app handoff");
+            Save(form, folder, "install-handoff-simulated");
         }
         foreach (int percent in new[] { 150, 200 })
         using (var scaled = new ProductInstallDialog(new Installer(), true))
@@ -133,6 +148,56 @@ internal static class UiJourneyTests
             Check(Find<Button>(setup, b => b.Text == "Read LAN journal") != null &&
                 Find<Button>(setup, b => b.Text == "Enable feature") != null,
                 "LAN and child-feature approvals are visibly separate");
+        }
+        int requested = 0;
+        var local = new ToolStripMenuItem("Start ChildStream Sunshine") { Enabled = true };
+        var lanAction = new ToolStripMenuItem("Start Sunshine on approved LAN…") { Enabled = false };
+        var pairAction = new ToolStripMenuItem("Pair Moonlight…") { Enabled = false };
+        var recoverAction = new ToolStripMenuItem("Recover failed ChildStream start") { Enabled = false };
+        local.Click += (s, e) => requested++;
+        using (var shell = new Form { Text = "ChildStream child desktop — simulated",
+            Width = 1100, Height = 300 })
+        {
+            var bar = StreamingActionBar.Create(local, lanAction, pairAction, recoverAction);
+            shell.Controls.Add(bar);
+            shell.Controls.Add(new Label { Dock = DockStyle.Bottom, Height = 36,
+                Text = "Verified child desktop. Choose local readiness or separately approved LAN streaming." });
+            Save(shell, folder, "runtime-local-ready-simulated");
+            ((ToolStripButton)bar.Items[0]).PerformClick();
+            Check(requested == 1, "rendered guided action routes to the normal application command");
+            local.Enabled = false; lanAction.Enabled = true;
+            Check(!bar.Items[0].Enabled && bar.Items[1].Enabled,
+                "guided LAN transition follows actual menu state");
+            Save(shell, folder, "runtime-lan-reconfigure-simulated");
+            lanAction.Enabled = false; pairAction.Enabled = false; recoverAction.Enabled = true;
+            Check(bar.Items[3].Enabled && !bar.Items[2].Enabled,
+                "uncertain recovery remains reachable without exposing pairing");
+            Save(shell, folder, "runtime-recovery-simulated");
+        }
+        var guideItems = new [] {
+            new ToolStripMenuItem("Review Windows setup…") { Enabled = true },
+            new ToolStripMenuItem("Start ChildStream Sunshine") { Enabled = true },
+            new ToolStripMenuItem("Start Sunshine on approved LAN…") { Enabled = false },
+            new ToolStripMenuItem("Pair Moonlight…") { Enabled = false },
+            new ToolStripMenuItem("Start Steam Big Picture in child") { Enabled = false },
+            new ToolStripMenuItem("Request Minecraft Dungeons in child") { Enabled = false },
+            new ToolStripMenuItem("Stop ChildStream streaming") { Enabled = false },
+            new ToolStripMenuItem("Recover failed ChildStream start") { Enabled = false }
+        };
+        string guideStatus = "Verified child desktop. Choose local Sunshine readiness.";
+        using (var guide = new ChildStreamGuideForm(() => guideStatus, guideItems, true))
+        {
+            Save(guide, folder, "guide-local-ready-simulated");
+            guideItems[1].Enabled = false; guideItems[2].Enabled = true;
+            guideStatus = "Local ChildStream Sunshine ready. Approve a scoped LAN plan for Moonlight.";
+            guide.RefreshState(); Save(guide, folder, "guide-lan-reconfigure-simulated");
+            guideItems[2].Enabled = false; guideItems[7].Enabled = true;
+            guideStatus = "Owned startup outcome uncertain. Exact process recovery is required.";
+            guide.RefreshState(); Save(guide, folder, "guide-recovery-simulated");
+            Check(Find<Button>(guide, b => b.Text == "Recover start").Enabled &&
+                !Find<Button>(guide, b => b.Text == "Pair Moonlight").Enabled,
+                "production guide exposes recovery and keeps pairing disabled on uncertain runtime");
+            CheckVisibleControlsInside(guide, "guided action remains visible");
         }
         string json = "{\"displays\":[{\"id\":\"{6b4f23ba-ef14-45ab-9c90-5d6c8f859f24}\",\"name\":\"Child Display 1\"}," +
             "{\"id\":\"{12100db6-5a9d-40c4-9c10-c3b1f606a632}\",\"name\":\"Child Display 2\"}]," +

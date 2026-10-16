@@ -233,6 +233,7 @@ internal static class SetupInstallTrust
     internal static string RequireOwnedPath(string leaf)
     {
         if (leaf != "ChildStream.exe" && leaf != "ChildStreamSetup.exe" &&
+            leaf != "ChildStreamBootstrap.exe" &&
             leaf != "feasibility-inventory.ps1")
             throw new InvalidOperationException("Unknown setup binary or script.");
         string root = Path.GetFullPath(Path.Combine(
