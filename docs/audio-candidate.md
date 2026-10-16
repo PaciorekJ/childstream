@@ -31,18 +31,30 @@ The normal application obtains exact child identity, starts its limited child
 agent, discovers child display and audio endpoints, and uses the selected active
 endpoint ID in an immutable generation configuration. RDP mode 1 leaves playback
 on the remote child host; parent microphone redirection stays off. ChildStream
-Sunshine receives `audio_sink = <selected ID>`, `external_audio = enabled`,
-`stream_audio = enabled`, `install_steam_audio_drivers = disabled` and no
-`virtual_sink`. Pairing and Steam/game commands remain bound to the exact owned
+Sunshine first receives `audio_sink = <selected ID>`, `external_audio = enabled`,
+`stream_audio = disabled`, `install_steam_audio_drivers = disabled` and no
+`virtual_sink`. This explicit silent preparation lets the game launch before its
+render session exists. Pairing and Steam/game commands remain bound to the exact owned
 process and certificate. Local-to-LAN reconfiguration preserves the selected
 identity in the presenter request and a healthy game survives Sunshine recovery.
-The agent observes endpoint presence again while running; loss blocks pairing
-and new game actions and exposes exact-owned stream recovery.
+The agent observes endpoint presence again while running. When the exact game
+render route is observed, the owner can select **Enable verified game audio**.
+The presenter and agent recheck the route, stop only the exact owned Sunshine,
+and start an immutable capture-only configuration with `stream_audio = enabled`.
+The game, child session and pairing identity remain in place; Moonlight reconnects.
+An idle agent monitor also checks the admitted route. Wrong, ambiguous or missing
+route evidence stops the audio-enabled process; if the selected endpoint remains
+available, the agent restarts Sunshine silently. Endpoint loss leaves the stream
+stopped until an endpoint is reselected. A later positive observation requires a
+new explicit audio-enable action. A stopped, failed or crashed agent cannot claim
+continuous enforcement, and polling cannot prevent every transient leak.
 
 The game route has a **supported owner-configured adoption path**, rather than
 an automatic setter. Once the exact owned Minecraft Dungeons process starts,
-the normal app opens Windows' documented `ms-settings:apps-volume` Volume Mixer
-in that child desktop. The owner may choose the game's output there. The agent
+the normal app requests Windows' documented `ms-settings:apps-volume` Volume Mixer
+from that child desktop; the owner must confirm the window appeared there and may
+choose the game's output. Child-observed friendly endpoint names are shown when
+available, while all checks use stable endpoint IDs. The agent
 then reconciles active Core Audio sessions on all observed render endpoints
 with the durable game PID, start time, image digest, WTS session and logon
 generation. It reports `WaitingForRender`, `GameRenderObserved`,
@@ -53,7 +65,8 @@ positive observation. The positive synthetic production-path fixture names
 **Windows Volume Mixer per-app output to `{child-audio-2}`**, a nondefault
 endpoint, with Sunshine `audio_sink` set to that same endpoint. It exercises
 the presenter, controller, agent, owned game record, configuration file,
-observation and Sunshine-only recovery with unchanged game and pairing.
+observation, explicit audio-enabled restart, idle wrong-route withdrawal,
+silent reconnect and Sunshine-only recovery with unchanged game and pairing.
 The status separately labels `DefaultEndpoint` and `NondefaultEndpoint`;
 observing game render on the default is not evidence of child-only audio.
 

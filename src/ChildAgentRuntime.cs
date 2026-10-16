@@ -143,10 +143,10 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
     private readonly SunshinePortFamily family = new SunshinePortFamily(48089);
     private readonly object gate = new object();
     private readonly IRuntimeMonitor monitor;
-    private bool monitoringLan, boundaryWithdrawn;
+    private bool monitoringLan, monitoringRuntime, boundaryWithdrawn, audioWithdrawn, streamAudioEnabled;
     private string lastCapabilities;
     private string lanAddress;
-    private string selectedAudioId;
+    private string selectedAudioId, selectedDisplayId;
     private ChildOwnedProcess sunshine;
     private ProductProcessIdentity sunshineIdentity;
     private IChildSunshineIdentity identity;
@@ -176,7 +176,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
     private string ExecuteLocked(ChildAgentOperation operation, string payload)
     {
         RequireChild();
-        if (monitoringLan) SuperviseLanLocked();
+        if (monitoringRuntime) SuperviseRuntimeLocked();
         if (sunshineIdentity == null && environment.HasUnresolvedStartIntent(child)) uncertain = true;
         if (uncertain && operation != ChildAgentOperation.Status &&
             operation != ChildAgentOperation.RecoverSunshine)
@@ -222,6 +222,9 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
             case ChildAgentOperation.OpenGameAudioRoute:
                 if (payload.Length != 0) throw new InvalidDataException("Audio route action has no caller arguments.");
                 OpenGameAudioRoute(); return Status();
+            case ChildAgentOperation.EnableGameAudio:
+                if (payload.Length != 0) throw new InvalidDataException("Audio enable has no caller arguments.");
+                EnableGameAudio(); return Status();
             case ChildAgentOperation.StopSteam:
                 if (payload.Length != 0) throw new InvalidDataException("Steam stop has no payload.");
                 StopSteam(); return Status();
@@ -274,14 +277,16 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
             throw new InvalidOperationException("Child audio endpoint inventory is incomplete.");
         var endpoints = new List<string>(audio.ActiveRenderIds);
         endpoints.Sort(StringComparer.Ordinal);
-        return new JavaScriptSerializer().Serialize(new { displays = displays, audio = endpoints });
+        return new JavaScriptSerializer().Serialize(new { displays = displays, audio = endpoints,
+            audioNames = audio.FriendlyNames });
     }
     private string Status()
     {
+        if (monitoringRuntime && streamAudioEnabled) SuperviseRuntimeLocked();
         if (sunshineIdentity == null && environment.HasUnresolvedStartIntent(child)) uncertain = true;
         if (!uncertain) ObservePendingGame();
         string state = uncertain ? "Uncertain" : sunshineIdentity == null ?
-            (boundaryWithdrawn ? "SunshineWithdrawn" : "NoSunshine") :
+            (boundaryWithdrawn ? "SunshineWithdrawn" : audioWithdrawn ? "SunshineAudioWithdrawn" : "NoSunshine") :
             sunshine != null && sunshine.VerifyRunning() ? "SunshineReady" : "SunshineLost";
         if (state == "SunshineReady")
             try { owner.AssertStillOwned(); }
@@ -296,10 +301,14 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
                 state == "SunshineReady" ? "ScopedRulesVerified" : "ChangedOrUnavailable" },
             { "steamStage", steam == null ? "NotStarted" : steam.Stage.ToString() },
             { "gameAudio", gameAudio }, { "captureEndpoint", selectedAudioId ?? "" },
+            { "captureEndpointName", CaptureEndpointName() },
+            { "audioMode", streamAudioEnabled && state == "SunshineReady" ? "CaptureEnabled" :
+                audioWithdrawn ? "SilentRouteWithdrawn" : "SilentPreparation" },
             { "routeKind", CaptureRouteKind() },
             { "routeConfiguration", gameAudio == "GameRenderObserved" ? "AdoptedObservedOutput" :
                 volumeMixerOpenedForGame ? "OwnerSelectionRequested" : "NotEstablished" },
-            { "captureReady", state == "SunshineReady" && AudioReady() },
+            { "captureReady", state == "SunshineReady" && streamAudioEnabled &&
+                gameAudio == "GameRenderObserved" && AudioReady() },
             { "clientPlayback", "HardwareUnverified" }
         });
     }
@@ -343,6 +352,17 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
         }
         catch { return "Unknown"; }
     }
+    private string CaptureEndpointName()
+    {
+        if (String.IsNullOrEmpty(selectedAudioId)) return "";
+        try
+        {
+            ChildAudioEndpointInventory audio = environment.ReadAudio(child);
+            string name;
+            return audio != null && audio.FriendlyNames.TryGetValue(selectedAudioId, out name) ? name : selectedAudioId;
+        }
+        catch { return selectedAudioId; }
+    }
     private void OpenGameAudioRoute()
     {
         if (steam == null || steam.Stage != SteamChildStage.GameObserved ||
@@ -356,9 +376,31 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
     }
     private void AssertGameAudioForPairing()
     {
-        if (steam != null && steam.Stage == SteamChildStage.GameObserved &&
+        if (streamAudioEnabled && steam != null && steam.Stage == SteamChildStage.GameObserved &&
             GameAudioStatus() != "GameRenderObserved")
             throw new InvalidOperationException("Exact game rendering on the selected capture endpoint is not observed.");
+    }
+    private void EnableGameAudio()
+    {
+        if (sunshineIdentity == null || owner == null || streamAudioEnabled ||
+            steam == null || steam.Stage != SteamChildStage.GameObserved)
+            throw new InvalidOperationException("Silent owned Sunshine and the exact observed child game are required.");
+        owner.AssertStillOwned();
+        if (GameAudioStatus() != "GameRenderObserved")
+            throw new InvalidOperationException("Exact game rendering on the selected capture endpoint is not observed.");
+        var selected = new SelectedCapabilities { Display = selectedDisplayId, Audio = selectedAudioId };
+        string address = lanAddress;
+        StopSunshine();
+        // A fresh config is immutable and a new exact process is recorded. The
+        // route is checked once more immediately before audio is admitted.
+        if (GameAudioStatusForSelection(selected.Audio) != "GameRenderObserved")
+        { audioWithdrawn = true; throw new InvalidOperationException("Game audio route changed during owned Sunshine reconfiguration."); }
+        StartSunshine(address, selected, true);
+    }
+    private string GameAudioStatusForSelection(string audioId)
+    {
+        selectedAudioId = audioId;
+        return GameAudioStatus();
     }
     private bool AudioReady()
     {
@@ -446,7 +488,8 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
         }
         catch { uncertain = true; environment.RecordRuntimeUncertainty(child, "SteamStopUnknown"); throw; }
     }
-    private string StartSunshine(string requestedLanAddress, SelectedCapabilities selected)
+    private string StartSunshine(string requestedLanAddress, SelectedCapabilities selected,
+        bool enableAudio = false)
     {
         if (sunshineIdentity != null)
         {
@@ -504,7 +547,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
                 BindAddress = requestedLanAddress ?? "127.0.0.1",
                 LanCandidate = requestedLanAddress == null ? null : new SunshineLanCandidate {
                     Child = child, BindAddress = requestedLanAddress, Port = family.BasePort,
-                    BoundaryVerified = true } };
+                BoundaryVerified = true }, StreamAudioEnabled = enableAudio };
             environment.EnsureGenerationFile(child, "apps.json", ChildProductConfiguration.BuildApps());
             string configuration = ChildProductConfiguration.BuildSunshine(options);
             string config = environment.EnsureGenerationFile(child,
@@ -549,13 +592,14 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
             }
             pairing.Send("GET", "/api/pin", null); // Authenticated readiness, never native Sunshine.
             selectedAudioId = audioId;
+            selectedDisplayId = display.Id;
             lanAddress = requestedLanAddress;
             boundaryWithdrawn = false;
-            if (requestedLanAddress != null)
-            {
-                monitoringLan = true;
-                monitor.Start(SuperviseLan);
-            }
+            audioWithdrawn = false;
+            streamAudioEnabled = enableAudio;
+            monitoringLan = requestedLanAddress != null;
+            monitoringRuntime = true;
+            monitor.Start(SuperviseRuntime);
             return Status();
         }
         catch
@@ -574,19 +618,45 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
             // if the LAN boundary has drifted and pairing/status are blocked.
             sunshine.Stop(5000);
             environment.ResolveStopped(child, sunshineIdentity);
-            monitoringLan = false; monitor.Stop();
+            monitoringLan = false; monitoringRuntime = false; monitor.Stop();
             sunshine = null; sunshineIdentity = null; pairing = null; owner = null; lanAddress = null;
-            selectedAudioId = null;
+            selectedAudioId = null; selectedDisplayId = null; streamAudioEnabled = false;
             identity.Dispose(); identity = null;
         }
         catch { uncertain = true; throw; }
     }
-    private void SuperviseLan()
+    private void SuperviseRuntime()
     {
         lock (gate)
         {
-            try { if (monitoringLan) SuperviseLanLocked(); }
+            try { if (monitoringRuntime) SuperviseRuntimeLocked(); }
             catch { /* The durable uncertainty and command status retain the failure. */ }
+        }
+    }
+    private void SuperviseRuntimeLocked()
+    {
+        if (monitoringLan) SuperviseLanLocked();
+        if (!monitoringRuntime || !streamAudioEnabled || sunshineIdentity == null) return;
+        if (GameAudioStatus() == "GameRenderObserved" && AudioReady()) return;
+        var selected = new SelectedCapabilities { Display = selectedDisplayId, Audio = selectedAudioId };
+        string address = lanAddress;
+        // An already paired client is disconnected by stopping only the exact
+        // owned process. Its game and persistent pairing identity remain.
+        try
+        {
+            StopSunshine();
+            audioWithdrawn = true;
+            if (GameAudioStatusForSelection(selected.Audio) != "CaptureEndpointLost" &&
+                (address == null || environment.VerifyLanBoundary(address, family)))
+            {
+                StartSunshine(address, selected); // Silent preparation only.
+                audioWithdrawn = true;
+            }
+        }
+        catch
+        {
+            audioWithdrawn = true;
+            if (uncertain) environment.RecordRuntimeUncertainty(child, "AudioWithdrawalUnknown");
         }
     }
     private void SuperviseLanLocked()
@@ -597,13 +667,13 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
         {
             // Invalidate pairing before attempting an exact-owned stop. A
             // changed PID, generation or token can never be killed by name.
-            pairing = null; owner = null; monitoringLan = false; monitor.Stop();
+            pairing = null; owner = null; monitoringLan = false; monitoringRuntime = false; monitor.Stop();
             try
             {
                 sunshine.Stop(5000);
                 environment.ResolveStopped(child, sunshineIdentity);
                 sunshine = null; sunshineIdentity = null; lanAddress = null;
-                selectedAudioId = null;
+                selectedAudioId = null; selectedDisplayId = null; streamAudioEnabled = false;
                 if (identity != null) { identity.Dispose(); identity = null; }
                 boundaryWithdrawn = true;
             }
@@ -648,9 +718,9 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
         // close request. An absent PID is handled by the durable record check.
         if (environment.Processes.Read(exact.Pid) != null) controlled.Stop(5000);
         environment.ResolveFailedStart(child, exact);
-        monitoringLan = false; monitor.Stop();
+        monitoringLan = false; monitoringRuntime = false; monitor.Stop();
         sunshine = null; sunshineIdentity = null; pairing = null; owner = null; lanAddress = null;
-        selectedAudioId = null;
+        selectedAudioId = null; selectedDisplayId = null; streamAudioEnabled = false;
         if (identity != null) { identity.Dispose(); identity = null; }
         uncertain = false;
     }
@@ -660,7 +730,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
     }
     private void DisposeLocked()
     {
-        monitoringLan = false; monitor.Dispose();
+        monitoringLan = false; monitoringRuntime = false; monitor.Dispose();
         if (steam != null)
             try { StopSteam(); }
             catch { try { environment.RecordRuntimeUncertainty(child, "AgentExitWithSteamUnknown"); } catch { } }

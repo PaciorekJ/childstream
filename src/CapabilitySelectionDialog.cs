@@ -12,15 +12,19 @@ internal sealed class ChildCapabilityCatalog
       { return Name + "  ·  " + Id.Trim('{', '}').Substring(0, 8); } }
     internal readonly List<Display> Displays = new List<Display>();
     internal readonly List<string> Audio = new List<string>();
+    internal readonly Dictionary<string, string> AudioNames = new Dictionary<string, string>(StringComparer.Ordinal);
     internal static ChildCapabilityCatalog Parse(string json)
     {
         if (String.IsNullOrEmpty(json) || json.Length > 8192)
             throw new InvalidDataException("Child capability response is missing or oversized.");
         var root = new JavaScriptSerializer().DeserializeObject(json) as IDictionary<string, object>;
-        object rawDisplays, rawAudio;
-        if (root == null || root.Count != 2 || !root.TryGetValue("displays", out rawDisplays) ||
+        object rawDisplays, rawAudio, rawNames;
+        if (root == null || (root.Count != 2 && root.Count != 3) ||
+            !root.TryGetValue("displays", out rawDisplays) ||
             !root.TryGetValue("audio", out rawAudio))
             throw new InvalidDataException("Child capability response is malformed.");
+        if (root.Count == 3 && !root.TryGetValue("audioNames", out rawNames))
+            throw new InvalidDataException("Child audio label response is malformed.");
         var displays = rawDisplays as object[]; var audio = rawAudio as object[];
         if (displays == null || audio == null || displays.Length < 1 || displays.Length > 32 ||
             audio.Length < 1 || audio.Length > 64)
@@ -43,6 +47,20 @@ internal sealed class ChildCapabilityCatalog
                 ((string)value).Length > 256 || !audioIds.Add((string)value))
                 throw new InvalidDataException("Child audio choice is malformed or duplicated.");
             else result.Audio.Add((string)value);
+        if (root.TryGetValue("audioNames", out rawNames))
+        {
+            var names = rawNames as IDictionary<string, object>;
+            if (names == null || names.Count > result.Audio.Count)
+                throw new InvalidDataException("Child audio labels are malformed.");
+            foreach (var pair in names)
+            {
+                string name = pair.Value as string;
+                if (!audioIds.Contains(pair.Key) || String.IsNullOrWhiteSpace(name) ||
+                    name.Length > 128 || name.IndexOfAny(new[] { '\r', '\n', '\0' }) >= 0)
+                    throw new InvalidDataException("Child audio label has no exact endpoint identity.");
+                result.AudioNames.Add(pair.Key, name);
+            }
+        }
         return result;
     }
     internal string SelectionPayload(string display, string audio, string address)
@@ -56,10 +74,15 @@ internal sealed class ChildCapabilityCatalog
 
 internal sealed class CapabilitySelectionDialog : Form
 {
+    private sealed class AudioChoice
+    {
+        internal string Id, Name;
+        public override string ToString() { return Name == null ? Id : Name + "  ·  " + Id; }
+    }
     private readonly ChildCapabilityCatalog catalog;
     private readonly ListBox displays, audio;
     internal string SelectedDisplay { get { return ((ChildCapabilityCatalog.Display)displays.SelectedItem).Id; } }
-    internal string SelectedAudio { get { return (string)audio.SelectedItem; } }
+    internal string SelectedAudio { get { return ((AudioChoice)audio.SelectedItem).Id; } }
     internal CapabilitySelectionDialog(ChildCapabilityCatalog catalog, bool simulated = false)
     {
         this.catalog = catalog;
@@ -78,7 +101,12 @@ internal sealed class CapabilitySelectionDialog : Form
             Anchor = AnchorStyles.Top | AnchorStyles.Right | AnchorStyles.Bottom,
             AccessibleName = "Child observed audio selection" };
         foreach (var item in catalog.Displays) displays.Items.Add(item);
-        foreach (string item in catalog.Audio) audio.Items.Add(item);
+        foreach (string item in catalog.Audio)
+        {
+            string name;
+            audio.Items.Add(new AudioChoice { Id = item,
+                Name = catalog.AudioNames.TryGetValue(item, out name) ? name : null });
+        }
         if (displays.Items.Count == 1) displays.SelectedIndex = 0;
         if (audio.Items.Count == 1) audio.SelectedIndex = 0;
         var confirm = new Button { Left = 405, Top = 335, Width = 105, Text = "Continue",

@@ -202,6 +202,7 @@ internal static class UiJourneyTests
             new ToolStripMenuItem("Start Steam Big Picture in child") { Enabled = false },
             new ToolStripMenuItem("Request Minecraft Dungeons in child") { Enabled = false },
             new ToolStripMenuItem("Set game audio in child Volume Mixer…") { Enabled = false },
+            new ToolStripMenuItem("Enable verified game audio…") { Enabled = false },
             new ToolStripMenuItem("Stop ChildStream streaming") { Enabled = false },
             new ToolStripMenuItem("Recover failed ChildStream start") { Enabled = false }
         };
@@ -213,21 +214,23 @@ internal static class UiJourneyTests
             guideStatus = "Local ChildStream Sunshine ready. Approve a scoped LAN plan for Moonlight.";
             guide.RefreshState(); Save(guide, folder, "guide-lan-reconfigure-simulated");
             guideItems[2].Enabled = false; guideItems[3].Enabled = true;
-            guideItems[4].Enabled = true; guideItems[7].Enabled = true;
+            guideItems[4].Enabled = true; guideItems[8].Enabled = true;
             guideItems[6].Enabled = true;
             guideStatus = "Exact game launched. Select Minecraft Dungeons output in child Volume Mixer; render session pending on {child-audio-2}.";
             guide.RefreshState(); Save(guide, folder, "guide-audio-route-pending-simulated");
             guideStatus = "WrongEndpoint: game renders to {child-audio}; Sunshine captures {child-audio-2}. Change only the game's output in child Volume Mixer.";
             guide.RefreshState(); Save(guide, folder, "guide-audio-route-wrong-simulated");
-            guideStatus = "Exact game render session observed on {child-audio-2} (NondefaultEndpoint); Sunshine capture ready. Endpoint privacy and Moonlight playback still need physical checks.";
+            guideItems[7].Enabled = true;
+            guideStatus = "Exact game render observed on {child-audio-2}; enable verified game audio to restart only owned Sunshine.";
             guide.RefreshState(); Save(guide, folder, "guide-audio-ready-simulated");
-            guideStatus = "Moonlight reconnected to the same owned ChildStream certificate and audio endpoint.";
+            guideItems[7].Enabled = false;
+            guideStatus = "Owned capture-only Sunshine is audio enabled; Moonlight reconnected to the same certificate and endpoint.";
             guide.RefreshState(); Save(guide, folder, "guide-audio-reconnect-simulated");
-            guideItems[3].Enabled = guideItems[4].Enabled = guideItems[7].Enabled = false;
-            guideItems[8].Enabled = true;
+            guideItems[3].Enabled = guideItems[4].Enabled = guideItems[8].Enabled = false;
+            guideItems[9].Enabled = true;
             guideStatus = "Selected child audio endpoint disappeared. Recover only the exact owned stream.";
             guide.RefreshState(); Save(guide, folder, "guide-audio-lost-simulated");
-            guideItems[2].Enabled = false; guideItems[8].Enabled = true;
+            guideItems[2].Enabled = false; guideItems[9].Enabled = true;
             guideStatus = "Owned startup outcome uncertain. Exact process recovery is required.";
             guide.RefreshState(); Save(guide, folder, "guide-recovery-simulated");
             Check(Find<Button>(guide, b => b.Text == "Recover start").Enabled &&
@@ -235,7 +238,7 @@ internal static class UiJourneyTests
                 "production guide exposes recovery and keeps pairing disabled on uncertain runtime");
             var lost = ChildStreamingUiState.From(new System.Collections.Generic.Dictionary<string, object> {
                 { "stage", "SunshineLost" }, { "lanPosture", "LocalOnly" } }, false);
-            guideItems[7].Enabled = lost.Recover; guideItems[2].Enabled = lost.StartLan;
+            guideItems[9].Enabled = lost.Recover; guideItems[2].Enabled = lost.StartLan;
             guideStatus = "Owned local Sunshine exited. Reconcile its exact process before retrying.";
             guide.RefreshState(); Save(guide, folder, "guide-lost-recovery-simulated");
             Check(lost.Recover && !lost.StartLan && !lost.Pair &&
@@ -253,8 +256,12 @@ internal static class UiJourneyTests
         }
         string json = "{\"displays\":[{\"id\":\"{6b4f23ba-ef14-45ab-9c90-5d6c8f859f24}\",\"name\":\"Child Display 1\"}," +
             "{\"id\":\"{12100db6-5a9d-40c4-9c10-c3b1f606a632}\",\"name\":\"Child Display 2\"}]," +
-            "\"audio\":[\"Child Audio 1\",\"Child Audio 2\"]}";
+            "\"audio\":[\"{endpoint-1}\",\"{endpoint-2}\"]," +
+            "\"audioNames\":{\"{endpoint-1}\":\"Speakers\",\"{endpoint-2}\":\"ChildStream Capture\"}}";
         ChildCapabilityCatalog catalog = ChildCapabilityCatalog.Parse(json);
+        Check(catalog.AudioNames["{endpoint-2}"] == "ChildStream Capture" &&
+            catalog.SelectionPayload(catalog.Displays[0].Id, "{endpoint-2}", null).Contains("{endpoint-2}"),
+            "friendly labels cannot replace stable endpoint identities in the child selection payload");
         using (var chooser = new CapabilitySelectionDialog(catalog, true))
         {
             Save(chooser, folder, "multiple-child-devices-simulated");
@@ -263,7 +270,8 @@ internal static class UiJourneyTests
             Check(boxes.Count == 2 && boxes[0].SelectedIndex < 0 && boxes[1].SelectedIndex < 0,
                 "multiple child devices require an explicit selection");
             boxes[0].SelectedIndex = 1; boxes[1].SelectedIndex = 1;
-            Check(chooser.SelectedDisplay == catalog.Displays[1].Id && chooser.SelectedAudio == "Child Audio 2",
+            Check(chooser.SelectedDisplay == catalog.Displays[1].Id && chooser.SelectedAudio == "{endpoint-2}" &&
+                boxes[1].Items[1].ToString().Contains("ChildStream Capture"),
                 "UI selection resolves exact child-observed IDs");
         }
         var coordinator = new MoonlightPairingCoordinator(new Runtime(), new Pairing());

@@ -24,6 +24,7 @@ internal sealed class ChildProductOptions
     internal int Port = 48089;
     internal string BindAddress = "127.0.0.1";
     internal SunshineLanCandidate LanCandidate;
+    internal bool StreamAudioEnabled;
 }
 
 // This object only permits deterministic configuration generation. It is not
@@ -186,7 +187,7 @@ internal static class ChildProductConfiguration
         // installs a driver. Routing game output to this endpoint remains an
         // independent prerequisite; the child agent observes it separately.
         line("external_audio", "enabled");
-        line("stream_audio", "enabled");
+        line("stream_audio", option.StreamAudioEnabled ? "enabled" : "disabled");
         AppendInputPolicy(line, true);
         line("gamepad", "x360");
         return config.ToString();

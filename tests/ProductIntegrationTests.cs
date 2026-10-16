@@ -98,6 +98,10 @@ internal static class ProductIntegrationTests
             config.Contains("gamepad_driver = vigembus") &&
             config.Contains("keyboard = enabled") && config.Contains("mouse = enabled") &&
             config.Contains("install_steam_audio_drivers = disabled"), "free input driver and no automatic driver install");
+        Check(config.Contains("stream_audio = disabled"),
+            "initial owned Sunshine preparation cannot send audio before game route observation");
+        option.StreamAudioEnabled = true;
+        config = ChildProductConfiguration.BuildSunshine(option);
         Check(config.Contains("audio_sink = {audio-endpoint}") &&
             config.Contains("external_audio = enabled") && config.Contains("stream_audio = enabled") &&
             !config.Contains("virtual_sink ="),

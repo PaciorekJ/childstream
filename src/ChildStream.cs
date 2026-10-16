@@ -63,7 +63,7 @@ internal static class StreamingActionBar
 
 internal sealed class ChildStreamingUiState
 {
-    internal bool StartLocal, StartLan, Stop, Recover, Pair;
+    internal bool StartLocal, StartLan, Stop, Recover, Pair, EnableAudio;
     internal static ChildStreamingUiState From(System.Collections.Generic.IDictionary<string, object> status,
         bool pairingAvailable)
     {
@@ -72,14 +72,17 @@ internal sealed class ChildStreamingUiState
         string stage = Convert.ToString(status["stage"]);
         string posture = Convert.ToString(status["lanPosture"]);
         bool ready = stage == "SunshineReady";
-        bool available = stage == "NoSunshine" || stage == "SunshineWithdrawn";
+        bool available = stage == "NoSunshine" || stage == "SunshineWithdrawn" ||
+            stage == "SunshineAudioWithdrawn";
         bool lost = stage == "Uncertain" || stage == "SunshineLost" ||
             stage == "SunshineBoundaryLost" || stage == "SunshineAudioLost";
         if (!ready && !available && !lost)
             throw new InvalidDataException("Unrecognized owned runtime stage.");
         return new ChildStreamingUiState { StartLocal = available,
             StartLan = available || ready && posture == "LocalOnly",
-            Stop = ready, Recover = lost, Pair = ready && pairingAvailable };
+            Stop = ready, Recover = lost, Pair = ready && pairingAvailable,
+            EnableAudio = ready && Convert.ToString(status["audioMode"]) != "CaptureEnabled" &&
+                Convert.ToString(status["gameAudio"]) == "GameRenderObserved" };
     }
 }
 
@@ -93,11 +96,11 @@ internal sealed class ChildStreamGuideForm : Form
     internal ChildStreamGuideForm(Func<string> currentStatus, ToolStripMenuItem[] actions,
         bool simulated = false)
     {
-        if (currentStatus == null || actions == null || actions.Length != 9)
-            throw new ArgumentException("Nine guided ChildStream actions are required.");
+        if (currentStatus == null || actions == null || actions.Length != 10)
+            throw new ArgumentException("Ten guided ChildStream actions are required.");
         this.currentStatus = currentStatus; this.actions = actions;
         Text = simulated ? "ChildStream guided play — simulated" : "ChildStream guided play";
-        Width = 670; Height = 650; MinimumSize = new Size(620, 600);
+        Width = 670; Height = 700; MinimumSize = new Size(620, 620);
         AutoScroll = true; StartPosition = FormStartPosition.CenterParent;
         var title = new Label { Left = 20, Top = 18, Width = 610, Height = 32,
             Font = new Font(SystemFonts.MessageBoxFont, FontStyle.Bold),
@@ -112,11 +115,12 @@ internal sealed class ChildStreamGuideForm : Form
             "5. Start Steam Big Picture only after the child stream is verified.",
             "6. Request Minecraft Dungeons and observe it in the child session.",
             "7. In child Volume Mixer, select its output. ChildStream checks the exact game render session.",
+            "8. Recheck the route and restart only owned Sunshine with capture-only audio.",
             "Stop only ChildStream-owned streaming. The child desktop stays open.",
             "If startup failed, reconcile the exact owned process before retrying." };
         var shortNames = new [] { "Review setup", "Start local", "Switch to LAN",
-            "Pair Moonlight", "Start Steam", "Launch game", "Set game audio", "Stop streaming", "Recover start" };
-        buttons = new Button[9];
+            "Pair Moonlight", "Start Steam", "Launch game", "Set game audio", "Enable game audio", "Stop streaming", "Recover start" };
+        buttons = new Button[10];
         for (int i = 0; i < actions.Length; i++)
         {
             int row = i;
@@ -406,8 +410,10 @@ static class Program
         var steamItem = new ToolStripMenuItem("Start Steam Big Picture in child") { Enabled = false };
         var gameItem = new ToolStripMenuItem("Request Minecraft Dungeons in child") { Enabled = false };
         var gameAudioItem = new ToolStripMenuItem("Set game audio in child Volume Mixer…") { Enabled = false };
+        var enableGameAudioItem = new ToolStripMenuItem("Enable verified game audio…") { Enabled = false };
         var stopSteamItem = new ToolStripMenuItem("Stop exact owned child Steam/game") { Enabled = false };
-        menu.Items.Add(steamItem); menu.Items.Add(gameItem); menu.Items.Add(gameAudioItem); menu.Items.Add(stopSteamItem);
+        menu.Items.Add(steamItem); menu.Items.Add(gameItem); menu.Items.Add(gameAudioItem);
+        menu.Items.Add(enableGameAudioItem); menu.Items.Add(stopSteamItem);
         var pairItem = new ToolStripMenuItem("Pair Moonlight…") { Enabled = false };
         menu.Items.Add(pairItem);
         pairItem.Click += async (s, e) =>
@@ -449,7 +455,7 @@ static class Program
                 pairItem.Enabled = false; sunshineItem.Enabled = false; lanSunshineItem.Enabled = false;
                 stopSunshineItem.Enabled = false; recoverSunshineItem.Enabled = false;
                 steamItem.Enabled = false; gameItem.Enabled = false; stopSteamItem.Enabled = false;
-                gameAudioItem.Enabled = false;
+                gameAudioItem.Enabled = false; enableGameAudioItem.Enabled = false;
                 statusText.Text = "Child agent and owned Sunshine stopped. Child desktop remains available.";
                 return true;
             }
@@ -511,7 +517,8 @@ static class Program
         f.Controls.Add(rdp);
         f.Controls.Add(statusBar);
         f.Controls.Add(StreamingActionBar.Create(setupItem, sunshineItem, lanSunshineItem,
-            pairItem, steamItem, gameItem, gameAudioItem, stopSunshineItem, recoverSunshineItem));
+            pairItem, steamItem, gameItem, gameAudioItem, enableGameAudioItem,
+            stopSunshineItem, recoverSunshineItem));
         rdp.CreateControl();
         ocx = rdp.Ocx;
 
@@ -572,20 +579,27 @@ static class Program
             gameAudioItem.Enabled = !runtimeActionPending &&
                 Convert.ToString(observed.ContainsKey("steamStage") ? observed["steamStage"] : "") == "GameObserved" &&
                 stage == "SunshineReady";
+            enableGameAudioItem.Enabled = !runtimeActionPending && state.EnableAudio;
             if (stage == "SunshineWithdrawn")
                 statusText.Text = "LAN boundary changed; exact owned Sunshine was withdrawn. Review LAN setup.";
             else if (stage == "SunshineAudioLost")
                 statusText.Text = "Selected child audio endpoint disappeared. Recover only the exact ChildStream stream, then choose an active endpoint.";
+            else if (stage == "SunshineAudioWithdrawn")
+                statusText.Text = "Game audio evidence was lost. Exact owned Sunshine stopped; game and pairing remain. Choose an active endpoint and restart silently.";
             else if (stage == "SunshineLost" || stage == "SunshineBoundaryLost")
                 statusText.Text = "Owned Sunshine was lost; reconcile its exact process before retrying.";
             else if (Convert.ToString(observed.ContainsKey("steamStage") ? observed["steamStage"] : "") == "GameObserved")
             {
                 string route = Convert.ToString(observed.ContainsKey("gameAudio") ? observed["gameAudio"] : "ObservationIncomplete");
-                string sink = Convert.ToString(observed.ContainsKey("captureEndpoint") ? observed["captureEndpoint"] : "");
+                string sink = Convert.ToString(observed.ContainsKey("captureEndpointName") ?
+                    observed["captureEndpointName"] : observed.ContainsKey("captureEndpoint") ? observed["captureEndpoint"] : "");
                 string kind = Convert.ToString(observed.ContainsKey("routeKind") ? observed["routeKind"] : "Unknown");
+                string audioMode = Convert.ToString(observed.ContainsKey("audioMode") ? observed["audioMode"] : "");
                 statusText.Text = route == "GameRenderObserved" ?
-                    "Exact game render session observed on " + sink + " (" + kind + "); Sunshine capture ready. Endpoint privacy and Moonlight playback still require physical checks." :
-                    "Game audio: " + route + ". Select the game's output in child Volume Mixer as " + sink + ", then wait for recheck.";
+                    audioMode == "CaptureEnabled" ?
+                    "Exact game render observed on " + sink + "; owned capture-only Sunshine is audio enabled. Physical isolation and playback remain unverified." :
+                    "Exact game render observed on " + sink + " (" + kind + "). Select Enable verified game audio to restart only owned Sunshine." :
+                    "Game audio: " + route + ". Sunshine is silent. Request child Volume Mixer, confirm the game's output as " + sink + ", then recheck.";
             }
         };
         Func<Task> refreshStreamingState = async () =>
@@ -601,6 +615,7 @@ static class Program
             catch
             {
                 sunshineItem.Enabled = lanSunshineItem.Enabled = stopSunshineItem.Enabled = pairItem.Enabled = false;
+                enableGameAudioItem.Enabled = false;
                 pairingCoordinator = null; recoverSunshineItem.Enabled = !runtimeActionPending;
             }
         };
@@ -714,10 +729,26 @@ static class Program
             {
                 var presenter = new ChildStreamingPresenter(agent, lifecycle.ObservedChild.Value);
                 await Task.Run(() => presenter.OpenGameAudioRoute());
-                statusText.Text = "Windows Volume Mixer opened in the child desktop. Set Minecraft Dungeons output to the selected ChildStream endpoint; ChildStream will recheck its exact render session.";
+                statusText.Text = "Windows Volume Mixer requested in the child desktop. Confirm it appeared there, choose the selected endpoint, then enable audio after route observation.";
             }
             catch (Exception ex) { statusText.Text = "Child game audio route unavailable: " + ex.Message; }
             finally { Task refreshed = refreshStreamingState(); }
+        };
+        enableGameAudioItem.Click += async (s, e) =>
+        {
+            if (agent == null || !lifecycle.CheckConnectedIdentity() || runtimeActionPending) return;
+            if (MessageBox.Show(f,
+                "This briefly disconnects Moonlight while ChildStream stops and restarts only its exact owned Sunshine process with capture-only audio. The game, child desktop and pairing identity stay in place. Continue?",
+                "Enable game audio", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            runtimeActionPending = true; enableGameAudioItem.Enabled = false;
+            try
+            {
+                var presenter = new ChildStreamingPresenter(agent, lifecycle.ObservedChild.Value);
+                await Task.Run(() => presenter.EnableGameAudio());
+                statusText.Text = "Exact game render rechecked; owned Sunshine restarted with capture-only audio. Reconnect Moonlight. Physical playback remains unverified.";
+            }
+            catch (Exception ex) { statusText.Text = "Game audio enable stopped or needs recovery: " + ex.Message; }
+            finally { runtimeActionPending = false; Task refreshed = refreshStreamingState(); }
         };
         stopSteamItem.Click += async (s, e) =>
         {
@@ -739,7 +770,8 @@ static class Program
             if (guide == null || guide.IsDisposed)
                 guide = new ChildStreamGuideForm(() => statusText.Text,
                     new[] { setupItem, sunshineItem, lanSunshineItem, pairItem,
-                        steamItem, gameItem, gameAudioItem, stopSunshineItem, recoverSunshineItem });
+                        steamItem, gameItem, gameAudioItem, enableGameAudioItem,
+                        stopSunshineItem, recoverSunshineItem });
             guide.Show(f); guide.BringToFront();
         };
         menu.Items.Insert(1, guideItem);

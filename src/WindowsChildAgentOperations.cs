@@ -129,6 +129,9 @@ internal sealed class WindowsChildRuntimeEnvironment : IChildRuntimeEnvironment
             processes.ReadSessionLogonTime((int)child.SessionId) != child.LogonTime)
             throw new InvalidOperationException("The child generation changed before opening Volume Mixer.");
         Process.Start(new ProcessStartInfo(GameAudioRoute.MixerUri) { UseShellExecute = true });
+        if (processes.CurrentSessionId != (int)child.SessionId ||
+            processes.ReadSessionLogonTime((int)child.SessionId) != child.LogonTime)
+            throw new InvalidOperationException("The child generation changed after requesting Volume Mixer.");
     }
     public SunshineCollisionSnapshot ReadCollision(SunshinePortFamily family)
     { return WindowsSunshineCollisionReader.Read(family); }

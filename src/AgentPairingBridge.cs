@@ -126,7 +126,8 @@ internal sealed class ChildStreamingPresenter
     {
         var status = Observe();
         string stage = (string)status["stage"];
-        if (stage != "NoSunshine" && stage != "SunshineWithdrawn" && stage != "SunshineReady")
+        if (stage != "NoSunshine" && stage != "SunshineWithdrawn" &&
+            stage != "SunshineAudioWithdrawn" && stage != "SunshineReady")
             throw new InvalidOperationException("Reconcile the current owned runtime before device selection.");
         if (stage == "SunshineReady" && (string)status["lanPosture"] != "LocalOnly" && address == null)
             throw new InvalidOperationException("Stop approved LAN streaming before local diagnostics.");
@@ -159,5 +160,15 @@ internal sealed class ChildStreamingPresenter
         if ((string)state["steamStage"] != "GameObserved" || (string)state["stage"] != "SunshineReady")
             throw new InvalidOperationException("The exact child game and owned Sunshine must be running before setting its route.");
         return controller.Execute(ChildAgentOperation.OpenGameAudioRoute, "");
+    }
+    internal string EnableGameAudio()
+    {
+        var state = Observe();
+        if ((string)state["stage"] != "SunshineReady" ||
+            (string)state["steamStage"] != "GameObserved" ||
+            (string)state["audioMode"] == "CaptureEnabled" ||
+            (string)state["gameAudio"] != "GameRenderObserved")
+            throw new InvalidOperationException("The exact child game route must be observed before audio can be enabled.");
+        return controller.Execute(ChildAgentOperation.EnableGameAudio, "");
     }
 }

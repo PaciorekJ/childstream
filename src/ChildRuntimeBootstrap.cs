@@ -182,7 +182,9 @@ internal sealed class ChildAgentController
         if (!ReconcileLocked()) throw new InvalidOperationException("A verified child agent is required for runtime operation.");
         var commands = host as IChildAgentCommandHost;
         if (commands == null) throw new InvalidOperationException("This host has no authenticated child command channel.");
-        try { return commands.Exchange(operation, payload, operation == ChildAgentOperation.PairingPost ? 30000 : 15000); }
+        try { return commands.Exchange(operation, payload,
+            operation == ChildAgentOperation.PairingPost ||
+            operation == ChildAgentOperation.EnableGameAudio ? 30000 : 15000); }
         catch (ChildAgentCommandRejectedException) { throw; }
         catch (Exception ex) { Failure = ex.Message; Stage = ChildAgentStage.Uncertain; throw; }
     }
