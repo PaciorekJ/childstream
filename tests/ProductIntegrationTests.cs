@@ -132,13 +132,24 @@ internal static class ProductIntegrationTests
         var exact = new ProductProcessIdentity { Pid = 120, SessionId = 2,
             StartTimeUtcTicks = 54321, ExecutablePath = executable,
             ExecutableSha256 = SunshineReleasePin.ExecutableSha256 };
-        environment.RecordStartIntent(child); environment.RecordStarted(child, exact);
+        string configText = "bind_address = 127.0.0.1\noutput_name = {first}\n";
+        string config = environment.EnsureGenerationFile(child,
+            ChildGenerationConfiguration.RunName(configText), configText);
+        environment.RecordStartIntent(child); environment.RecordStarted(child, exact, config);
         Check(environment.HasUnresolvedStartIntent(child),
             "production record store exposes interrupted start intent after restart");
         var loaded = environment.ReadStarted(child);
         Check(loaded.Pid == exact.Pid && loaded.StartTimeUtcTicks == exact.StartTimeUtcTicks &&
             loaded.ExecutableSha256 == exact.ExecutableSha256,
             "production durable record store reloads exact Sunshine identity from temporary files");
+        Check(File.ReadAllText(Path.Combine(session, "started.record")).Contains(Path.GetFileName(config)),
+            "durable Sunshine process record binds the immutable run configuration");
+        File.AppendAllText(config, "external edit");
+        Reject(() => environment.ReadStarted(child),
+            "foreign edit of a recorded run config invalidates recovery identity");
+        Check(File.ReadAllText(config).EndsWith("external edit"),
+            "foreign configuration drift remains untouched for review");
+        File.WriteAllText(config, configText);
         processes.Current = new ProductProcessIdentity { Pid = exact.Pid, SessionId = 2,
             StartTimeUtcTicks = 88888, ExecutablePath = executable,
             ExecutableSha256 = SunshineReleasePin.ExecutableSha256 };
@@ -150,6 +161,14 @@ internal static class ProductIntegrationTests
             !File.Exists(Path.Combine(session, "started.record")),
             "verified absent exact failed start removes only its own intent and record");
         Check(!environment.HasUnresolvedStartIntent(child), "reconciled start no longer blocks a new launch");
+        string nextText = "bind_address = 0.0.0.0\noutput_name = {second}\n";
+        string partialConfig = Path.Combine(session, ChildGenerationConfiguration.RunName(nextText));
+        File.WriteAllText(partialConfig, "interrupted write");
+        Reject(() => environment.EnsureGenerationFile(child,
+            ChildGenerationConfiguration.RunName(nextText), nextText),
+            "interrupted per-run file cannot be adopted as a completed config");
+        Check(File.ReadAllText(partialConfig) == "interrupted write",
+            "incomplete config admission preserves its bytes for reviewed cleanup");
         environment.RecordStartIntent(child);
         File.WriteAllText(Path.Combine(session, "started.record"), "partial");
         Reject(() => environment.ReadStarted(child),

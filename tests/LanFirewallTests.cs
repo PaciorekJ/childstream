@@ -14,7 +14,7 @@ internal static class LanFirewallTests
     {
         internal readonly Dictionary<string, LanFirewallRule> Rules = new Dictionary<string, LanFirewallRule>();
         internal bool Complete = true, Physical = true, Private = true, Enabled = true, Block = true,
-            LocalEffective = true, InterfaceProtected = true;
+            LocalEffective = true, InterfaceProtected = true, Wildcard = true;
         internal int Foreign, ConflictingBlock;
         internal string Network = "physical-adapter|192.168.50.10|192.168.50.0/24";
         public LanFirewallObservation Read(string address, SunshinePortFamily family, string executable)
@@ -24,6 +24,7 @@ internal static class LanFirewallTests
                 PhysicalInterfaceUp = Physical, PrivateProfileActive = Private,
                 FirewallEnabled = Enabled, DefaultInboundBlocked = Block,
                 LocalRulesEffective = LocalEffective, InterfaceFirewallApplies = InterfaceProtected,
+                WildcardScopeComplete = Wildcard,
                 ForeignAllowRules = Foreign, ConflictingBlockRules = ConflictingBlock,
                 Complete = Complete };
             result.OwnedRules.AddRange(Rules.Values); return result;
@@ -58,6 +59,34 @@ internal static class LanFirewallTests
             "Wi-Fi", 0, 2) &&
             !WindowsLanFirewallHost.IsSelectedPrivateProfileEvidence(7, "Wi-Fi", 7,
             "Wi-Fi", 1, 1), "another private profile cannot substitute for selected interface");
+        var selected = new WildcardInterfaceEvidence { Identity = nic, Address = "192.168.50.10",
+            Selected = true, Profile = 2, ProfileKnown = true, FirewallEnabled = true,
+            DefaultInboundBlocked = true, InterfaceProtected = true, LocalRulesEffective = true };
+        var second = new WildcardInterfaceEvidence { Identity = another, Address = "10.0.0.2",
+            Profile = 1, ProfileKnown = true, FirewallEnabled = true,
+            DefaultInboundBlocked = true, InterfaceProtected = true, LocalRulesEffective = true };
+        Check(WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected, second }),
+            "all wildcard-reachable profiles require individual protected observations");
+        second.FirewallEnabled = false;
+        Check(!WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected, second }),
+            "Private selected interface cannot mask disabled Public firewall");
+        second.FirewallEnabled = true; second.DefaultInboundBlocked = false;
+        Check(!WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected, second }),
+            "Public default allow blocks wildcard binding");
+        second.DefaultInboundBlocked = true; second.InterfaceProtected = false;
+        Check(!WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected, second }),
+            "firewall-excluded alternate interface blocks wildcard binding");
+        second.InterfaceProtected = true; second.Profile = 4; second.ProfileKnown = false;
+        Check(!WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected, second }),
+            "unattributed Domain path fails closed");
+        second.ProfileKnown = true; second.Profile = 2;
+        Check(WindowsLanFirewallHost.WildcardScopeAccepted(new [] { selected, second }),
+            "multiple same-profile interfaces are each assessed");
+        Check(WindowsLanFirewallHost.RuleIntersectsWildcard(1, 3) &&
+            WindowsLanFirewallHost.RuleIntersectsWildcard(4, 6) &&
+            WindowsLanFirewallHost.RuleIntersectsWildcard(0, 2) &&
+            !WindowsLanFirewallHost.RuleIntersectsWildcard(4, 3),
+            "Public, Domain and unknown-profile broad rules are assessed against all reachable profiles");
         string fixture = Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
             "ChildStreamLan-" + Guid.NewGuid().ToString("N"));
         string root = Path.Combine(fixture, "ChildStream");
@@ -100,6 +129,10 @@ internal static class LanFirewallTests
             host.InterfaceProtected = true; host.ConflictingBlock = 1;
             Reject(() => transaction.Plan("192.168.50.10", digest), "overlapping inbound block rule blocks plan");
             host.ConflictingBlock = 0;
+            host.Wildcard = false;
+            Reject(() => transaction.Plan("192.168.50.10", digest),
+                "unprotected alternate wildcard path blocks pre-start plan");
+            host.Wildcard = true;
             host.Block = true; host.Network = "drift";
             Reject(() => transaction.Apply(plan, plan.Hash), "network identity drift blocks apply");
             host.Network = "physical-adapter|192.168.50.10|192.168.50.0/24";
@@ -120,6 +153,10 @@ internal static class LanFirewallTests
                 "journal durable before approved firewall changes");
             host.Foreign = 1;
             Check(!transaction.Verify("192.168.50.10"), "new broad allowance invalidates runtime admission");
+            host.Foreign = 0; host.Wildcard = false;
+            Check(!transaction.Verify("192.168.50.10"),
+                "idle supervision sees the same complete wildcard scope as pre-start planning");
+            host.Wildcard = true;
             host.Foreign = 0; host.Network = "changed-after-logon";
             Check(!transaction.Verify("192.168.50.10"), "adapter or subnet drift invalidates runtime admission");
             host.Network = "physical-adapter|192.168.50.10|192.168.50.0/24";

@@ -114,6 +114,7 @@ static class IntegratedRuntimeTests
         internal bool MultipleDevices;
         internal bool FailGameRecord;
         internal string SunshineConfiguration;
+        internal string LastConfig;
         internal string GameIntentPath { get { return Path.Combine(Root, "game.intent"); } }
         internal string GameRecordPath { get { return Path.Combine(Root, "game.record"); } }
         internal Environment(string root)
@@ -128,7 +129,8 @@ static class IntegratedRuntimeTests
         public ProcessTokenObservation ReadToken(int pid)
         { return new ProcessTokenObservation { Sid = UserSid, Elevation = Elevated ? RuntimeTokenStatus.Elevated : RuntimeTokenStatus.Limited }; }
         public string DiscoverDisplayLog(ChildSessionIdentity child)
-        { Discoveries++; return "Info: Currently available display devices:\n[{\"device_id\":\"{6b4f23ba-ef14-45ab-9c90-5d6c8f859f24}\",\"display_name\":\"DISPLAY2\",\"info\":{\"primary\":true}}" +
+        { if (Process.Current != null) throw new InvalidOperationException("Discovery collided with the running owned port family.");
+          Discoveries++; return "Info: Currently available display devices:\n[{\"device_id\":\"{6b4f23ba-ef14-45ab-9c90-5d6c8f859f24}\",\"display_name\":\"DISPLAY2\",\"info\":{\"primary\":true}}" +
             (MultipleDevices ? ",{\"device_id\":\"{12100db6-5a9d-40c4-9c10-c3b1f606a632}\",\"display_name\":\"DISPLAY3\",\"info\":{}}" : "") + "]"; }
         public ChildAudioEndpointInventory ReadAudio(ChildSessionIdentity child)
         { var result = new ChildAudioEndpointInventory { SessionId = (int)child.SessionId, Complete = true };
@@ -151,10 +153,16 @@ static class IntegratedRuntimeTests
           Pairing.Owner = owner; return Pairing; }
         public string EnsureGenerationFile(ChildSessionIdentity child, string name, string content)
         { if (!name.EndsWith(".conf") && name != "apps.json") throw new Exception("Unexpected config file.");
-          if (name == "sunshine.conf") SunshineConfiguration = content;
-          return Path.Combine(Root, "sessions", child.SessionId + "-" + child.LogonTime, name); }
+          if (name.StartsWith("s-")) SunshineConfiguration = content;
+          string path = ChildGenerationConfiguration.Write(Path.Combine(Root, "sessions",
+              child.SessionId + "-" + child.LogonTime), name, content);
+          if (name.StartsWith("s-")) LastConfig = path;
+          return path; }
         public void RecordStartIntent(ChildSessionIdentity child) { Intents++; }
-        public void RecordStarted(ChildSessionIdentity child, ProductProcessIdentity process) { Records++; LastStarted = process; }
+        public void RecordStarted(ChildSessionIdentity child, ProductProcessIdentity process, string configuration)
+        { if (ChildGenerationConfiguration.VerifyRunFile(Path.GetDirectoryName(configuration), configuration) == null)
+              throw new Exception("Config not admitted");
+          Records++; LastStarted = process; }
         public bool HasUnresolvedStartIntent(ChildSessionIdentity child) { return Intents > Resolved; }
         public void ResolveStopped(ChildSessionIdentity child, ProductProcessIdentity process) { Resolved++; }
         public ProductProcessIdentity ReadStarted(ChildSessionIdentity child)
@@ -428,6 +436,9 @@ static class IntegratedRuntimeTests
             transition.LanApproved = true;
             string chosen = "{\"display\":\"{6b4f23ba-ef14-45ab-9c90-5d6c8f859f24}\"," +
                 "\"audio\":\"{child-audio}\",\"address\":\"192.168.50.10\"}";
+            Reject(() => journey.Start(chosen, true),
+                "low-level journey cannot bypass explicit stream interruption approval");
+            journey.Stop();
             Check(journey.Start(chosen, true).ManualAddress == "192.168.50.10:48089" &&
                 transition.Process.Starts == 2 && transition.Process.Stops == 1 &&
                 transition.Identity.Credentials,
@@ -443,6 +454,110 @@ static class IntegratedRuntimeTests
             app.Stop();
         }
         var multiple = new Environment(root + "-multiple") { MultipleDevices = true };
+        var productionPath = new Environment(root + "-ui-path") { MultipleDevices = true };
+        using (var worker = new ChildAgentRuntime(child, 1, productionPath, new ManualMonitor()))
+        {
+            var host = new Bootstrap(worker, child, agentPath);
+            var app = new ChildAgentController(host, 1, child, agentPath, Digest);
+            app.Start(request);
+            var presenter = new ChildStreamingPresenter(app, child);
+            ChildStreamingPreparation first = presenter.Prepare(null);
+            string firstDisplay = first.Catalog.Displays[0].Id;
+            string firstAudio = first.Catalog.Audio[0];
+            Check(presenter.Commit(first, firstDisplay, firstAudio, false).ManualAddress ==
+                "127.0.0.1:48089" && productionPath.Process.Starts == 1,
+                "real UI presenter starts local owned runtime after capability discovery");
+            string firstConfig = productionPath.LastConfig;
+            int beforePicker = productionPath.Discoveries;
+            ChildStreamingPreparation lanChoice = presenter.Prepare("192.168.50.10");
+            Check(productionPath.Discoveries == beforePicker && productionPath.Process.Current != null,
+                "running local process supplies verified picker snapshot without colliding discovery process");
+            Check(presenter.Observe()["stage"].Equals("SunshineReady") &&
+                worker.Execute(ChildAgentOperation.PairingGet, "").Contains("Fire TV"),
+                "cancelled picker leaves owned process and pairing capability unchanged");
+            Reject(() => presenter.Commit(lanChoice, firstDisplay, firstAudio, false),
+                "production presenter requires approval before interrupting local stream");
+            productionPath.LanApproved = true;
+            Check(presenter.Commit(lanChoice, firstDisplay, firstAudio, true).ManualAddress ==
+                "192.168.50.10:48089" && productionPath.Process.Starts == 2 &&
+                productionPath.Process.Stops == 1 && productionPath.Discoveries > beforePicker,
+                "approved UI transition stops exact local process before fresh discovery and LAN start");
+            string lanConfigA = productionPath.LastConfig;
+            Check(File.Exists(firstConfig) && File.Exists(lanConfigA) && firstConfig != lanConfigA &&
+                productionPath.Identity.Credentials,
+                "immutable local and LAN files coexist while pairing identity remains stable");
+            presenter.Stop();
+            ChildStreamingPreparation second = presenter.Prepare("192.168.50.10");
+            string secondDisplay = second.Catalog.Displays[1].Id;
+            string secondAudio = second.Catalog.Audio[1];
+            presenter.Commit(second, secondDisplay, secondAudio, false);
+            string lanConfigB = productionPath.LastConfig;
+            Check(lanConfigA != lanConfigB && File.Exists(lanConfigB) &&
+                File.ReadAllText(lanConfigB).Contains(secondAudio) &&
+                File.ReadAllText(lanConfigA).Contains(firstAudio) &&
+                productionPath.Process.Starts == 3,
+                "same child generation can select different display/audio using real immutable files");
+            presenter.Stop();
+            ChildStreamingPreparation repeat = presenter.Prepare("192.168.50.10");
+            presenter.Commit(repeat, secondDisplay, secondAudio, false);
+            Check(productionPath.LastConfig == lanConfigB && productionPath.Process.Starts == 4,
+                "repeat selection reuses exact unchanged configuration bytes without overwrite");
+            presenter.Stop();
+            File.AppendAllText(lanConfigB, "foreign edit");
+            ChildStreamingPreparation drifted = presenter.Prepare("192.168.50.10");
+            Reject(() => presenter.Commit(drifted, secondDisplay, secondAudio, false),
+                "external edit of an owned run configuration blocks restart");
+            Check(productionPath.Process.Starts == 4 && File.ReadAllText(lanConfigB).EndsWith("foreign edit"),
+                "config drift never launches a process or overwrites foreign bytes");
+            app.Stop();
+        }
+        var lostLocal = new Environment(root + "-lost-local");
+        var failedTransition = new Environment(root + "-failed-switch");
+        using (var worker = new ChildAgentRuntime(child, 1, failedTransition, new ManualMonitor()))
+        {
+            var host = new Bootstrap(worker, child, agentPath);
+            var app = new ChildAgentController(host, 1, child, agentPath, Digest);
+            app.Start(request);
+            var presenter = new ChildStreamingPresenter(app, child);
+            var local = presenter.Prepare(null);
+            presenter.Commit(local, local.Catalog.Displays[0].Id, local.Catalog.Audio[0], false);
+            var planned = presenter.Prepare("192.168.50.10");
+            Reject(() => presenter.Commit(planned, planned.Catalog.Displays[0].Id,
+                planned.Catalog.Audio[0], true),
+                "failed approved transition reports a stopped local runtime, not success");
+            var observed = presenter.Observe();
+            Check(observed["stage"].Equals("NoSunshine") &&
+                failedTransition.Process.Stops == 1 && failedTransition.Process.Starts == 1 &&
+                !ChildStreamingUiState.From(observed, false).Pair &&
+                ChildStreamingUiState.From(observed, false).StartLan,
+                "failed transition restores controls from authoritative no-runtime status");
+            Reject(() => worker.Execute(ChildAgentOperation.PairingGet, ""),
+                "failed transition cannot retain a stale pairing capability");
+            app.Stop();
+        }
+        using (var worker = new ChildAgentRuntime(child, 1, lostLocal, new ManualMonitor()))
+        {
+            var host = new Bootstrap(worker, child, agentPath);
+            var app = new ChildAgentController(host, 1, child, agentPath, Digest);
+            app.Start(request);
+            var presenter = new ChildStreamingPresenter(app, child);
+            ChildStreamingPreparation local = presenter.Prepare(null);
+            presenter.Commit(local, local.Catalog.Displays[0].Id, local.Catalog.Audio[0], false);
+            lostLocal.Process.Current = null;
+            Check(presenter.Observe()["stage"].Equals("SunshineLost"),
+                "unexpected local process exit is visible to the production presenter");
+            Reject(() => presenter.Prepare(null), "lost runtime is not offered a new start before recovery");
+            Check(presenter.Recover().Contains("NoSunshine") && lostLocal.Resolved == 1,
+                "production recovery reconciles an exact already-exited local process");
+            local = presenter.Prepare(null);
+            presenter.Commit(local, local.Catalog.Displays[0].Id, local.Catalog.Audio[0], false);
+            ProductProcessIdentity old = lostLocal.Process.Current;
+            lostLocal.Process.Current = new ProductProcessIdentity { Pid = old.Pid,
+                SessionId = old.SessionId, StartTimeUtcTicks = old.StartTimeUtcTicks + 1,
+                ExecutablePath = old.ExecutablePath, ExecutableSha256 = old.ExecutableSha256 };
+            Reject(() => presenter.Recover(), "PID reuse prevents guessed local recovery");
+            Check(lostLocal.Process.UnrelatedTouched == 0, "recovery never touches reused PID");
+        }
         using (var worker = new ChildAgentRuntime(child, 1, multiple))
         {
             ChildCapabilityCatalog catalog = ChildCapabilityCatalog.Parse(
@@ -514,7 +629,7 @@ static class IntegratedRuntimeTests
         string temporary = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar) +
             Path.DirectorySeparatorChar + "ChildStreamIntegrated-";
         foreach (string fixture in new [] { root, root + "-cold", root + "-replaced", root + "-exited",
-            root + "-never", root + "-warm-delayed", root + "-warm-never", root + "-resumed", root + "-lan", root + "-reused-lan", root + "-transition", root + "-multiple", root + "-delayed", root + "-vanished", root + "-reused", root + "-interrupted" })
+            root + "-never", root + "-warm-delayed", root + "-warm-never", root + "-resumed", root + "-lan", root + "-reused-lan", root + "-transition", root + "-ui-path", root + "-failed-switch", root + "-lost-local", root + "-multiple", root + "-delayed", root + "-vanished", root + "-reused", root + "-interrupted" })
         { if (!Path.GetFullPath(fixture).StartsWith(temporary, StringComparison.OrdinalIgnoreCase))
               throw new InvalidOperationException("Fixture cleanup escaped ChildStream temp root.");
           if (Directory.Exists(fixture)) Directory.Delete(fixture, true); }

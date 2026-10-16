@@ -82,6 +82,12 @@ if ($LASTEXITCODE -ne 0) { throw 'Offline product integration tests failed.' }
 if ($LASTEXITCODE -ne 0) { throw 'LAN firewall transaction test compilation failed.' }
 & (Join-Path $artifacts 'LanFirewallTests.exe')
 if ($LASTEXITCODE -ne 0) { throw 'LAN firewall transaction fixture tests failed.' }
+& $csc /nologo /target:exe /main:ControllerWitnessProgram "/out:$artifacts\ChildStreamControllerWitness.exe" /r:System.Web.Extensions.dll (Join-Path $root 'src\ControllerWitness.cs')
+if ($LASTEXITCODE -ne 0) { throw 'Opt-in controller witness compilation failed.' }
+& $csc /nologo /target:exe /main:ControllerWitnessTests "/out:$artifacts\ControllerWitnessTests.exe" /r:System.Web.Extensions.dll (Join-Path $root 'src\ControllerWitness.cs') (Join-Path $PSScriptRoot 'ControllerWitnessTests.cs')
+if ($LASTEXITCODE -ne 0) { throw 'Synthetic controller witness test compilation failed.' }
+& (Join-Path $artifacts 'ControllerWitnessTests.exe')
+if ($LASTEXITCODE -ne 0) { throw 'Synthetic controller witness tests failed.' }
 & $csc /nologo /target:exe /main:IntegratedRuntimeTests "/out:$artifacts\IntegratedRuntimeTests.exe" $productReferences $sources (Join-Path $PSScriptRoot 'IntegratedRuntimeTests.cs')
 if ($LASTEXITCODE -ne 0) { throw 'Integrated runtime test compilation failed.' }
 & (Join-Path $artifacts 'IntegratedRuntimeTests.exe')

@@ -197,6 +197,18 @@ internal static class UiJourneyTests
             Check(Find<Button>(guide, b => b.Text == "Recover start").Enabled &&
                 !Find<Button>(guide, b => b.Text == "Pair Moonlight").Enabled,
                 "production guide exposes recovery and keeps pairing disabled on uncertain runtime");
+            var lost = ChildStreamingUiState.From(new System.Collections.Generic.Dictionary<string, object> {
+                { "stage", "SunshineLost" }, { "lanPosture", "LocalOnly" } }, false);
+            guideItems[7].Enabled = lost.Recover; guideItems[2].Enabled = lost.StartLan;
+            guideStatus = "Owned local Sunshine exited. Reconcile its exact process before retrying.";
+            guide.RefreshState(); Save(guide, folder, "guide-lost-recovery-simulated");
+            Check(lost.Recover && !lost.StartLan && !lost.Pair &&
+                Find<Button>(guide, b => b.Text == "Recover start").Enabled,
+                "idle local process loss exposes exact recovery through real guided controls");
+            var withdrawn = ChildStreamingUiState.From(new System.Collections.Generic.Dictionary<string, object> {
+                { "stage", "SunshineWithdrawn" }, { "lanPosture", "Withdrawn" } }, false);
+            Check(withdrawn.StartLan && !withdrawn.Pair && !withdrawn.Recover,
+                "withdrawn LAN listener offers a new approved start without stale pairing");
             CheckVisibleControlsInside(guide, "guided action remains visible");
         }
         string json = "{\"displays\":[{\"id\":\"{6b4f23ba-ef14-45ab-9c90-5d6c8f859f24}\",\"name\":\"Child Display 1\"}," +

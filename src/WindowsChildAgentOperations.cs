@@ -5,6 +5,7 @@ using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
 using System.Threading;
+using System.Linq;
 
 internal sealed class WindowsChildAgentOperations : IChildAgentOperations
 {
@@ -18,6 +19,54 @@ internal sealed class WindowsChildAgentOperations : IChildAgentOperations
     public string Execute(ChildAgentOperation operation, string payload)
     { return runtime.Execute(operation, payload); }
     public void Dispose() { runtime.Dispose(); }
+}
+
+// Immutable, content-addressed per-run configuration. A stopped generation can
+// select different devices without overwriting a file another process used.
+internal static class ChildGenerationConfiguration
+{
+    internal static string Digest(byte[] bytes)
+    {
+        using (var sha = SHA256.Create())
+            return BitConverter.ToString(sha.ComputeHash(bytes)).Replace("-", "").ToLowerInvariant();
+    }
+    internal static string RunName(string content)
+    { return "s-" + Digest(new UTF8Encoding(false).GetBytes(content)).Substring(0, 32) + ".conf"; }
+    internal static string Write(string session, string name, string content)
+    {
+        bool run = name.StartsWith("s-", StringComparison.Ordinal);
+        if (name != "apps.json" && name != "sunshine-discovery.conf" &&
+            name != "sunshine.conf" && name != "sunshine-lan.conf" && !run)
+            throw new InvalidOperationException("Child generation file is outside the fixed allowlist.");
+        byte[] desired = new UTF8Encoding(false).GetBytes(content);
+        if (run && name != RunName(content))
+            throw new InvalidDataException("Per-run configuration name does not match its bytes.");
+        string path = Path.Combine(session, name);
+        InstallerPolicy.ValidateCanonicalFilePath(path);
+        Directory.CreateDirectory(session);
+        if (File.Exists(path))
+        {
+            byte[] existing = File.ReadAllBytes(path);
+            if (existing.Length != desired.Length || !existing.SequenceEqual(desired))
+                throw new InvalidOperationException("Child generation configuration drifted.");
+            return path;
+        }
+        using (var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+        { stream.Write(desired, 0, desired.Length); stream.Flush(true); }
+        return path;
+    }
+    internal static string VerifyRunFile(string session, string path)
+    {
+        string exact = Path.GetFullPath(path);
+        InstallerPolicy.ValidateCanonicalFilePath(exact);
+        if (!String.Equals(Path.GetDirectoryName(exact), Path.GetFullPath(session),
+            StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("Runtime config is outside the exact child generation.");
+        string name = Path.GetFileName(exact);
+        if (!File.Exists(exact) || name != RunName(File.ReadAllText(exact, new UTF8Encoding(false))))
+            throw new InvalidDataException("Runtime config bytes or content identity changed.");
+        return Digest(File.ReadAllBytes(exact));
+    }
 }
 
 internal sealed class WindowsChildRuntimeEnvironment : IChildRuntimeEnvironment
@@ -104,26 +153,7 @@ internal sealed class WindowsChildRuntimeEnvironment : IChildRuntimeEnvironment
         return path;
     }
     public string EnsureGenerationFile(ChildSessionIdentity child, string name, string content)
-    {
-        if (name != "apps.json" && name != "sunshine.conf" && name != "sunshine-lan.conf" &&
-            name != "sunshine-discovery.conf")
-            throw new InvalidOperationException("Child generation file is outside the fixed allowlist.");
-        string path = Path.Combine(SessionRoot(child), name);
-        InstallerPolicy.ValidateCanonicalFilePath(path);
-        Directory.CreateDirectory(Path.GetDirectoryName(path));
-        byte[] desired = new UTF8Encoding(false).GetBytes(content);
-        if (File.Exists(path))
-        {
-            byte[] existing = File.ReadAllBytes(path);
-            if (existing.Length != desired.Length) throw new InvalidOperationException("Child generation configuration drifted.");
-            for (int i = 0; i < desired.Length; i++)
-                if (existing[i] != desired[i]) throw new InvalidOperationException("Child generation configuration drifted.");
-            return path;
-        }
-        using (var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-        { stream.Write(desired, 0, desired.Length); stream.Flush(true); }
-        return path;
-    }
+    { return ChildGenerationConfiguration.Write(SessionRoot(child), name, content); }
     private static string DiscoveryConfiguration(ChildSessionIdentity child, string session)
     {
         Action<StringBuilder, string, string> add = (buffer, key, value) => buffer.Append(key).Append(" = ").Append(value).Append('\n');
@@ -202,11 +232,13 @@ internal sealed class WindowsChildRuntimeEnvironment : IChildRuntimeEnvironment
         using (var stream = new FileStream(file, FileMode.CreateNew, FileAccess.Write, FileShare.None))
         { stream.Write(bytes, 0, bytes.Length); stream.Flush(true); }
     }
-    public void RecordStarted(ChildSessionIdentity child, ProductProcessIdentity process)
+    public void RecordStarted(ChildSessionIdentity child, ProductProcessIdentity process, string configuration)
     {
         string file = Path.Combine(SessionRoot(child), "started.record");
         InstallerPolicy.ValidateCanonicalFilePath(file);
-        byte[] bytes = Encoding.ASCII.GetBytes(RecordText(child, process));
+        string digest = ChildGenerationConfiguration.VerifyRunFile(SessionRoot(child), configuration);
+        string name = Path.GetFileName(configuration);
+        byte[] bytes = Encoding.ASCII.GetBytes(RecordText(child, process) + "|" + name + "|" + digest);
         using (var stream = new FileStream(file, FileMode.CreateNew, FileAccess.Write, FileShare.None))
         { stream.Write(bytes, 0, bytes.Length); stream.Flush(true); }
     }
@@ -229,8 +261,10 @@ internal sealed class WindowsChildRuntimeEnvironment : IChildRuntimeEnvironment
     {
         string session = SessionRoot(child);
         string record = Path.Combine(session, "started.record"), intent = Path.Combine(session, "start.intent");
-        if (processes.Read(process.Pid) != null ||
-            File.ReadAllText(record) != RecordText(child, process) ||
+        ProductProcessIdentity recorded = ReadStarted(child);
+        if (processes.Read(process.Pid) != null || recorded == null ||
+            recorded.Pid != process.Pid || recorded.StartTimeUtcTicks != process.StartTimeUtcTicks ||
+            !String.Equals(recorded.ExecutableSha256, process.ExecutableSha256, StringComparison.OrdinalIgnoreCase) ||
             File.ReadAllText(intent) != child.SessionId + "|" + child.LogonTime)
             throw new InvalidOperationException("Owned Sunshine stop record or process state changed.");
         File.Delete(record); File.Delete(intent);
@@ -246,7 +280,7 @@ internal sealed class WindowsChildRuntimeEnvironment : IChildRuntimeEnvironment
             throw new InvalidDataException("Sunshine recovery intent or record changed.");
         string[] fields = File.ReadAllText(record).Split('|');
         int pid; long started;
-        if (fields.Length != 5 || fields[0] != child.SessionId.ToString() ||
+        if ((fields.Length != 5 && fields.Length != 7) || fields[0] != child.SessionId.ToString() ||
             fields[1] != child.LogonTime.ToString() ||
             !Int32.TryParse(fields[2], out pid) || pid <= 0 ||
             !Int64.TryParse(fields[3], out started) || started <= 0 ||
@@ -256,7 +290,16 @@ internal sealed class WindowsChildRuntimeEnvironment : IChildRuntimeEnvironment
         var observed = new ProductProcessIdentity { Pid = pid, SessionId = (int)child.SessionId,
             StartTimeUtcTicks = started, ExecutablePath = SunshineExecutable,
             ExecutableSha256 = SunshineReleasePin.ExecutableSha256 };
-        if (File.ReadAllText(record) != RecordText(child, observed))
+        string canonical = RecordText(child, observed);
+        if (fields.Length == 7)
+        {
+            string path = Path.Combine(session, fields[5]);
+            string digest = ChildGenerationConfiguration.VerifyRunFile(session, path);
+            if (digest != fields[6])
+                throw new InvalidDataException("Started Sunshine config identity changed.");
+            canonical += "|" + fields[5] + "|" + digest;
+        }
+        if (File.ReadAllText(record) != canonical)
             throw new InvalidDataException("Sunshine recovery record is noncanonical.");
         return observed;
     }
@@ -266,9 +309,13 @@ internal sealed class WindowsChildRuntimeEnvironment : IChildRuntimeEnvironment
         string session = SessionRoot(child);
         string record = Path.Combine(session, "started.record");
         string intent = Path.Combine(session, "start.intent");
+        ProductProcessIdentity recorded = File.Exists(record) ? ReadStarted(child) : null;
         if (processes.Read(process.Pid) != null ||
             File.ReadAllText(intent) != child.SessionId + "|" + child.LogonTime ||
-            (File.Exists(record) && File.ReadAllText(record) != RecordText(child, process)))
+            (recorded != null && (recorded.Pid != process.Pid ||
+                recorded.StartTimeUtcTicks != process.StartTimeUtcTicks ||
+                !String.Equals(recorded.ExecutableSha256, process.ExecutableSha256,
+                    StringComparison.OrdinalIgnoreCase))))
             throw new InvalidOperationException("Failed-start process or durable record cannot be reconciled.");
         if (File.Exists(record)) File.Delete(record);
         File.Delete(intent);

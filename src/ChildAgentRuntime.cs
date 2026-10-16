@@ -23,7 +23,7 @@ internal interface IChildRuntimeEnvironment
         SunshineAdminCredential credential, IVerifiedChildSunshine owner);
     string EnsureGenerationFile(ChildSessionIdentity child, string name, string content);
     void RecordStartIntent(ChildSessionIdentity child);
-    void RecordStarted(ChildSessionIdentity child, ProductProcessIdentity process);
+    void RecordStarted(ChildSessionIdentity child, ProductProcessIdentity process, string configuration);
     bool HasUnresolvedStartIntent(ChildSessionIdentity child);
     void ResolveStopped(ChildSessionIdentity child, ProductProcessIdentity process);
     ProductProcessIdentity ReadStarted(ChildSessionIdentity child);
@@ -140,6 +140,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
     private readonly object gate = new object();
     private readonly IRuntimeMonitor monitor;
     private bool monitoringLan, boundaryWithdrawn;
+    private string lastCapabilities;
     private string lanAddress;
     private ChildOwnedProcess sunshine;
     private ProductProcessIdentity sunshineIdentity;
@@ -239,7 +240,23 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
     }
     private string Capabilities()
     {
+        if (sunshineIdentity != null)
+        {
+            if (owner == null) throw new InvalidOperationException("Owned Sunshine has no verified owner.");
+            owner.AssertStillOwned();
+            if (lastCapabilities == null)
+                throw new InvalidOperationException("No verified child device catalog belongs to this runtime.");
+            // A picker may use the last owned observation while this process
+            // occupies the discovery ports. StartSunshine rediscovers and
+            // validates the selection after its exact stop.
+            return lastCapabilities;
+        }
         string log = environment.DiscoverDisplayLog(child);
+        lastCapabilities = SerializeCapabilities(log);
+        return lastCapabilities;
+    }
+    private string SerializeCapabilities(string log)
+    {
         var displays = new List<object>();
         foreach (SunshineDisplayObservation display in SunshineDisplayCatalog.ParseOwnedLog(log))
             if (display.Active) displays.Add(new { id = display.Id, name = display.Name });
@@ -354,6 +371,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
         string conflict = SunshineStartupGate.CheckFamilyAvailable(collision, family);
         if (conflict != null) throw new InvalidOperationException(conflict);
         string log = environment.DiscoverDisplayLog(child);
+        lastCapabilities = SerializeCapabilities(log);
         SunshineDisplayObservation display = null;
         if (selected.Display == null) display = SunshineDisplayCatalog.RequireUniqueActive(log);
         else
@@ -394,16 +412,16 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
                     Child = child, BindAddress = requestedLanAddress, Port = family.BasePort,
                     BoundaryVerified = true } };
             environment.EnsureGenerationFile(child, "apps.json", ChildProductConfiguration.BuildApps());
+            string configuration = ChildProductConfiguration.BuildSunshine(options);
             string config = environment.EnsureGenerationFile(child,
-                requestedLanAddress == null ? "sunshine.conf" : "sunshine-lan.conf",
-                ChildProductConfiguration.BuildSunshine(options));
+                ChildGenerationConfiguration.RunName(configuration), configuration);
             environment.RecordStartIntent(child);
             startIntentRecorded = true;
             sunshine = new ChildOwnedProcess(environment.Processes, child,
                 environment.SunshineExecutable, SunshineReleasePin.ExecutableSha256);
             sunshine.Start("\"" + config + "\"");
             sunshineIdentity = sunshine.Identity;
-            environment.RecordStarted(child, sunshineIdentity);
+            environment.RecordStarted(child, sunshineIdentity, config);
             var pendingOwner = new VerifiedChildSunshineRuntime(environment, child,
                 sunshineIdentity, identity, family, establishedCertificate, requestedLanAddress);
             string readyCertificate = null;

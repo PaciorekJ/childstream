@@ -20,7 +20,7 @@ internal sealed class LanFirewallObservation
 {
     internal string LocalAddress, RemoteSubnet, NetworkIdentity;
     internal bool PhysicalInterfaceUp, PrivateProfileActive, FirewallEnabled, DefaultInboundBlocked,
-        LocalRulesEffective, InterfaceFirewallApplies, Complete;
+        LocalRulesEffective, InterfaceFirewallApplies, WildcardScopeComplete, Complete;
     internal int ForeignAllowRules, ConflictingBlockRules;
     internal readonly List<LanFirewallRule> OwnedRules = new List<LanFirewallRule>();
 }
@@ -66,7 +66,7 @@ internal sealed class LanFirewallTransaction
     {
         if (state == null || !state.Complete || !state.PhysicalInterfaceUp ||
             !state.PrivateProfileActive || !state.FirewallEnabled || !state.DefaultInboundBlocked ||
-            !state.LocalRulesEffective || !state.InterfaceFirewallApplies ||
+            !state.LocalRulesEffective || !state.InterfaceFirewallApplies || !state.WildcardScopeComplete ||
             state.ForeignAllowRules != 0 || state.ConflictingBlockRules != 0 ||
             state.OwnedRules.Count != 0 ||
             !String.Equals(state.LocalAddress, address, StringComparison.Ordinal) ||
@@ -178,7 +178,7 @@ internal sealed class LanFirewallTransaction
         LanFirewallObservation state = host.Read(address, family, executable);
         return state != null && state.Complete && state.PhysicalInterfaceUp && state.PrivateProfileActive &&
             state.FirewallEnabled && state.DefaultInboundBlocked && state.LocalRulesEffective &&
-            state.InterfaceFirewallApplies && state.ForeignAllowRules == 0 &&
+            state.InterfaceFirewallApplies && state.WildcardScopeComplete && state.ForeignAllowRules == 0 &&
             state.ConflictingBlockRules == 0 &&
             state.NetworkIdentity == plan.NetworkIdentity && state.RemoteSubnet == plan.Subnet &&
             state.OwnedRules.Count == 2 && state.OwnedRules.Any(r => Exact(r, plan.Tcp)) &&

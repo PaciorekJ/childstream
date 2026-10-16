@@ -51,7 +51,7 @@ foreach ($relative in $sortedTracked) {
     if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw "Missing tracked file: $relative" }
     $entries[$relative.Replace('\','/')] = Read-CommittedBlob $relative
 }
-foreach ($name in @('ChildStream.exe','ChildStreamSetup.exe','ChildStreamBootstrap.exe','ChildStreamFeasibilityProbe.exe')) {
+foreach ($name in @('ChildStream.exe','ChildStreamSetup.exe','ChildStreamBootstrap.exe','ChildStreamFeasibilityProbe.exe','ChildStreamControllerWitness.exe')) {
     $full = Join-Path $root "tests\.artifacts\$name"
     $entries["bin/$name"] = [System.IO.File]::ReadAllBytes($full)
 }

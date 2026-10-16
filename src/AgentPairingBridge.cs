@@ -49,7 +49,7 @@ internal sealed class ChildStreamingJourney
     internal ChildStreamingJourney(ChildAgentController controller, ChildSessionIdentity child)
     { if (controller == null) throw new ArgumentNullException("controller");
       this.controller = controller; this.child = child; }
-    private IDictionary<string, object> ReadStatus()
+    internal IDictionary<string, object> ReadStatus()
     {
         if (!controller.Reconcile()) throw new InvalidOperationException("Exact child agent is no longer verified.");
         var state = new JavaScriptSerializer().DeserializeObject(
@@ -80,11 +80,7 @@ internal sealed class ChildStreamingJourney
             return existing;
         }
         if (stage == "SunshineReady" && approvedLan && posture == "LocalOnly")
-        {
-            controller.Execute(ChildAgentOperation.StopSunshine, "");
-            if ((string)ReadStatus()["stage"] != "NoSunshine")
-                throw new InvalidOperationException("Local Sunshine stop was not reconciled before LAN start.");
-        }
+            throw new InvalidOperationException("An explicit approved stop is required before changing network posture.");
         else if (stage == "SunshineReady" &&
             ((approvedLan && posture != "ScopedRulesVerified") ||
              (!approvedLan && posture != "LocalOnly")))
@@ -97,8 +93,9 @@ internal sealed class ChildStreamingJourney
     }
     internal string RecoverFailedStart()
     {
-        if ((string)ReadStatus()["stage"] != "Uncertain")
-            throw new InvalidOperationException("No uncertain ChildStream startup requires recovery.");
+        string stage = (string)ReadStatus()["stage"];
+        if (stage != "Uncertain" && stage != "SunshineLost" && stage != "SunshineBoundaryLost")
+            throw new InvalidOperationException("No lost or uncertain owned Sunshine requires recovery.");
         return controller.Execute(ChildAgentOperation.RecoverSunshine, "");
     }
     internal string Stop()
@@ -107,4 +104,53 @@ internal sealed class ChildStreamingJourney
             throw new InvalidOperationException("No verified owned Sunshine process is available to stop.");
         return controller.Execute(ChildAgentOperation.StopSunshine, "");
     }
+}
+
+internal sealed class ChildStreamingPreparation
+{
+    internal ChildCapabilityCatalog Catalog;
+    internal string Stage, Posture, Address;
+}
+
+// The same presenter is called by the real WinForms actions and the connected
+// fixture. Discovery is read-only with respect to the owned runtime; consent
+// to interrupt is required only after the user has selected child devices.
+internal sealed class ChildStreamingPresenter
+{
+    private readonly ChildAgentController controller;
+    private readonly ChildStreamingJourney journey;
+    internal ChildStreamingPresenter(ChildAgentController controller, ChildSessionIdentity child)
+    { this.controller = controller; journey = new ChildStreamingJourney(controller, child); }
+    internal IDictionary<string, object> Observe() { return journey.ReadStatus(); }
+    internal ChildStreamingPreparation Prepare(string address)
+    {
+        var status = Observe();
+        string stage = (string)status["stage"];
+        if (stage != "NoSunshine" && stage != "SunshineWithdrawn" && stage != "SunshineReady")
+            throw new InvalidOperationException("Reconcile the current owned runtime before device selection.");
+        if (stage == "SunshineReady" && (string)status["lanPosture"] != "LocalOnly" && address == null)
+            throw new InvalidOperationException("Stop approved LAN streaming before local diagnostics.");
+        string choices = controller.Execute(ChildAgentOperation.Capabilities, "");
+        return new ChildStreamingPreparation { Catalog = ChildCapabilityCatalog.Parse(choices),
+            Stage = stage, Posture = (string)status["lanPosture"], Address = address };
+    }
+    internal IVerifiedChildSunshine Commit(ChildStreamingPreparation prepared,
+        string display, string audio, bool approvedInterruption)
+    {
+        if (prepared == null || prepared.Catalog == null)
+            throw new InvalidDataException("A verified child device preparation is required.");
+        var now = Observe();
+        if ((string)now["stage"] != prepared.Stage || (string)now["lanPosture"] != prepared.Posture)
+            throw new InvalidOperationException("Child runtime changed during device selection; prepare again.");
+        string payload = prepared.Catalog.SelectionPayload(display, audio, prepared.Address);
+        if (prepared.Stage == "SunshineReady")
+        {
+            if (!approvedInterruption)
+                throw new InvalidOperationException("Interrupting the owned stream requires explicit approval.");
+            journey.Stop(); // Exact owned process only; child, game and pairing identity remain.
+        }
+        return journey.Start(payload, prepared.Address != null);
+    }
+    internal string Stop() { return journey.Stop(); }
+    internal string Recover() { return journey.RecoverFailedStart(); }
 }
