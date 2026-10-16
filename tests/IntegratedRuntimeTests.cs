@@ -131,6 +131,7 @@ static class IntegratedRuntimeTests
           Process.SteamPath = Path.Combine(root, "Steam", "steam.exe");
           Process.GamePath = Path.Combine(root, "Game", "Dungeons-Win64-Shipping.exe"); Pairing = new Pairing(Identity);
           Directory.CreateDirectory(Root); }
+        internal string AudioDefaultId = "{child-audio}";
         public IProductProcessHost Processes { get { return Process; } }
         public string SunshineExecutable { get { return Process.Path; } }
         public string DataRoot { get { return Root; } }
@@ -142,7 +143,8 @@ static class IntegratedRuntimeTests
           Discoveries++; return "Info: Currently available display devices:\n[{\"device_id\":\"{6b4f23ba-ef14-45ab-9c90-5d6c8f859f24}\",\"display_name\":\"DISPLAY2\",\"info\":{\"primary\":true}}" +
             (MultipleDevices ? ",{\"device_id\":\"{12100db6-5a9d-40c4-9c10-c3b1f606a632}\",\"display_name\":\"DISPLAY3\",\"info\":{}}" : "") + "]"; }
         public ChildAudioEndpointInventory ReadAudio(ChildSessionIdentity child)
-        { var result = new ChildAudioEndpointInventory { SessionId = (int)child.SessionId, Complete = true };
+        { var result = new ChildAudioEndpointInventory { SessionId = (int)child.SessionId,
+              Complete = true, DefaultRenderId = AudioDefaultId };
           result.ActiveRenderIds.Add("{child-audio}"); if (MultipleDevices) result.ActiveRenderIds.Add("{child-audio-2}");
           return result; }
         public SunshineCollisionSnapshot ReadCollision(SunshinePortFamily family)
@@ -678,13 +680,15 @@ static class IntegratedRuntimeTests
             ChildStreamingPreparation first = presenter.Prepare(null);
             string firstDisplay = first.Catalog.Displays[0].Id;
             string firstAudio = first.Catalog.Audio[0];
+            productionPath.AudioDefaultId = firstAudio;
             Check(presenter.Commit(first, firstDisplay, firstAudio, false).ManualAddress ==
                 "127.0.0.1:48089" && productionPath.Process.Starts == 1,
                 "real UI presenter starts local owned runtime after capability discovery");
             string firstConfig = productionPath.LastConfig;
             Check(File.ReadAllText(firstConfig).Contains("gamepad_driver = vigembus") &&
-                File.ReadAllText(firstConfig).Contains("controller = disabled"),
-                "production local start pins free Sunshine input policy without enabling gamepads");
+                File.ReadAllText(firstConfig).Contains("controller = disabled") &&
+                File.ReadAllText(firstConfig).Contains("stream_audio = disabled"),
+                "production local start pins free input backend and disables unsafe pinned audio");
             int beforePicker = productionPath.Discoveries;
             ChildStreamingPreparation lanChoice = presenter.Prepare("192.168.50.10");
             Check(productionPath.Discoveries == beforePicker && productionPath.Process.Current != null,
@@ -701,8 +705,9 @@ static class IntegratedRuntimeTests
                 "approved UI transition stops exact local process before fresh discovery and LAN start");
             string lanConfigA = productionPath.LastConfig;
             Check(File.ReadAllText(lanConfigA).Contains("gamepad_driver = vigembus") &&
-                File.ReadAllText(lanConfigA).Contains("controller = disabled"),
-                "approved LAN transition retains the exact disabled controller posture");
+                File.ReadAllText(lanConfigA).Contains("controller = disabled") &&
+                File.ReadAllText(lanConfigA).Contains("stream_audio = disabled"),
+                "approved LAN transition retains disabled controller and unsafe-audio posture");
             Check(File.Exists(firstConfig) && File.Exists(lanConfigA) && firstConfig != lanConfigA &&
                 productionPath.Identity.Credentials,
                 "immutable local and LAN files coexist while pairing identity remains stable");
@@ -710,6 +715,7 @@ static class IntegratedRuntimeTests
             ChildStreamingPreparation second = presenter.Prepare("192.168.50.10");
             string secondDisplay = second.Catalog.Displays[1].Id;
             string secondAudio = second.Catalog.Audio[1];
+            productionPath.AudioDefaultId = secondAudio;
             presenter.Commit(second, secondDisplay, secondAudio, false);
             string lanConfigB = productionPath.LastConfig;
             Check(lanConfigA != lanConfigB && File.Exists(lanConfigB) &&
@@ -788,6 +794,11 @@ static class IntegratedRuntimeTests
                 "multiple child devices cannot be chosen implicitly");
             string selected = catalog.SelectionPayload("{12100db6-5a9d-40c4-9c10-c3b1f606a632}",
                 "{child-audio-2}", null);
+            Reject(() => worker.Execute(ChildAgentOperation.StartSunshine, selected),
+                "selected capture endpoint without child default playback route cannot start");
+            Check(multiple.Process.Starts == 0,
+                "audio route rejection happens before an owned Sunshine process starts");
+            multiple.AudioDefaultId = "{child-audio-2}";
             worker.Execute(ChildAgentOperation.StartSunshine, selected);
             Check(multiple.SunshineConfiguration.Contains("audio_sink = {child-audio-2}") &&
                 multiple.SunshineConfiguration.Contains("output_name = {12100db6-5a9d-40c4-9c10-c3b1f606a632}"),

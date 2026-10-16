@@ -24,6 +24,26 @@ public class RdpBox : AxHost
     public object Ocx { get { return GetOcx(); } }
 }
 
+internal static class ChildRdpAudioPolicy
+{
+    // Microsoft RDP ActiveX: 2 suppresses playback at both viewer and child;
+    // false prevents redirecting the parent's microphone into the child.
+    // Both values must be accepted before Connect; never fall back to the
+    // default mode 0, which sends child playback to the parent viewer.
+    // Mode 1 may be used only after an independent child render path and a
+    // capture-only Sunshine release are qualified; neither exists today.
+    internal static void Configure(object control)
+    {
+        if (control == null) throw new InvalidOperationException("RDP audio control is unavailable.");
+        dynamic rdp = control;
+        rdp.SecuredSettings2.AudioRedirectionMode = 2;
+        rdp.AdvancedSettings7.AudioCaptureRedirectionMode = false;
+        if ((int)rdp.SecuredSettings2.AudioRedirectionMode != 2 ||
+            (bool)rdp.AdvancedSettings7.AudioCaptureRedirectionMode)
+            throw new InvalidOperationException("RDP child audio redirection settings were not retained.");
+    }
+}
+
 internal static class StreamingActionBar
 {
     internal static ToolStrip Create(params ToolStripMenuItem[] actions)
@@ -741,6 +761,7 @@ static class Program
                 }
                 try { ocx.ColorDepth = 32; } catch { }
                 try { ocx.AdvancedSettings7.EnableCredSspSupport = true; } catch { }
+                ChildRdpAudioPolicy.Configure(rdp.Ocx);
                 object v = true;
                 var ext = (IMsRdpExtendedSettings)rdp.Ocx;
                 ext.put_Property("ConnectToChildSession", ref v);

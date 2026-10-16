@@ -395,6 +395,8 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
         }
         if (!audio.ActiveRenderIds.Contains(audioId))
             throw new InvalidOperationException("Selected child audio endpoint is not active in this child session.");
+        if (!String.Equals(audio.DefaultRenderId, audioId, StringComparison.Ordinal))
+            throw new InvalidOperationException("Selected audio endpoint is not the current child default render endpoint; no game playback route is established.");
         identity = environment.OpenIdentity();
         bool startIntentRecorded = false;
         try

@@ -7,6 +7,7 @@ internal sealed class ChildAudioEndpointInventory
 {
     internal int SessionId;
     internal bool Complete;
+    internal string DefaultRenderId;
     internal readonly HashSet<string> ActiveRenderIds = new HashSet<string>(StringComparer.Ordinal);
 }
 
@@ -22,6 +23,7 @@ internal static class WindowsAudioEndpoints
     private interface IMMDeviceEnumerator
     {
         void EnumAudioEndpoints(int dataFlow, uint stateMask, out IMMDeviceCollection devices);
+        void GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice device);
     }
 
     [ComImport, Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E"),
@@ -76,9 +78,25 @@ internal static class WindowsAudioEndpoints
                     if (device != null) Marshal.ReleaseComObject(device);
                 }
             }
+            IMMDevice defaultDevice = null;
+            IntPtr defaultRaw = IntPtr.Zero;
+            try
+            {
+                enumerator.GetDefaultAudioEndpoint(0, 1, out defaultDevice); // eRender, eMultimedia
+                defaultDevice.GetId(out defaultRaw);
+                result.DefaultRenderId = Marshal.PtrToStringUni(defaultRaw);
+                if (String.IsNullOrEmpty(result.DefaultRenderId) ||
+                    !result.ActiveRenderIds.Contains(result.DefaultRenderId))
+                    throw new InvalidOperationException("Child default render endpoint is absent or inactive.");
+            }
+            finally
+            {
+                if (defaultRaw != IntPtr.Zero) Marshal.FreeCoTaskMem(defaultRaw);
+                if (defaultDevice != null) Marshal.ReleaseComObject(defaultDevice);
+            }
             result.Complete = true;
         }
-        catch { result.ActiveRenderIds.Clear(); result.Complete = false; }
+        catch { result.ActiveRenderIds.Clear(); result.DefaultRenderId = null; result.Complete = false; }
         finally
         {
             if (devices != null) Marshal.ReleaseComObject(devices);

@@ -6,6 +6,24 @@ using System.Text;
 
 internal static class ProductIntegrationTests
 {
+    public sealed class FakeRdpAudioSettings
+    {
+        private int mode;
+        public bool IgnoreWrites;
+        public int AudioRedirectionMode { get { return mode; } set { if (!IgnoreWrites) mode = value; } }
+    }
+    public sealed class FakeRdpAdvancedSettings
+    {
+        private bool capture;
+        public bool IgnoreWrites;
+        public bool AudioCaptureRedirectionMode
+        { get { return capture; } set { if (!IgnoreWrites) capture = value; } }
+    }
+    public sealed class FakeRdpControl
+    {
+        public FakeRdpAudioSettings SecuredSettings2 = new FakeRdpAudioSettings();
+        public FakeRdpAdvancedSettings AdvancedSettings7 = new FakeRdpAdvancedSettings();
+    }
     private static int assertions;
     private static readonly string SunshineDigest = new string('a', 64);
     private static readonly string SteamDigest = new string('b', 64);
@@ -63,7 +81,8 @@ internal static class ProductIntegrationTests
     private static void Configuration(string root)
     {
         string installed = Path.Combine(root, "ChildStream");
-        var audio = new ChildAudioEndpointInventory { SessionId = 2, Complete = true };
+        var audio = new ChildAudioEndpointInventory { SessionId = 2, Complete = true,
+            DefaultRenderId = "{audio-endpoint}" };
         audio.ActiveRenderIds.Add("{audio-endpoint}");
         var option = new ChildProductOptions { ParentSessionId = 1, Child = new ChildSessionIdentity(2, 123),
             OwnedInstallationRoot = installed, OwnedRoot = Path.Combine(installed, "sessions", "2-123"),
@@ -79,6 +98,22 @@ internal static class ProductIntegrationTests
             config.Contains("gamepad_driver = vigembus") &&
             config.Contains("keyboard = enabled") && config.Contains("mouse = enabled") &&
             config.Contains("install_steam_audio_drivers = disabled"), "free input driver and no automatic driver install");
+        Check(config.Contains("audio_sink = {audio-endpoint}") &&
+            config.Contains("stream_audio = disabled") && !config.Contains("virtual_sink ="),
+            "pinned Sunshine audio stays off until default-switching and parent effects are excluded");
+        var rdpAudio = new FakeRdpControl();
+        rdpAudio.AdvancedSettings7.AudioCaptureRedirectionMode = true;
+        ChildRdpAudioPolicy.Configure(rdpAudio);
+        Check(rdpAudio.SecuredSettings2.AudioRedirectionMode == 2 &&
+            !rdpAudio.AdvancedSettings7.AudioCaptureRedirectionMode,
+            "production RDP policy suppresses unsafe playback and parent microphone redirection");
+        var ignoredRdp = new FakeRdpControl(); ignoredRdp.SecuredSettings2.IgnoreWrites = true;
+        Reject(() => ChildRdpAudioPolicy.Configure(ignoredRdp),
+            "RDP control refusing child-side playback blocks connection");
+        var ignoredMic = new FakeRdpControl(); ignoredMic.AdvancedSettings7.AudioCaptureRedirectionMode = true;
+        ignoredMic.AdvancedSettings7.IgnoreWrites = true;
+        Reject(() => ChildRdpAudioPolicy.Configure(ignoredMic),
+            "RDP control refusing parent microphone isolation blocks connection");
         string discovery = WindowsChildRuntimeEnvironment.DiscoveryConfiguration(option.Child,
             Path.Combine(installed, "sessions", "2-123"));
         Check(discovery.Contains("controller = disabled") &&
@@ -118,7 +153,11 @@ internal static class ProductIntegrationTests
         Reject(() => ChildProductConfiguration.BuildSunshine(option), "config injection blocked");
         option.AudioEndpointId = "{audio-endpoint}"; audio.Complete = false;
         Reject(() => ChildProductConfiguration.BuildSunshine(option), "incomplete child audio inventory blocked");
-        audio.Complete = true; audio.SessionId = 1;
+        audio.Complete = true; audio.DefaultRenderId = "{other-endpoint}";
+        Reject(() => ChildProductConfiguration.BuildSunshine(option),
+            "audio capture sink without the child render default is rejected");
+        audio.DefaultRenderId = "{audio-endpoint}";
+        audio.SessionId = 1;
         Reject(() => ChildProductConfiguration.BuildSunshine(option), "parent audio inventory cannot qualify child");
         audio.SessionId = 2; option.DisplayActiveInChild = false;
         Reject(() => ChildProductConfiguration.BuildSunshine(option), "parent or inactive display rejected");
