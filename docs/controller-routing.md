@@ -1,6 +1,6 @@
 # Child-only controller routing: implementation decision
 
-**Decision:** no controller provider can be enabled safely from the reviewed contracts. ChildStream keeps Sunshine controller input disabled. The missing property is prevention of parent-session consumption of the child's two controller reports, including focus changes and reconnects. Provider ownership of a feeder or target does not provide this property. No adapter or injection was added on this unsupported premise.
+**Decision:** the [current-PC deployment](current-pc-deployment.md) selects pinned Sunshine with its free ViGEmBus-only configuration, but no controller provider can be enabled safely from the reviewed contracts. ChildStream keeps Sunshine controller input disabled. The missing property is prevention of parent-session consumption of the child's two controller reports, including focus changes and reconnects. Provider ownership of a feeder or target does not provide this property. No adapter or injection was added on this unsupported premise.
 
 ## Exact pinned path
 

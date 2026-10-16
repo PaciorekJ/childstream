@@ -89,6 +89,18 @@ internal sealed class SunshinePortFamily
 
 internal static class ChildProductConfiguration
 {
+    // Pinned Sunshine's Windows policy: choose its free ViGEmBus path explicitly
+    // while controller reports remain off pending real cross-session acceptance.
+    // This chooses a backend; it does not assert that Windows isolates its devices.
+    internal static void AppendInputPolicy(Action<string, string> line, bool interactiveDesktop)
+    {
+        if (line == null) throw new ArgumentNullException("line");
+        line("keyboard", interactiveDesktop ? "enabled" : "disabled");
+        line("mouse", interactiveDesktop ? "enabled" : "disabled");
+        line("controller", "disabled");
+        line("gamepad_driver", "vigembus");
+    }
+
     private static string SafePath(string root, string name)
     {
         string path = Path.Combine(root, name);
@@ -171,9 +183,7 @@ internal static class ChildProductConfiguration
         line("encoder", "nvenc");
         line("audio_sink", option.AudioEndpointId);
         line("stream_audio", "enabled");
-        // A global virtual gamepad driver does not establish child-only input.
-        // Keep controller injection off until an independently observed route exists.
-        line("controller", "disabled");
+        AppendInputPolicy(line, true);
         line("gamepad", "x360");
         return config.ToString();
     }

@@ -308,6 +308,9 @@ static class IntegratedRuntimeTests
                 Check(noGame.Process.Starts == 2 && noGame.Pairing.Bootstraps == 1 &&
                     noGame.Identity.Credentials && noGame.Process.SteamCurrent == originalSteam,
                     "stream restarts around same Steam process and persistent pairing identity");
+                Check(noGame.SunshineConfiguration.Contains("gamepad_driver = vigembus") &&
+                    noGame.SunshineConfiguration.Contains("controller = disabled"),
+                    "lost-stream recovery cannot change the selected provider or enable gamepads");
                 app.Execute(ChildAgentOperation.StopSteam, ""); presenter.Stop(); app.Stop();
             }
             var withGame = new Environment(fixtures[1]);
@@ -679,6 +682,9 @@ static class IntegratedRuntimeTests
                 "127.0.0.1:48089" && productionPath.Process.Starts == 1,
                 "real UI presenter starts local owned runtime after capability discovery");
             string firstConfig = productionPath.LastConfig;
+            Check(File.ReadAllText(firstConfig).Contains("gamepad_driver = vigembus") &&
+                File.ReadAllText(firstConfig).Contains("controller = disabled"),
+                "production local start pins free Sunshine input policy without enabling gamepads");
             int beforePicker = productionPath.Discoveries;
             ChildStreamingPreparation lanChoice = presenter.Prepare("192.168.50.10");
             Check(productionPath.Discoveries == beforePicker && productionPath.Process.Current != null,
@@ -694,6 +700,9 @@ static class IntegratedRuntimeTests
                 productionPath.Process.Stops == 1 && productionPath.Discoveries > beforePicker,
                 "approved UI transition stops exact local process before fresh discovery and LAN start");
             string lanConfigA = productionPath.LastConfig;
+            Check(File.ReadAllText(lanConfigA).Contains("gamepad_driver = vigembus") &&
+                File.ReadAllText(lanConfigA).Contains("controller = disabled"),
+                "approved LAN transition retains the exact disabled controller posture");
             Check(File.Exists(firstConfig) && File.Exists(lanConfigA) && firstConfig != lanConfigA &&
                 productionPath.Identity.Credentials,
                 "immutable local and LAN files coexist while pairing identity remains stable");

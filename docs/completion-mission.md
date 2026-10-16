@@ -2,6 +2,8 @@
 
 This ledger tracks evidence without publishing private host inventory, account IDs, addresses, container details, plan hashes or journal contents. The product objective remains an independently interactive Windows gaming desktop streamed to Fire TV while the parent desktop stays usable.
 
+The [recommended current-PC deployment](current-pc-deployment.md) is a Windows loopback child session with exact child-owned Sunshine and least-privilege orchestration. It maps desktop, host-resource, controller, audio and LAN requirements to their actual platform mechanisms and acceptance gaps. The pinned Sunshine configurations now explicitly select the free ViGEmBus backend while keeping controller reports disabled; display discovery also disables keyboard/mouse. This is a deterministic deployment policy, not controller isolation or live product acceptance. Connected-host Stage A remains No-Go on the intended workstation.
+
 ## Current source and evidence
 
 - The PR #4 lifecycle increment retains the five earlier production corrections. It now retries a delayed **owned** pairing listener even with an established certificate, while replacement certificates, foreign listeners and exact-process drift fail immediately. Failed Sunshine starts expose an uncertain status and have an exact-owned recovery command; a new agent detects durable unresolved intent. Intent-only outcomes without a recorded process identity remain blocked for reviewed enumeration. Real harmless pipe, private identity and loopback TLS fixtures are separate from native WTS/streaming acceptance.

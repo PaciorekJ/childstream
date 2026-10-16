@@ -154,7 +154,7 @@ internal sealed class WindowsChildRuntimeEnvironment : IChildRuntimeEnvironment
     }
     public string EnsureGenerationFile(ChildSessionIdentity child, string name, string content)
     { return ChildGenerationConfiguration.Write(SessionRoot(child), name, content); }
-    private static string DiscoveryConfiguration(ChildSessionIdentity child, string session)
+    internal static string DiscoveryConfiguration(ChildSessionIdentity child, string session)
     {
         Action<StringBuilder, string, string> add = (buffer, key, value) => buffer.Append(key).Append(" = ").Append(value).Append('\n');
         var text = new StringBuilder();
@@ -164,7 +164,7 @@ internal sealed class WindowsChildRuntimeEnvironment : IChildRuntimeEnvironment
         add(text, "port", "48089");
         add(text, "origin_web_ui_allowed", "pc");
         add(text, "upnp", "disabled");
-        add(text, "controller", "disabled");
+        ChildProductConfiguration.AppendInputPolicy((key, value) => add(text, key, value), false);
         add(text, "stream_audio", "disabled");
         add(text, "install_steam_audio_drivers", "disabled");
         add(text, "dd_configuration_option", "disabled");

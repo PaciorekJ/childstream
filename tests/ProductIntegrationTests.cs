@@ -75,8 +75,17 @@ internal static class ProductIntegrationTests
             config.Contains("origin_web_ui_allowed = pc"), "loopback-only posture");
         Check(config.Contains("capture = wgc") && config.Contains("encoder = nvenc") &&
             config.Contains("dd_configuration_option = verify_only"), "explicit capture without display mutation");
-        Check(config.Contains("controller = disabled") && !config.Contains("gamepad_driver =") &&
+        Check(config.Contains("controller = disabled") &&
+            config.Contains("gamepad_driver = vigembus") &&
+            config.Contains("keyboard = enabled") && config.Contains("mouse = enabled") &&
             config.Contains("install_steam_audio_drivers = disabled"), "free input driver and no automatic driver install");
+        string discovery = WindowsChildRuntimeEnvironment.DiscoveryConfiguration(option.Child,
+            Path.Combine(installed, "sessions", "2-123"));
+        Check(discovery.Contains("controller = disabled") &&
+            discovery.Contains("gamepad_driver = vigembus") &&
+            discovery.Contains("keyboard = disabled") && discovery.Contains("mouse = disabled") &&
+            discovery.Contains("stream_audio = disabled"),
+            "temporary display discovery cannot accept client input or audio");
         Check(config.Contains("credentials_file = " + Path.Combine(installed, "identity", "credentials.json")) &&
             config.Contains("file_state = " + Path.Combine(installed, "identity", "sunshine_state.json")) &&
             config.Contains("pkey = " + Path.Combine(installed, "identity", "sunshine.key")),
