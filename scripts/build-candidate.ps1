@@ -20,10 +20,36 @@ if ($LASTEXITCODE -ne 0) { throw 'Tracked-file inventory failed.' }
 $entries = [ordered]@{}
 $sortedTracked = [string[]]@($tracked)
 [Array]::Sort($sortedTracked, [StringComparer]::Ordinal)
+function Read-CommittedBlob([string] $relative) {
+    # Read the committed bytes, not the checkout's platform-dependent CRLF
+    # conversion. ArgumentList avoids shell quoting and stdout is binary.
+    $start = [System.Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = 'git'
+    $start.WorkingDirectory = $root
+    $start.UseShellExecute = $false
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $start.ArgumentList.Add('cat-file')
+    $start.ArgumentList.Add('blob')
+    $start.ArgumentList.Add("HEAD:$relative")
+    $process = [System.Diagnostics.Process]::Start($start)
+    try {
+        $buffer = [System.IO.MemoryStream]::new()
+        try {
+            $process.StandardOutput.BaseStream.CopyTo($buffer)
+            $errorText = $process.StandardError.ReadToEnd()
+            $process.WaitForExit()
+            if ($process.ExitCode -ne 0) { throw "Cannot read committed blob $relative`: $errorText" }
+            return ,$buffer.ToArray()
+        }
+        finally { $buffer.Dispose() }
+    }
+    finally { $process.Dispose() }
+}
 foreach ($relative in $sortedTracked) {
     $full = Join-Path $root $relative
     if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw "Missing tracked file: $relative" }
-    $entries[$relative.Replace('\','/')] = [System.IO.File]::ReadAllBytes($full)
+    $entries[$relative.Replace('\','/')] = Read-CommittedBlob $relative
 }
 foreach ($name in @('ChildStream.exe','ChildStreamFeasibilityProbe.exe')) {
     $full = Join-Path $root "tests\.artifacts\$name"

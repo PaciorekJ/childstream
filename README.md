@@ -29,7 +29,7 @@ An explicit **End session** action checks the parent-associated child ID and its
 - `src/LegacyCredentialCleanup.cs`: explicit, path-scoped legacy credential cleanup.
 - `src/InstallerFoundation.cs` and `src/InstallerInventory.cs`: offline transaction engine, typed inventory, and portable package admission contracts.
 - `src/PortableSunshine.cs`, `src/PortableExtractionTransaction.cs`, `src/ProductIntegration.cs`, `src/WindowsAudioEndpoints.cs`, `src/ChildRuntimeBootstrap.cs`, `src/ProductAcceptance.cs`, and `src/WindowsOwnedInstallerHost.cs`: pinned Sunshine package, exact-child configuration and agent protocol, process/collision and audio selection guards, archive and owned-file recovery candidates, and physical acceptance gates. Task registration and live agent startup remain disabled.
-- `scripts/build-candidate.ps1` and `scripts/verify-candidate.ps1`: repeatable unsigned, uninstalled candidate package with source and file hashes, license and notice; no Sunshine binary or hardware acceptance claim.
+- `scripts/build-candidate.ps1` and `scripts/verify-candidate.ps1`: unsigned, uninstalled candidate package with committed source blobs, file hashes, license and notice; no Sunshine binary or hardware acceptance claim. The legacy Framework compiler is not deterministic, so verify each build by its own ZIP digest.
 - `src/FeasibilityProbe.cs`, `src/WindowsFeasibilityHost.cs`, and `src/FeasibilityProbeProgram.cs`: gated one-session experiment, narrow Windows adapter, and console commands; live execution requires separate approval.
 - `scripts/feasibility-inventory.ps1`: read-only, typed Windows 11 Pro feasibility inventory.
 - `scripts/diagnose.ps1`: read-only inventory; omits credentials and Sunshine config contents.
