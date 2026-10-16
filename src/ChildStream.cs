@@ -595,7 +595,9 @@ static class Program
                     observed["captureEndpointName"] : observed.ContainsKey("captureEndpoint") ? observed["captureEndpoint"] : "");
                 string kind = Convert.ToString(observed.ContainsKey("routeKind") ? observed["routeKind"] : "Unknown");
                 string audioMode = Convert.ToString(observed.ContainsKey("audioMode") ? observed["audioMode"] : "");
-                statusText.Text = route == "GameRenderObserved" ?
+                statusText.Text = route == "GameRenderIdle" && audioMode == "CaptureEnabled" ?
+                    "The admitted game audio session is currently inactive on " + sink + "; owned capture-only Sunshine remains audio enabled. Physical isolation and playback remain unverified." :
+                    route == "GameRenderObserved" ?
                     audioMode == "CaptureEnabled" ?
                     "Exact game render observed on " + sink + "; owned capture-only Sunshine is audio enabled. Physical isolation and playback remain unverified." :
                     "Exact game render observed on " + sink + " (" + kind + "). Select Enable verified game audio to restart only owned Sunshine." :

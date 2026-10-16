@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
 
-// A snapshot is evidence of an active render session, not proof that the
+// A snapshot is evidence of a render session, not proof that the
 // endpoint is private or that Moonlight played the samples.
+internal enum GameAudioSessionState { Unknown = -1, Inactive = 0, Active = 1, Expired = 2 }
+
 internal sealed class GameAudioSessionSnapshot
 {
     internal bool Complete;
@@ -13,7 +15,8 @@ internal sealed class GameAudioSession
 {
     internal string EndpointId;
     internal int ProcessId;
-    internal bool Active;
+    internal GameAudioSessionState State;
+    internal string InstanceIdentifier;
     internal bool MultiProcess;
 }
 
@@ -23,8 +26,10 @@ internal static class GameAudioRoute
 
     internal static string Assess(ProductProcessIdentity game, ProductProcessIdentity current,
         ChildSessionIdentity child, string selectedEndpoint, ChildAudioEndpointInventory endpoints,
-        GameAudioSessionSnapshot snapshot)
+        GameAudioSessionSnapshot snapshot, string admittedInstanceIdentifier,
+        out string activeInstanceIdentifier)
     {
+        activeInstanceIdentifier = null;
         if (game == null) return "WaitingForGame";
         if (current == null || current.Pid != game.Pid ||
             current.StartTimeUtcTicks != game.StartTimeUtcTicks ||
@@ -36,21 +41,48 @@ internal static class GameAudioRoute
             String.IsNullOrEmpty(selectedEndpoint) || !endpoints.ActiveRenderIds.Contains(selectedEndpoint))
             return "CaptureEndpointLost";
         if (snapshot == null || !snapshot.Complete) return "ObservationIncomplete";
-        bool selected = false, other = false, ambiguous = false;
+        bool other = false, ambiguous = false, changed = false, knownIdle = false;
+        string selectedActive = null;
+        int exactLiveSessions = 0;
         foreach (GameAudioSession session in snapshot.Sessions)
         {
             if (session == null || String.IsNullOrEmpty(session.EndpointId) ||
-                !endpoints.ActiveRenderIds.Contains(session.EndpointId)) return "ObservationIncomplete";
-            if (!session.Active) continue;
+                !endpoints.ActiveRenderIds.Contains(session.EndpointId) ||
+                String.IsNullOrEmpty(session.InstanceIdentifier) ||
+                session.State == GameAudioSessionState.Unknown) return "ObservationIncomplete";
+            if (session.State == GameAudioSessionState.Expired) continue;
             // AUDCLNT_S_NO_SINGLE_PROCESS reports only the initial PID. It
             // cannot identify every process in the session on any endpoint.
             if (session.MultiProcess) { ambiguous = true; continue; }
             if (session.ProcessId != game.Pid) continue;
-            if (String.Equals(session.EndpointId, selectedEndpoint, StringComparison.Ordinal)) selected = true;
-            else other = true;
+            exactLiveSessions++;
+            bool onSelected = String.Equals(session.EndpointId, selectedEndpoint, StringComparison.Ordinal);
+            if (!onSelected)
+            {
+                if (session.State == GameAudioSessionState.Active ||
+                    String.Equals(session.InstanceIdentifier, admittedInstanceIdentifier, StringComparison.Ordinal))
+                    other = true;
+                continue;
+            }
+            if (admittedInstanceIdentifier != null &&
+                !String.Equals(session.InstanceIdentifier, admittedInstanceIdentifier, StringComparison.Ordinal))
+                changed = true;
+            if (session.State == GameAudioSessionState.Active)
+            {
+                if (selectedActive != null) ambiguous = true;
+                selectedActive = session.InstanceIdentifier;
+            }
+            else if (String.Equals(session.InstanceIdentifier, admittedInstanceIdentifier, StringComparison.Ordinal))
+                knownIdle = true;
         }
         if (ambiguous) return "AmbiguousSession";
         if (other) return "WrongEndpoint";
-        return selected ? "GameRenderObserved" : "WaitingForRender";
+        if (changed || exactLiveSessions > 1) return "AudioSessionChanged";
+        if (selectedActive != null)
+        {
+            activeInstanceIdentifier = selectedActive;
+            return "GameRenderObserved";
+        }
+        return knownIdle ? "GameRenderIdle" : "WaitingForRender";
     }
 }

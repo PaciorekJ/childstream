@@ -147,6 +147,9 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
     private string lastCapabilities;
     private string lanAddress;
     private string selectedAudioId, selectedDisplayId;
+    private string admittedAudioInstanceId, admittedAudioEndpointId;
+    private int admittedAudioGamePid;
+    private long admittedAudioGameStart, admittedAudioChildLogon;
     private ChildOwnedProcess sunshine;
     private ProductProcessIdentity sunshineIdentity;
     private IChildSunshineIdentity identity;
@@ -307,21 +310,32 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
                 audioWithdrawn ? "SilentRouteWithdrawn" : "SilentPreparation" :
                 state == "SunshineAudioWithdrawn" ? "SilentRouteWithdrawn" : "Stopped" },
             { "routeKind", CaptureRouteKind() },
-            { "routeConfiguration", gameAudio == "GameRenderObserved" ? "AdoptedObservedOutput" :
+            { "routeConfiguration", gameAudio == "GameRenderObserved" || gameAudio == "GameRenderIdle" ? "AdoptedObservedOutput" :
                 volumeMixerOpenedForGame ? "OwnerSelectionRequested" : "NotEstablished" },
             { "captureReady", state == "SunshineReady" && streamAudioEnabled &&
-                gameAudio == "GameRenderObserved" && AudioReady() },
+                (gameAudio == "GameRenderObserved" || gameAudio == "GameRenderIdle") && AudioReady() },
             { "clientPlayback", "HardwareUnverified" }
         });
     }
     private string GameAudioStatus()
     {
+        string ignored;
+        return GameAudioStatus(out ignored);
+    }
+    private string GameAudioStatus(out string activeInstanceId)
+    {
+        activeInstanceId = null;
         if (steam == null || (steam.Stage != SteamChildStage.GameRequested &&
             steam.Stage != SteamChildStage.GameObserved)) return "NotRequested";
         if (steam.Stage == SteamChildStage.GameRequested) return "WaitingForGame";
         ProductProcessIdentity game = steam.GameIdentity;
         if (game == null || environment.Processes.ReadSessionLogonTime((int)child.SessionId) != child.LogonTime)
             return "GameIdentityLost";
+        if (streamAudioEnabled && (admittedAudioInstanceId == null ||
+            admittedAudioGamePid != game.Pid || admittedAudioGameStart != game.StartTimeUtcTicks ||
+            admittedAudioChildLogon != child.LogonTime ||
+            !String.Equals(admittedAudioEndpointId, selectedAudioId, StringComparison.Ordinal)))
+            return "AudioSessionChanged";
         if (String.IsNullOrEmpty(selectedAudioId)) return "CaptureNotConfigured";
         ChildAudioEndpointInventory endpoints;
         try { endpoints = environment.ReadAudio(child); }
@@ -333,9 +347,13 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
             ProductProcessIdentity before = environment.Processes.Read(game.Pid);
             GameAudioSessionSnapshot sessions = environment.ReadGameAudio(child, endpoints, game.Pid);
             ProductProcessIdentity after = environment.Processes.Read(game.Pid);
-            string verdict = GameAudioRoute.Assess(game, before, child, selectedAudioId, endpoints, sessions);
-            if (verdict == "GameRenderObserved" &&
-                GameAudioRoute.Assess(game, after, child, selectedAudioId, endpoints, sessions) != "GameRenderObserved")
+            string admitted = streamAudioEnabled ? admittedAudioInstanceId : null;
+            string verdict = GameAudioRoute.Assess(game, before, child, selectedAudioId, endpoints,
+                sessions, admitted, out activeInstanceId);
+            string afterInstance;
+            if ((verdict == "GameRenderObserved" || verdict == "GameRenderIdle") &&
+                GameAudioRoute.Assess(game, after, child, selectedAudioId, endpoints,
+                    sessions, admitted, out afterInstance) != verdict)
                 return "GameIdentityLost";
             return verdict;
         }
@@ -379,30 +397,46 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
     private void AssertGameAudioForPairing()
     {
         if (streamAudioEnabled && steam != null && steam.Stage == SteamChildStage.GameObserved &&
-            GameAudioStatus() != "GameRenderObserved")
-            throw new InvalidOperationException("Exact game rendering on the selected capture endpoint is not observed.");
+            !GameAudioStillAdmitted(GameAudioStatus()))
+            throw new InvalidOperationException("The admitted exact game audio session is not observed on the selected endpoint.");
     }
+    private static bool GameAudioStillAdmitted(string verdict)
+    { return verdict == "GameRenderObserved" || verdict == "GameRenderIdle"; }
     private void EnableGameAudio()
     {
         if (sunshineIdentity == null || owner == null || streamAudioEnabled ||
             steam == null || steam.Stage != SteamChildStage.GameObserved)
             throw new InvalidOperationException("Silent owned Sunshine and the exact observed child game are required.");
         owner.AssertStillOwned();
-        if (GameAudioStatus() != "GameRenderObserved")
+        string initialInstance;
+        if (GameAudioStatus(out initialInstance) != "GameRenderObserved" || initialInstance == null)
             throw new InvalidOperationException("Exact game rendering on the selected capture endpoint is not observed.");
         var selected = new SelectedCapabilities { Display = selectedDisplayId, Audio = selectedAudioId };
         string address = lanAddress;
         StopSunshine();
         // A fresh config is immutable and a new exact process is recorded. The
         // route is checked once more immediately before audio is admitted.
-        if (GameAudioStatusForSelection(selected.Audio) != "GameRenderObserved")
+        string admittedInstance;
+        if (GameAudioStatusForSelection(selected.Audio, out admittedInstance) != "GameRenderObserved" ||
+            admittedInstance == null)
         { audioWithdrawn = true; throw new InvalidOperationException("Game audio route changed during owned Sunshine reconfiguration."); }
+        ProductProcessIdentity game = steam.GameIdentity;
+        admittedAudioInstanceId = admittedInstance;
+        admittedAudioEndpointId = selected.Audio;
+        admittedAudioGamePid = game.Pid;
+        admittedAudioGameStart = game.StartTimeUtcTicks;
+        admittedAudioChildLogon = child.LogonTime;
         StartSunshine(address, selected, true);
     }
     private string GameAudioStatusForSelection(string audioId)
     {
         selectedAudioId = audioId;
         return GameAudioStatus();
+    }
+    private string GameAudioStatusForSelection(string audioId, out string activeInstanceId)
+    {
+        selectedAudioId = audioId;
+        return GameAudioStatus(out activeInstanceId);
     }
     private bool AudioReady()
     {
@@ -623,6 +657,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
             monitoringLan = false; monitoringRuntime = false; monitor.Stop();
             sunshine = null; sunshineIdentity = null; pairing = null; owner = null; lanAddress = null;
             selectedAudioId = null; selectedDisplayId = null; streamAudioEnabled = false;
+            admittedAudioInstanceId = null; admittedAudioEndpointId = null;
             audioWithdrawn = false;
             identity.Dispose(); identity = null;
         }
@@ -640,7 +675,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
     {
         if (monitoringLan) SuperviseLanLocked();
         if (!monitoringRuntime || !streamAudioEnabled || sunshineIdentity == null) return;
-        if (GameAudioStatus() == "GameRenderObserved" && AudioReady()) return;
+        if (GameAudioStillAdmitted(GameAudioStatus()) && AudioReady()) return;
         var selected = new SelectedCapabilities { Display = selectedDisplayId, Audio = selectedAudioId };
         string address = lanAddress;
         // An already paired client is disconnected by stopping only the exact
@@ -677,6 +712,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
                 environment.ResolveStopped(child, sunshineIdentity);
                 sunshine = null; sunshineIdentity = null; lanAddress = null;
                 selectedAudioId = null; selectedDisplayId = null; streamAudioEnabled = false;
+                admittedAudioInstanceId = null; admittedAudioEndpointId = null;
                 if (identity != null) { identity.Dispose(); identity = null; }
                 boundaryWithdrawn = true;
             }
@@ -724,6 +760,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
         monitoringLan = false; monitoringRuntime = false; monitor.Stop();
         sunshine = null; sunshineIdentity = null; pairing = null; owner = null; lanAddress = null;
         selectedAudioId = null; selectedDisplayId = null; streamAudioEnabled = false;
+        admittedAudioInstanceId = null; admittedAudioEndpointId = null;
         if (identity != null) { identity.Dispose(); identity = null; }
         uncertain = false;
     }

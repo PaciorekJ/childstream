@@ -3,11 +3,34 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 
-// Read-only Core Audio observation in the child agent. Only PID, active state
-// and endpoint identity are read; no other application's process is opened.
+// Read-only Core Audio observation in the child agent. Retain state and
+// instance identity only for the exact game or an ambiguous multi-process
+// session; no other application's process is opened.
 internal static class WindowsGameAudioSessions
 {
     private const int NoSingleProcess = 0x0889000d; // AUDCLNT_S_NO_SINGLE_PROCESS
+
+    internal static GameAudioSessionState MapState(int nativeState)
+    {
+        switch (nativeState)
+        {
+            case 0: return GameAudioSessionState.Inactive;
+            case 1: return GameAudioSessionState.Active;
+            case 2: return GameAudioSessionState.Expired;
+            default: return GameAudioSessionState.Unknown;
+        }
+    }
+
+    internal static GameAudioSession ReadRelevantSession(string endpointId, int processId,
+        bool multiProcess, int nativeState, Func<string> readInstanceIdentifier)
+    {
+        if (readInstanceIdentifier == null) throw new ArgumentNullException("readInstanceIdentifier");
+        string instance = readInstanceIdentifier(); // Getter failures invalidate the whole snapshot.
+        if (String.IsNullOrEmpty(instance) || instance.Length > 4096)
+            throw new InvalidOperationException("Audio session instance identity is unavailable.");
+        return new GameAudioSession { EndpointId = endpointId, ProcessId = processId,
+            State = MapState(nativeState), InstanceIdentifier = instance, MultiProcess = multiProcess };
+    }
 
     [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
     private class MMDeviceEnumeratorClass { }
@@ -121,15 +144,25 @@ internal static class WindowsGameAudioSessions
                 {
                     sessions.GetSession(i, out baseControl);
                     var control = (IAudioSessionControl2)baseControl;
-                    int active; control.GetState(out active);
                     uint pid; int hr = control.GetProcessId(out pid);
                     if (hr != 0 && hr != NoSingleProcess) Marshal.ThrowExceptionForHR(hr);
                     if (pid > Int32.MaxValue) throw new InvalidOperationException("Audio PID is invalid.");
                     // Do not retain unrelated process identifiers or metadata.
                     if (hr == NoSingleProcess || pid == (uint)exactGamePid)
-                        result.Sessions.Add(new GameAudioSession { EndpointId = id,
-                            ProcessId = hr == NoSingleProcess ? 0 : (int)pid,
-                            Active = active == 1, MultiProcess = hr == NoSingleProcess });
+                    {
+                        int nativeState; control.GetState(out nativeState);
+                        result.Sessions.Add(ReadRelevantSession(id,
+                            hr == NoSingleProcess ? 0 : (int)pid, hr == NoSingleProcess, nativeState, () =>
+                        {
+                            IntPtr rawInstance = IntPtr.Zero;
+                            try
+                            {
+                                control.GetSessionInstanceIdentifier(out rawInstance);
+                                return rawInstance == IntPtr.Zero ? null : Marshal.PtrToStringUni(rawInstance);
+                            }
+                            finally { if (rawInstance != IntPtr.Zero) Marshal.FreeCoTaskMem(rawInstance); }
+                        }));
+                    }
                 }
                 finally { if (baseControl != null) Marshal.ReleaseComObject(baseControl); }
             }

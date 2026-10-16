@@ -135,6 +135,9 @@ static class IntegratedRuntimeTests
         internal bool AudioAvailable = true;
         internal bool AudioSnapshotComplete = true;
         internal bool GameAudioActive, GameAudioWrong, GameAudioMulti, RouteSettingsFail;
+        internal GameAudioSessionState GameAudioState = GameAudioSessionState.Active;
+        internal string GameAudioInstance = "exact-game-session-1";
+        internal bool AdditionalWrongActive;
         internal int GameAudioReads, InvalidateGameAudioOnRead;
         internal int RouteSettingsOpened;
         public IProductProcessHost Processes { get { return Process; } }
@@ -166,7 +169,12 @@ static class IntegratedRuntimeTests
             if (GameAudioActive && Process.GameCurrent != null)
                 result.Sessions.Add(new GameAudioSession { ProcessId = Process.GameCurrent.Pid,
                     EndpointId = GameAudioWrong ? "{child-audio}" : "{child-audio-2}",
-                    Active = true, MultiProcess = GameAudioMulti });
+                    State = GameAudioState, InstanceIdentifier = GameAudioInstance,
+                    MultiProcess = GameAudioMulti });
+            if (AdditionalWrongActive && Process.GameCurrent != null)
+                result.Sessions.Add(new GameAudioSession { ProcessId = Process.GameCurrent.Pid,
+                    EndpointId = "{child-audio}", State = GameAudioSessionState.Active,
+                    InstanceIdentifier = "wrong-output-session", MultiProcess = false });
             return result;
         }
         public void OpenGameAudioRouteSettings(ChildSessionIdentity child)
@@ -302,6 +310,62 @@ static class IntegratedRuntimeTests
     private static void Check(bool value, string message) { checks++; if (!value) throw new Exception(message); }
     private static void Reject(Action operation, string message)
     { bool rejected = false; try { operation(); } catch { rejected = true; } Check(rejected, message); }
+    private static void KnownIdleRejections(string root, ChildSessionIdentity child,
+        string agentPath, ChildAgentRequest request)
+    {
+        string[] cases = { "expired", "missing", "changed", "wrong-active", "unknown", "ambiguous" };
+        foreach (string scenario in cases)
+        {
+            var host = new Environment(root + "-known-idle-" + scenario) { MultipleDevices = true,
+                GameAudioActive = true, GameAudioState = GameAudioSessionState.Inactive };
+            var monitor = new ManualMonitor();
+            using (var worker = new ChildAgentRuntime(child, 1, host, monitor))
+            {
+                var app = new ChildAgentController(new Bootstrap(worker, child, agentPath), 1,
+                    child, agentPath, Digest); app.Start(request);
+                var presenter = new ChildStreamingPresenter(app, child);
+                var selection = presenter.Prepare(null);
+                presenter.Commit(selection, selection.Catalog.Displays[0].Id, "{child-audio-2}", false);
+                app.Execute(ChildAgentOperation.StartSteam, "");
+                app.Execute(ChildAgentOperation.RequestGame, "");
+                Check(Convert.ToString(presenter.Observe()["gameAudio"]) == "WaitingForRender",
+                    "never-admitted inactive session cannot establish game rendering");
+                Reject(() => presenter.EnableGameAudio(),
+                    "never-admitted inactive session cannot enable capture audio");
+                host.GameAudioState = GameAudioSessionState.Active;
+                presenter.EnableGameAudio();
+                host.GameAudioState = GameAudioSessionState.Inactive;
+                if (scenario == "expired") host.GameAudioState = GameAudioSessionState.Expired;
+                if (scenario == "missing") host.GameAudioActive = false;
+                if (scenario == "changed") host.GameAudioInstance = "replacement-session";
+                if (scenario == "wrong-active") host.AdditionalWrongActive = true;
+                if (scenario == "unknown") host.GameAudioState = GameAudioSessionState.Unknown;
+                if (scenario == "ambiguous") host.GameAudioMulti = true;
+                string expectedBefore = scenario == "expired" || scenario == "missing" ? "WaitingForRender" :
+                    scenario == "changed" ? "AudioSessionChanged" :
+                    scenario == "wrong-active" ? "WrongEndpoint" :
+                    scenario == "unknown" ? "ObservationIncomplete" : "AmbiguousSession";
+                string ignoredInstance;
+                Check(GameAudioRoute.Assess(host.Process.GameCurrent, host.Process.GameCurrent, child,
+                    "{child-audio-2}", host.ReadAudio(child),
+                    host.ReadGameAudio(child, host.ReadAudio(child), host.Process.GameCurrent.Pid),
+                    "exact-game-session-1", out ignoredInstance) == expectedBefore,
+                    "admitted route rejects " + scenario + " before owned stream withdrawal");
+                monitor.Fire();
+                string expected = scenario == "expired" || scenario == "missing" ||
+                    scenario == "changed" ? "WaitingForRender" :
+                    scenario == "wrong-active" ? "WrongEndpoint" :
+                    scenario == "unknown" ? "ObservationIncomplete" : "AmbiguousSession";
+                Check(Convert.ToString(presenter.Observe()["gameAudio"]) == expected,
+                    "invalid " + scenario + " session retains its precise route verdict after withdrawal");
+                Check(host.Process.Starts == 3 && host.Process.Stops == 2 &&
+                    File.ReadAllText(host.LastConfig).Contains("stream_audio = disabled") &&
+                    host.Process.GameStops == 0 && host.Pairing.Bootstraps == 1,
+                    "invalid " + scenario + " session withdraws audio without stopping game or resetting pairing");
+                app.Execute(ChildAgentOperation.StopSteam, ""); presenter.Stop(); app.Stop();
+            }
+        }
+    }
     private static void GamePreservingRecovery(string root, ChildSessionIdentity child,
         string agentPath, ChildAgentRequest request)
     {
@@ -485,6 +549,17 @@ static class IntegratedRuntimeTests
         var request = new ChildAgentRequest { ParentSessionId = 1, Child = child,
             PipeName = "ChildStream-" + new string('a', 32), Nonce = new string('b', 64),
             ParentPid = 17, ParentExecutableSha256 = Digest, RequesterSid = "S-1-5-21-100" };
+        Check(WindowsGameAudioSessions.MapState(0) == GameAudioSessionState.Inactive &&
+            WindowsGameAudioSessions.MapState(1) == GameAudioSessionState.Active &&
+            WindowsGameAudioSessions.MapState(2) == GameAudioSessionState.Expired &&
+            WindowsGameAudioSessions.MapState(99) == GameAudioSessionState.Unknown,
+            "native 0/1/2/unknown Core Audio states retain their distinct semantics");
+        Reject(() => WindowsGameAudioSessions.ReadRelevantSession("sink", 140, false, 1,
+            () => { throw new InvalidOperationException("native instance getter failed"); }),
+            "native instance getter failure cannot be converted into an admissible session");
+        Check(WindowsGameAudioSessions.ReadRelevantSession("sink", 140, false, 0,
+            () => "session-instance").State == GameAudioSessionState.Inactive,
+            "native relevant-session adapter preserves inactive instance identity");
         controller.Start(request);
         Check(controller.Stage == ChildAgentStage.Ready, "agent verified before operational command");
         string status = controller.Execute(ChildAgentOperation.StartSunshine, "");
@@ -754,6 +829,25 @@ static class IntegratedRuntimeTests
                 Convert.ToString(presenter.Observe()["audioMode"]) == "CaptureEnabled" &&
                 gameAudio.Process.GameCurrent.Pid == ownedPid && gameAudio.Pairing.Bootstraps == 1,
                 "presenter rechecks exact route and restarts only owned Sunshine with capture-only audio");
+            ProductProcessIdentity activeSunshine = gameAudio.Process.Current;
+            ProductProcessIdentity activeGame = gameAudio.Process.GameCurrent;
+            gameAudio.GameAudioState = GameAudioSessionState.Inactive;
+            gameAudioMonitor.Fire();
+            Check(Convert.ToString(presenter.Observe()["gameAudio"]) == "GameRenderIdle" &&
+                Convert.ToString(presenter.Observe()["audioMode"]) == "CaptureEnabled" &&
+                Convert.ToBoolean(presenter.Observe()["captureReady"]) &&
+                app.Execute(ChildAgentOperation.PairingGet, "").Contains("Fire TV") &&
+                gameAudio.Process.Current == activeSunshine && gameAudio.Process.GameCurrent == activeGame &&
+                gameAudio.Process.Starts == 2 && gameAudio.Process.Stops == 1 &&
+                gameAudio.Process.GameStops == 0 && gameAudio.Pairing.Bootstraps == 1,
+                "same freshly observed inactive instance preserves owned audio stream, game and pairing");
+            gameAudio.GameAudioState = GameAudioSessionState.Active;
+            gameAudioMonitor.Fire();
+            Check(Convert.ToString(presenter.Observe()["gameAudio"]) == "GameRenderObserved" &&
+                gameAudio.Process.Current == activeSunshine && gameAudio.Process.GameCurrent == activeGame &&
+                gameAudio.Process.Starts == 2 && gameAudio.Process.Stops == 1 &&
+                gameAudio.Pairing.Bootstraps == 1,
+                "same instance returning active needs no second Enable action or process restart");
             gameAudio.AudioDefaultId = sink;
             Check(Convert.ToString(presenter.Observe()["routeKind"]) == "DefaultEndpoint" &&
                 Convert.ToString(presenter.Observe()["gameAudio"]) == "GameRenderObserved",
@@ -841,6 +935,7 @@ static class IntegratedRuntimeTests
             Check(gameAudio.Process.UnrelatedTouched == 0,
                 "game audio path never closes an unrelated process");
         }
+        KnownIdleRejections(root, child, agentPath, request);
         var lanAudio = new Environment(root + "-lan-audio") { MultipleDevices = true, LanApproved = true };
         var lanAudioMonitor = new ManualMonitor();
         using (var worker = new ChildAgentRuntime(child, 1, lanAudio, lanAudioMonitor))
