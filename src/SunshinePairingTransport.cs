@@ -105,7 +105,7 @@ internal sealed class PinnedSunshinePairingTransport : IChildSunshineTransport
             throw new InvalidOperationException("Only the pinned Sunshine pairing API is permitted.");
         return SendCore(method, path, jsonBody, true);
     }
-    // Sunshine v2026.914.233613 exposes this first-credential operation only
+    // The pinned Sunshine prerelease exposes this first-credential operation only
     // while its owned credential file has no configured username. A preexisting
     // account returns 401; no credential takeover or native fallback is tried.
     internal bool BootstrapFirstCredentials()
