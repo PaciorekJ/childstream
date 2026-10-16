@@ -4,6 +4,8 @@ The protected workstation and its unrelated development resources are outside th
 
 ## Current architecture
 
+The focused [Moonlight pairing boundary](moonlight-pairing.md) adds an offline-tested request/PIN flow and launcher entry. It remains unavailable until an exact child-owned Sunshine instance and authenticated, certificate-pinned transport exist.
+
 | Responsibility | Current source | Status and remaining gate |
 | --- | --- | --- |
 | Parent-associated child connection and exact sign-out | `ChildStream.cs`, `ChildSessionLifecycle.cs`, `SessionSignOutGuard.cs`; v6 feasibility journal | Implemented with offline fakes; Windows Stage A/B and actual independent interaction unverified |

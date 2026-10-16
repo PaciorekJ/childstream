@@ -218,6 +218,13 @@ static class Program
                 "ChildStream readiness", MessageBoxButtons.OK, MessageBoxIcon.Information);
         });
         menu.Items.Add("Inspect/remove legacy saved password", null, (s, e) => { RemoveLegacyPasswordExplicitly(); });
+        menu.Items.Add("Pair Moonlight…", null, (s, e) =>
+        {
+            // The pairing coordinator is unavailable until a ChildStream-owned
+            // Sunshine process in the exact child generation is verified.
+            // Never fall back to the native Sunshine service or web UI.
+            using (var dialog = new MoonlightPairingDialog(null)) dialog.ShowDialog(f);
+        });
         ToolStripMenuItem signOutItem = new ToolStripMenuItem("End session (sign out, closes games)");
         menu.Items.Add(signOutItem);
         signOutItem.Click += (s, e) =>

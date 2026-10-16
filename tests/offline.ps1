@@ -4,8 +4,8 @@ $artifacts = Join-Path $PSScriptRoot '.artifacts'
 New-Item -ItemType Directory -Path $artifacts -Force | Out-Null
 $csc = Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 if (-not (Test-Path -LiteralPath $csc)) { throw 'The .NET Framework C# compiler is unavailable.' }
-$sources = @(Join-Path $root 'src\ChildStream.cs'), @(Join-Path $root 'src\ChildSessionLifecycle.cs'), @(Join-Path $root 'src\SessionSignOutGuard.cs'), @(Join-Path $root 'src\LegacyCredentialCleanup.cs'), @(Join-Path $root 'src\InstallerFoundation.cs'), @(Join-Path $root 'src\InstallerInventory.cs'), @(Join-Path $root 'src\TransactionOwnership.cs'), @(Join-Path $root 'src\PortableSunshine.cs'), @(Join-Path $root 'src\PortableExtractionTransaction.cs'), @(Join-Path $root 'src\ProductIntegration.cs'), @(Join-Path $root 'src\ProductAcceptance.cs'), @(Join-Path $root 'src\WindowsAudioEndpoints.cs'), @(Join-Path $root 'src\ChildRuntimeBootstrap.cs'), @(Join-Path $root 'src\WindowsOwnedInstallerHost.cs')
-$productReferences = @('/r:System.Windows.Forms.dll','/r:System.Drawing.dll','/r:Microsoft.CSharp.dll','/r:System.IO.Compression.dll','/r:System.IO.Compression.FileSystem.dll','/r:System.Management.dll','/r:System.ServiceProcess.dll')
+$sources = @(Join-Path $root 'src\ChildStream.cs'), @(Join-Path $root 'src\MoonlightPairing.cs'), @(Join-Path $root 'src\MoonlightPairingDialog.cs'), @(Join-Path $root 'src\ChildSessionLifecycle.cs'), @(Join-Path $root 'src\SessionSignOutGuard.cs'), @(Join-Path $root 'src\LegacyCredentialCleanup.cs'), @(Join-Path $root 'src\InstallerFoundation.cs'), @(Join-Path $root 'src\InstallerInventory.cs'), @(Join-Path $root 'src\TransactionOwnership.cs'), @(Join-Path $root 'src\PortableSunshine.cs'), @(Join-Path $root 'src\PortableExtractionTransaction.cs'), @(Join-Path $root 'src\ProductIntegration.cs'), @(Join-Path $root 'src\ProductAcceptance.cs'), @(Join-Path $root 'src\WindowsAudioEndpoints.cs'), @(Join-Path $root 'src\ChildRuntimeBootstrap.cs'), @(Join-Path $root 'src\WindowsOwnedInstallerHost.cs')
+$productReferences = @('/r:System.Windows.Forms.dll','/r:System.Drawing.dll','/r:System.Web.Extensions.dll','/r:Microsoft.CSharp.dll','/r:System.IO.Compression.dll','/r:System.IO.Compression.FileSystem.dll','/r:System.Management.dll','/r:System.ServiceProcess.dll')
 & $csc /nologo /target:exe /main:Program "/out:$artifacts\ChildStream.exe" $productReferences $sources
 if ($LASTEXITCODE -ne 0) { throw 'Launcher compilation failed.' }
 & (Join-Path $artifacts 'ChildStream.exe') -child-agent invalid-request
@@ -14,6 +14,10 @@ if ($LASTEXITCODE -ne 2) { throw 'Shipping child-agent entry did not reject an i
 if ($LASTEXITCODE -ne 0) { throw 'Offline test compilation failed.' }
 & (Join-Path $artifacts 'LauncherLogicTests.exe')
 if ($LASTEXITCODE -ne 0) { throw 'Offline launcher tests failed.' }
+& $csc /nologo /target:exe /main:MoonlightPairingTests "/out:$artifacts\MoonlightPairingTests.exe" /r:System.Web.Extensions.dll (Join-Path $root 'src\MoonlightPairing.cs') (Join-Path $PSScriptRoot 'MoonlightPairingTests.cs')
+if ($LASTEXITCODE -ne 0) { throw 'Pairing test compilation failed.' }
+& (Join-Path $artifacts 'MoonlightPairingTests.exe')
+if ($LASTEXITCODE -ne 0) { throw 'Offline pairing tests failed.' }
 & $csc /nologo /target:exe /main:InstallerFoundationTests "/out:$artifacts\InstallerFoundationTests.exe" (Join-Path $root 'src\InstallerFoundation.cs') (Join-Path $root 'src\InstallerInventory.cs') (Join-Path $root 'src\TransactionOwnership.cs') (Join-Path $PSScriptRoot 'InstallerFoundationTests.cs')
 if ($LASTEXITCODE -ne 0) { throw 'Installer test compilation failed.' }
 & (Join-Path $artifacts 'InstallerFoundationTests.exe')
