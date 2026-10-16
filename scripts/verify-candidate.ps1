@@ -18,7 +18,7 @@ try {
     $total = 0L
     foreach ($entry in $zip.Entries) {
         $name = $entry.FullName
-        if ($name -notmatch '^(src|scripts|docs|tests|\.github|bin)/|^(README\.md|LICENSE|THIRD-PARTY-NOTICES\.md|candidate\.json|manifest\.json)$' -or
+        if ($name -notmatch '^(src|scripts|docs|tests|\.github|bin)/|^third_party/sunshine-license/(LICENSE|NOTICE)$|^(README\.md|LICENSE|THIRD-PARTY-NOTICES\.md|candidate\.json|manifest\.json)$' -or
             $name -match '(^|/)\.\.?(/|$)|\\|:|\x00' -or $name.EndsWith('/') -or
             $entry.Length -lt 0 -or $entry.Length -gt 100MB -or $entries.ContainsKey($name)) {
             throw "Unsafe or duplicate candidate path: $name"
@@ -34,7 +34,7 @@ try {
         if ($bytes.Length -ne $entry.Length) { throw "Candidate entry length changed: $name" }
         $entries.Add($name, $bytes)
     }
-    foreach ($required in @('manifest.json','candidate.json','LICENSE','THIRD-PARTY-NOTICES.md','bin/ChildStream.exe','bin/ChildStreamSetup.exe','bin/ChildStreamBootstrap.exe','bin/ChildStreamFeasibilityProbe.exe','bin/ChildStreamControllerWitness.exe')) {
+    foreach ($required in @('manifest.json','candidate.json','LICENSE','THIRD-PARTY-NOTICES.md','third_party/sunshine-license/LICENSE','third_party/sunshine-license/NOTICE','bin/ChildStream.exe','bin/ChildStreamSetup.exe','bin/ChildStreamBootstrap.exe','bin/ChildStreamFeasibilityProbe.exe','bin/ChildStreamControllerWitness.exe')) {
         if (-not $entries.ContainsKey($required)) { throw "Required candidate file missing: $required" }
     }
     $candidate = [Text.Encoding]::UTF8.GetString($entries['candidate.json']) | ConvertFrom-Json
