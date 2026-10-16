@@ -96,6 +96,27 @@ static class Program
         "ChildStream", "launcher.log");
     static string intentDir = GetIntentDirectory();
 
+    private static string PromptLanAddress(Form owner)
+    {
+        using (var dialog = new Form { Text = "ChildStream LAN streaming", Width = 480, Height = 225,
+            StartPosition = FormStartPosition.CenterParent, FormBorderStyle = FormBorderStyle.FixedDialog,
+            MinimizeBox = false, MaximizeBox = false })
+        {
+            var description = new Label { Left = 18, Top = 16, Width = 430, Height = 55,
+                Text = "Enter the exact private IPv4 address from the separately approved ChildStream LAN plan. " +
+                    "The child runtime will reverify the scoped firewall and network boundary before launch." };
+            var input = new TextBox { Left = 18, Top = 80, Width = 425, MaxLength = 45,
+                AccessibleName = "Approved ChildStream LAN IPv4 address" };
+            var confirm = new Button { Left = 260, Top = 119, Width = 85, Text = "Continue",
+                DialogResult = DialogResult.OK };
+            var cancel = new Button { Left = 355, Top = 119, Width = 85, Text = "Cancel",
+                DialogResult = DialogResult.Cancel };
+            dialog.Controls.AddRange(new Control[] { description, input, confirm, cancel });
+            dialog.AcceptButton = confirm; dialog.CancelButton = cancel;
+            return dialog.ShowDialog(owner) == DialogResult.OK ? input.Text.Trim() : null;
+        }
+    }
+
     static string GetIntentDirectory()
     {
         string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
@@ -195,7 +216,8 @@ static class Program
         }
 
         Application.EnableVisualStyles();
-        var firstRun = new FirstRunController(new WindowsChildFeatureReader(), new WindowsRuntimeTokenReader());
+        var firstRun = new FirstRunController(new WindowsChildFeatureReader(),
+            new WindowsRuntimeTokenReader(), new WindowsUnknownFeatureAttemptPolicy());
         using (var shell = new FirstRunForm(firstRun))
             if (shell.ShowDialog() != DialogResult.OK || !shell.StartSelected) return 0;
         if (!firstRun.CanStart) return 1;
@@ -204,18 +226,9 @@ static class Program
 
     private static int RunViewer()
     {
-        bool en;
-        if (!WTSIsChildSessionsEnabled(out en))
-        {
-            MessageBox.Show("Cannot query child-session support. Check Windows edition and system logs.", "ChildStream");
-            return 2;
-        }
-        Log("startup: child sessions enabled = " + en);
-        if (!en)
-        {
-            MessageBox.Show("Child sessions are not enabled. Installation is blocked until the transactional installer is validated.", "ChildStream");
-            return 1;
-        }
+        // A protected installed user with an exact approved limited task may
+        // explicitly attempt connection when the feature query is inaccessible.
+        // The live WTS association and ActiveX outcome remain authoritative.
 
         // Microsoft documents automatic child-session logon from an existing parent
         // session. Do not set UserName or ClearTextPassword on the RDP control.
@@ -261,6 +274,8 @@ static class Program
         menu.Items.Add("Inspect/remove legacy saved password", null, (s, e) => { RemoveLegacyPasswordExplicitly(); });
         var sunshineItem = new ToolStripMenuItem("Start ChildStream Sunshine") { Enabled = false };
         menu.Items.Add(sunshineItem);
+        var lanSunshineItem = new ToolStripMenuItem("Start Sunshine on approved LAN…") { Enabled = false };
+        menu.Items.Add(lanSunshineItem);
         var steamItem = new ToolStripMenuItem("Start Steam Big Picture in child") { Enabled = false };
         var gameItem = new ToolStripMenuItem("Request Minecraft Dungeons in child") { Enabled = false };
         var stopSteamItem = new ToolStripMenuItem("Stop exact owned child Steam/game") { Enabled = false };
@@ -294,12 +309,13 @@ static class Program
                 if (steamState != "NotStarted" && steamState != "Ended")
                     await Task.Run(() => selected.Execute(ChildAgentOperation.StopSteam, ""));
                 if (Convert.ToString(observed["stage"]) == "SunshineReady" ||
+                    Convert.ToString(observed["stage"]) == "SunshineBoundaryLost" ||
                     Convert.ToString(observed["stage"]) == "SunshineLost")
                     await Task.Run(() => selected.Execute(ChildAgentOperation.StopSunshine, ""));
                 await Task.Run(() => selected.Stop());
                 if (agentHost != null) agentHost.Dispose();
                 agentHost = null; agent = null; pairingCoordinator = null;
-                pairItem.Enabled = false; sunshineItem.Enabled = false;
+                pairItem.Enabled = false; sunshineItem.Enabled = false; lanSunshineItem.Enabled = false;
                 steamItem.Enabled = false; gameItem.Enabled = false; stopSteamItem.Enabled = false;
                 statusText.Text = "Child agent and owned Sunshine stopped. Child desktop remains available.";
                 return true;
@@ -401,31 +417,56 @@ static class Program
                     { task.Result.Item1.Dispose(); statusText.Text = "Child identity changed during runtime launch."; return; }
                     agentHost = task.Result.Item1; agent = task.Result.Item2;
                     sunshineItem.Enabled = true;
+                    lanSunshineItem.Enabled = true;
                     statusText.Text = "Limited child agent verified. Start ChildStream Sunshine when ready.";
                 }));
             });
         };
-        sunshineItem.Click += async (s, e) =>
+        Func<string, Task> startOwnedSunshine = async address =>
         {
             if (agent == null || lifecycle.State != ChildLifecycleState.Connected ||
                 !lifecycle.CheckConnectedIdentity()) return;
-            sunshineItem.Enabled = false;
-            statusText.Text = "Checking child display/audio and starting owned Sunshine…";
+            sunshineItem.Enabled = false; lanSunshineItem.Enabled = false;
+            statusText.Text = "Reading child display and audio choices…";
+            bool started = false;
             try
             {
                 var selectedAgent = agent;
-                await Task.Run(() => selectedAgent.Execute(ChildAgentOperation.StartSunshine, ""));
+                string choices = await Task.Run(() => selectedAgent.Execute(ChildAgentOperation.Capabilities, ""));
+                ChildCapabilityCatalog catalog = ChildCapabilityCatalog.Parse(choices);
+                string selectedDisplay, selectedAudio;
+                using (var chooser = new CapabilitySelectionDialog(catalog))
+                {
+                    if (chooser.ShowDialog(f) != DialogResult.OK)
+                    { statusText.Text = "Child device selection cancelled. No Sunshine start requested."; return; }
+                    selectedDisplay = chooser.SelectedDisplay; selectedAudio = chooser.SelectedAudio;
+                }
+                string selection = catalog.SelectionPayload(selectedDisplay, selectedAudio, address);
+                statusText.Text = "Verifying selected child devices and starting owned Sunshine…";
+                await Task.Run(() => selectedAgent.Execute(address == null ?
+                    ChildAgentOperation.StartSunshine : ChildAgentOperation.StartSunshineLan,
+                    selection));
+                started = true;
                 var runtime = new VerifiedAgentSunshine(selectedAgent, lifecycle.ObservedChild.Value);
                 await Task.Run(() => runtime.AssertStillOwned());
                 pairingCoordinator = new MoonlightPairingCoordinator(runtime,
                     new AgentSunshinePairingApi(selectedAgent));
                 pairItem.Enabled = true;
                 steamItem.Enabled = true;
-                statusText.Text = "ChildStream Sunshine verified on loopback. LAN streaming requires separate acceptance.";
+                statusText.Text = address == null
+                    ? "ChildStream Sunshine verified locally. Select approved LAN streaming for phone or Fire TV."
+                    : "ChildStream LAN rules and local pairing API verified. Moonlight streaming remains untested.";
             }
             catch (Exception ex)
             { statusText.Text = "ChildStream Sunshine unavailable: " + ex.Message; Log(statusText.Text); }
-            finally { sunshineItem.Enabled = agent != null && agent.Stage == ChildAgentStage.Ready; }
+            finally { sunshineItem.Enabled = lanSunshineItem.Enabled =
+                !started && agent != null && agent.Stage == ChildAgentStage.Ready; }
+        };
+        sunshineItem.Click += async (s, e) => await startOwnedSunshine(null);
+        lanSunshineItem.Click += async (s, e) =>
+        {
+            string address = PromptLanAddress(f);
+            if (address != null) await startOwnedSunshine(address);
         };
         steamItem.Click += async (s, e) =>
         {

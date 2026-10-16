@@ -63,6 +63,13 @@ internal sealed class ChildAgentTaskInstaller
         store.Create(name, expected);
         ChildAgentTaskPolicy.RequireExact(store.Read(name), expected);
     }
+    internal bool IsRegisteredExactly()
+    {
+        string name = ChildAgentTaskPolicy.Name(expected.PrincipalSid);
+        if (!store.Exists(name)) return false;
+        ChildAgentTaskPolicy.RequireExact(store.Read(name), expected);
+        return true;
+    }
     internal void Remove(bool explicitConsent)
     {
         if (!explicitConsent) throw new InvalidOperationException("Explicit task removal approval is required.");

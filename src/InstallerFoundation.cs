@@ -262,6 +262,12 @@ internal sealed class InstallerEngine
     internal InstallPlan Plan(IEnumerable<InstallOperation> requested)
     { using (ownership.Acquire()) return PlanOwned(requested); }
 
+    // Read-only planning for the pre-install bootstrap. Apply takes the
+    // exclusive transaction lock and rechecks every original state before its
+    // first journal write, so a racing plan can only become stale and fail.
+    internal InstallPlan PlanReadOnly(IEnumerable<InstallOperation> requested)
+    { return PlanOwned(requested); }
+
     private InstallPlan PlanOwned(IEnumerable<InstallOperation> requested)
     {
         var plan = new InstallPlan();

@@ -1,6 +1,8 @@
 using System;
 using System.Drawing;
 using System.IO;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Windows.Forms;
 
 internal static class SetupBoundaryTests
@@ -151,10 +153,12 @@ internal static class SetupBoundaryTests
         Reject(() => installer.EnsureRegistered(false), "ordinary task registration requires approval");
         installer.EnsureRegistered(true); installer.EnsureRegistered(true);
         Check(taskStore.Created == 1, "demand-only task registration reconciles exactly");
+        Check(installer.IsRegisteredExactly(), "exact task is read-only approval for unknown feature attempt");
         taskStore.Definition.RunningInstances = 1;
         Reject(() => installer.Remove(true), "running agent cannot be unregistered");
         taskStore.Definition.RunningInstances = 0;
         taskStore.Definition.Arguments = "-evil";
+        Reject(() => installer.IsRegisteredExactly(), "changed task cannot approve unknown feature attempt");
         Reject(() => installer.Remove(true), "foreign task action cannot be removed");
         taskStore.Definition.Arguments = expected.Arguments;
         installer.Remove(true); Check(taskStore.Deleted == 1, "exact stopped task removed");
@@ -197,6 +201,30 @@ internal static class SetupBoundaryTests
             72, 2, helper.ExecutablePath, hash), "limited helper rejected");
         Reject(() => SetupPeerPolicy.RequireAuthenticatedHelper(helper, otherAdmin, 72, 2,
             @"C:\Program Files\ChildStream\foreign.exe", hash), "substituted helper path rejected");
+        var protectedAcl = new FileSecurity();
+        protectedAcl.SetOwner(new SecurityIdentifier("S-1-5-32-544"));
+        protectedAcl.SetAccessRuleProtection(true, false);
+        protectedAcl.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier("S-1-5-32-544"),
+            FileSystemRights.FullControl, AccessControlType.Allow));
+        protectedAcl.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier("S-1-5-32-545"),
+            FileSystemRights.ReadAndExecute, AccessControlType.Allow));
+        SetupInstallTrust.VerifyProtectedAcl(protectedAcl);
+        Check(true, "standard-user read/execute ACE is safe for protected code");
+        foreach (FileSystemRights right in new [] { FileSystemRights.WriteData, FileSystemRights.AppendData,
+            FileSystemRights.WriteAttributes, FileSystemRights.WriteExtendedAttributes,
+            FileSystemRights.Delete, FileSystemRights.DeleteSubdirectoriesAndFiles,
+            FileSystemRights.ChangePermissions, FileSystemRights.TakeOwnership })
+        {
+            var writable = new FileSecurity();
+            writable.SetOwner(new SecurityIdentifier("S-1-5-32-544"));
+            writable.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier("S-1-5-32-545"),
+                right, AccessControlType.Allow));
+            Reject(() => SetupInstallTrust.VerifyProtectedAcl(writable),
+                "untrusted mutation right rejected: " + right);
+        }
+        var wrongOwner = new FileSecurity();
+        wrongOwner.SetOwner(new SecurityIdentifier("S-1-5-32-545"));
+        Reject(() => SetupInstallTrust.VerifyProtectedAcl(wrongOwner), "untrusted code owner rejected");
         using (var malformed = new MemoryStream(new byte[] { (byte)SetupOperation.PrepareFeature, 255 }))
             Reject(() => SetupWire.ReadRequest(malformed), "oversized setup request rejected before allocation");
         if (args.Length == 1)

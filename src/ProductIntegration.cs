@@ -34,6 +34,7 @@ internal sealed class SunshineLanCandidate
     internal ChildSessionIdentity Child;
     internal string BindAddress;
     internal int Port;
+    internal bool BoundaryVerified;
 
     internal SunshinePortFamily Validate()
     {
@@ -135,10 +136,10 @@ internal static class ChildProductConfiguration
         else
         {
             option.LanCandidate.Validate();
-            if (!option.LanCandidate.Child.Equals(option.Child) ||
+            if (!option.LanCandidate.BoundaryVerified || !option.LanCandidate.Child.Equals(option.Child) ||
                 !String.Equals(option.LanCandidate.BindAddress, option.BindAddress, StringComparison.Ordinal) ||
                 option.LanCandidate.Port != option.Port)
-                throw new InvalidDataException("LAN candidate does not match the exact child and endpoint.");
+                throw new InvalidDataException("Approved LAN boundary does not match the exact child and endpoint.");
         }
         string root = Path.GetFullPath(option.OwnedRoot).TrimEnd(Path.DirectorySeparatorChar);
         string identityRoot = Path.Combine(install, "identity");
@@ -147,7 +148,11 @@ internal static class ChildProductConfiguration
         Action<string, string> line = (key, value) => config.Append(key).Append(" = ").Append(value).Append('\n');
         line("sunshine_name", "ChildStream");
         line("address_family", "ipv4");
-        line("bind_address", option.BindAddress);
+        // The pinned Sunshine release has one bind_address for GameStream and
+        // its Web UI. A verified scoped firewall admission is mandatory before
+        // wildcard IPv4 binding, so the local pinned admin client can stay on
+        // loopback while the approved LAN can reach only streaming ports.
+        line("bind_address", option.LanCandidate == null ? "127.0.0.1" : "0.0.0.0");
         line("port", option.Port.ToString(System.Globalization.CultureInfo.InvariantCulture));
         line("origin_web_ui_allowed", "pc");
         line("upnp", "disabled");

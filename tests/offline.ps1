@@ -17,6 +17,13 @@ $sources += (Join-Path $root 'src\WindowsChildAgentOperations.cs')
 $sources += (Join-Path $root 'src\AgentPairingBridge.cs')
 $sources += (Join-Path $root 'src\ChildAgentTaskInstaller.cs')
 $sources += (Join-Path $root 'src\SetupBoundary.cs')
+$sources += (Join-Path $root 'src\BoundedPipe.cs')
+$sources += (Join-Path $root 'src\ProductInstall.cs')
+$sources += (Join-Path $root 'src\ProductInstallProgram.cs')
+$sources += (Join-Path $root 'src\LanFirewallTransaction.cs')
+$sources += (Join-Path $root 'src\WindowsLanFirewallHost.cs')
+$sources += (Join-Path $root 'src\InstallDialog.cs')
+$sources += (Join-Path $root 'src\CapabilitySelectionDialog.cs')
 $sources += (Join-Path $root 'src\SetupDialog.cs')
 $sources += (Join-Path $root 'src\WindowsSteamDiscovery.cs')
 $sources += (Join-Path $root 'src\FeasibilityProbe.cs')
@@ -29,6 +36,8 @@ $manifest = Join-Path $root 'src\ChildStream.manifest'
 if ($LASTEXITCODE -ne 0) { throw 'Launcher compilation failed.' }
 & $csc /nologo /target:exe /main:SetupHelperProgram "/out:$artifacts\ChildStreamSetup.exe" "/win32manifest:$(Join-Path $root 'src\ChildStreamSetup.manifest')" $productReferences $sources
 if ($LASTEXITCODE -ne 0) { throw 'Scoped setup helper compilation failed.' }
+& $csc /nologo /target:exe /main:ProductInstallProgram "/out:$artifacts\ChildStreamBootstrap.exe" "/win32manifest:$manifest" $productReferences $sources
+if ($LASTEXITCODE -ne 0) { throw 'Product bootstrap compilation failed.' }
 & $csc /nologo /target:exe /main:ManifestTests "/out:$artifacts\ManifestTests.exe" (Join-Path $PSScriptRoot 'ManifestTests.cs')
 if ($LASTEXITCODE -ne 0) { throw 'PE manifest verifier compilation failed.' }
 & (Join-Path $artifacts 'ManifestTests.exe') (Join-Path $artifacts 'ChildStream.exe') (Join-Path $artifacts 'ChildStreamSetup.exe')
@@ -46,6 +55,10 @@ if ($env:CI -eq 'true' -or $env:CHILDSTREAM_RUN_PRIVATE_IDENTITY -eq '1') {
 }
 & (Join-Path $artifacts 'LeastPrivilegeTests.exe') (Join-Path $artifacts 'screenshots')
 if ($LASTEXITCODE -ne 0) { throw 'Least-privilege UI/transport tests failed.' }
+& $csc /nologo /target:exe /main:UiJourneyTests "/out:$artifacts\UiJourneyTests.exe" $productReferences $sources (Join-Path $PSScriptRoot 'UiJourneyTests.cs')
+if ($LASTEXITCODE -ne 0) { throw 'Guided UI fixture compilation failed.' }
+& (Join-Path $artifacts 'UiJourneyTests.exe') (Join-Path $artifacts 'screenshots')
+if ($LASTEXITCODE -ne 0) { throw 'Rendered guided UI fixture tests failed.' }
 & $csc /nologo /target:exe /main:SunshineTransportTests "/out:$artifacts\SunshineTransportTests.exe" /r:System.Web.Extensions.dll (Join-Path $root 'src\MoonlightPairing.cs') (Join-Path $root 'src\SunshinePairingTransport.cs') (Join-Path $PSScriptRoot 'SunshineTransportTests.cs')
 if ($LASTEXITCODE -ne 0) { throw 'Ephemeral TLS fixture compilation failed.' }
 if ($env:CI -eq 'true' -or $env:CHILDSTREAM_RUN_LOOPBACK_TLS -eq '1') {
@@ -61,10 +74,14 @@ if ($LASTEXITCODE -ne 0) { throw 'Offline pairing tests failed.' }
 if ($LASTEXITCODE -ne 0) { throw 'Installer test compilation failed.' }
 & (Join-Path $artifacts 'InstallerFoundationTests.exe')
 if ($LASTEXITCODE -ne 0) { throw 'Offline installer tests failed.' }
-& $csc /nologo /target:exe /main:ProductIntegrationTests "/out:$artifacts\ProductIntegrationTests.exe" $productReferences $sources (Join-Path $PSScriptRoot 'ProductIntegrationTests.cs')
+& $csc /nologo /define:TEST_ONLY /target:exe /main:ProductIntegrationTests "/out:$artifacts\ProductIntegrationTests.exe" $productReferences $sources (Join-Path $PSScriptRoot 'ProductIntegrationTests.cs')
 if ($LASTEXITCODE -ne 0) { throw 'Product integration test compilation failed.' }
 & (Join-Path $artifacts 'ProductIntegrationTests.exe')
 if ($LASTEXITCODE -ne 0) { throw 'Offline product integration tests failed.' }
+& $csc /nologo /define:TEST_ONLY /target:exe /main:LanFirewallTests "/out:$artifacts\LanFirewallTests.exe" $productReferences $sources (Join-Path $PSScriptRoot 'LanFirewallTests.cs')
+if ($LASTEXITCODE -ne 0) { throw 'LAN firewall transaction test compilation failed.' }
+& (Join-Path $artifacts 'LanFirewallTests.exe')
+if ($LASTEXITCODE -ne 0) { throw 'LAN firewall transaction fixture tests failed.' }
 & $csc /nologo /target:exe /main:IntegratedRuntimeTests "/out:$artifacts\IntegratedRuntimeTests.exe" $productReferences $sources (Join-Path $PSScriptRoot 'IntegratedRuntimeTests.cs')
 if ($LASTEXITCODE -ne 0) { throw 'Integrated runtime test compilation failed.' }
 & (Join-Path $artifacts 'IntegratedRuntimeTests.exe')
@@ -73,6 +90,12 @@ if ($LASTEXITCODE -ne 0) { throw 'Integrated runtime tests failed.' }
 if ($LASTEXITCODE -ne 0) { throw 'Scoped setup test compilation failed.' }
 & (Join-Path $artifacts 'SetupBoundaryTests.exe') (Join-Path $artifacts 'screenshots')
 if ($LASTEXITCODE -ne 0) { throw 'Scoped setup tests failed.' }
+& $csc /nologo /target:exe /main:SetupPipeTests "/out:$artifacts\SetupPipeTests.exe" $productReferences $sources (Join-Path $PSScriptRoot 'SetupPipeTests.cs')
+if ($LASTEXITCODE -ne 0) { throw 'Actual named-pipe test compilation failed.' }
+if ($env:CI -eq 'true' -or $env:CHILDSTREAM_RUN_LOCAL_PIPE -eq '1') {
+    & (Join-Path $artifacts 'SetupPipeTests.exe')
+    if ($LASTEXITCODE -ne 0) { throw 'Actual named-pipe deadline tests failed.' }
+} else { Write-Output 'Actual named-pipe tests SKIPPED (restricted local fixture token).' }
 & $csc /nologo /target:exe /main:FeasibilityProbeTests "/out:$artifacts\FeasibilityProbeTests.exe" /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll /r:Microsoft.CSharp.dll (Join-Path $root 'src\FeasibilityProbe.cs') (Join-Path $root 'src\WindowsFeasibilityHost.cs') (Join-Path $root 'src\FirewallRdpAssessment.cs') (Join-Path $root 'src\NetworkIsolationAssessment.cs') (Join-Path $root 'src\FeasibilityProbeProgram.cs') (Join-Path $root 'src\InstallerFoundation.cs') (Join-Path $root 'src\TransactionOwnership.cs') (Join-Path $root 'src\ChildSessionLifecycle.cs') (Join-Path $PSScriptRoot 'FeasibilityProbeTests.cs')
 if ($LASTEXITCODE -ne 0) { throw 'Feasibility probe test compilation failed.' }
 & (Join-Path $artifacts 'FeasibilityProbeTests.exe')

@@ -4,7 +4,7 @@ using System.Text;
 
 internal enum ChildAgentOperation : byte
 { Status = 1, StartSunshine = 2, StopSunshine = 3, PairingGet = 4, PairingPost = 5,
-  StartSteam = 6, RequestGame = 7, StopSteam = 8 }
+  StartSteam = 6, RequestGame = 7, StopSteam = 8, StartSunshineLan = 9, Capabilities = 10 }
 
 internal interface IChildAgentCommandHost
 {

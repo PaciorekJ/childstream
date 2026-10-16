@@ -34,7 +34,7 @@ try {
         if ($bytes.Length -ne $entry.Length) { throw "Candidate entry length changed: $name" }
         $entries.Add($name, $bytes)
     }
-    foreach ($required in @('manifest.json','candidate.json','LICENSE','THIRD-PARTY-NOTICES.md','bin/ChildStream.exe','bin/ChildStreamSetup.exe','bin/ChildStreamFeasibilityProbe.exe')) {
+    foreach ($required in @('manifest.json','candidate.json','LICENSE','THIRD-PARTY-NOTICES.md','bin/ChildStream.exe','bin/ChildStreamSetup.exe','bin/ChildStreamBootstrap.exe','bin/ChildStreamFeasibilityProbe.exe')) {
         if (-not $entries.ContainsKey($required)) { throw "Required candidate file missing: $required" }
     }
     $candidate = [Text.Encoding]::UTF8.GetString($entries['candidate.json']) | ConvertFrom-Json

@@ -28,3 +28,9 @@ jobs:
           name: childstream-unsigned-candidate
           path: tests/.artifacts/candidate/ChildStream-candidate-*.zip
           if-no-files-found: error
+      - name: Retain simulated rendered UI evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: childstream-rendered-ui-simulated
+          path: tests/.artifacts/screenshots/*.png
+          if-no-files-found: error

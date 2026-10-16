@@ -60,6 +60,23 @@ internal sealed class WindowsChildRuntimeEnvironment : IChildRuntimeEnvironment
     { return WindowsAudioEndpoints.ReadActiveRender((int)child.SessionId); }
     public SunshineCollisionSnapshot ReadCollision(SunshinePortFamily family)
     { return WindowsSunshineCollisionReader.Read(family); }
+    public bool VerifyLanBoundary(string address, SunshinePortFamily family)
+    {
+        string installed = Path.GetFullPath(AppDomain.CurrentDomain.BaseDirectory)
+            .TrimEnd(Path.DirectorySeparatorChar);
+        string expected = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "ChildStream");
+        if (!String.Equals(installed, expected, StringComparison.OrdinalIgnoreCase)) return false;
+        try
+        {
+            SetupInstallTrust.VerifyProtectedAcl(Directory.GetAccessControl(installed));
+            string ownedSunshine = SetupInstallTrust.RequireOwnedSunshine();
+            string journal = Path.Combine(installed, "lan-firewall.journal");
+            SetupInstallTrust.VerifyProtectedAcl(File.GetAccessControl(journal));
+            return new LanFirewallTransaction(new WindowsLanFirewallHost(), installed,
+                ownedSunshine, family).Verify(address);
+        }
+        catch (Exception) { return false; }
+    }
     public IList<SunshineListener> ReadListeners(int pid, SunshinePortFamily family, out bool complete)
     { return WindowsSunshineCollisionReader.ReadListeners(pid, family, out complete); }
     public IChildSunshineIdentity OpenIdentity() { return new SunshineIdentityStore(root); }

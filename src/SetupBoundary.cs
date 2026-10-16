@@ -11,17 +11,32 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 
 internal enum SetupOperation : byte { PlanConnected = 1, BeginConnected = 2, PrepareFeature = 3,
-    RestoreOriginal = 4, ReadJournal = 5, ReviewedRestore = 6 }
+    RestoreOriginal = 4, ReadJournal = 5, ReviewedRestore = 6,
+    PlanLan = 7, ApplyLan = 8, RecoverLan = 9, ReadLanJournal = 10 }
 
 internal sealed class SetupRequest
 {
     internal SetupOperation Operation;
     internal string ApprovedPlanHash = "";
+    internal string LanAddress = "";
     internal void Validate()
     {
+        bool lan = Operation == SetupOperation.PlanLan || Operation == SetupOperation.ApplyLan ||
+            Operation == SetupOperation.RecoverLan || Operation == SetupOperation.ReadLanJournal;
+        bool readOnly = Operation == SetupOperation.PlanConnected || Operation == SetupOperation.ReadJournal ||
+            Operation == SetupOperation.PlanLan || Operation == SetupOperation.ReadLanJournal;
+        if (lan)
+        {
+            System.Net.IPAddress address;
+            if (!System.Net.IPAddress.TryParse(LanAddress, out address) ||
+                address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork ||
+                LanAddress.Length > 45)
+                throw new InvalidDataException("LAN setup requires one concrete IPv4 address.");
+        }
         if (!Enum.IsDefined(typeof(SetupOperation), Operation) || ApprovedPlanHash == null ||
-            ((Operation == SetupOperation.PlanConnected || Operation == SetupOperation.ReadJournal) && ApprovedPlanHash.Length != 0) ||
-            (Operation != SetupOperation.PlanConnected && Operation != SetupOperation.ReadJournal &&
+            (!lan && !String.IsNullOrEmpty(LanAddress)) ||
+            (readOnly && ApprovedPlanHash.Length != 0) ||
+            (!readOnly &&
                 !System.Text.RegularExpressions.Regex.IsMatch(
                 ApprovedPlanHash, "\\A[0-9a-fA-F]{64}\\z")))
             throw new InvalidDataException("Only a fixed setup operation and exact plan SHA-256 are accepted.");
@@ -35,7 +50,9 @@ internal static class SetupWire
         request.Validate();
         using (var writer = new BinaryWriter(stream, Encoding.ASCII, true))
         { writer.Write((byte)request.Operation); writer.Write((byte)request.ApprovedPlanHash.Length);
-          writer.Write(Encoding.ASCII.GetBytes(request.ApprovedPlanHash)); writer.Flush(); }
+          writer.Write(Encoding.ASCII.GetBytes(request.ApprovedPlanHash));
+          writer.Write((byte)request.LanAddress.Length); writer.Write(Encoding.ASCII.GetBytes(request.LanAddress));
+          writer.Flush(); }
     }
     internal static SetupRequest ReadRequest(Stream stream)
     {
@@ -46,8 +63,13 @@ internal static class SetupWire
             if (length != 0 && length != 64) throw new InvalidDataException("Setup request length is invalid.");
             byte[] bytes = reader.ReadBytes(length);
             if (bytes.Length != length) throw new EndOfStreamException("Setup request is incomplete.");
+            int addressLength = reader.ReadByte();
+            if (addressLength > 45) throw new InvalidDataException("Setup LAN address length is invalid.");
+            byte[] address = reader.ReadBytes(addressLength);
+            if (address.Length != addressLength) throw new EndOfStreamException("Setup LAN address is incomplete.");
             var request = new SetupRequest { Operation = operation,
-                ApprovedPlanHash = Encoding.ASCII.GetString(bytes) };
+                ApprovedPlanHash = Encoding.ASCII.GetString(bytes),
+                LanAddress = Encoding.ASCII.GetString(address) };
             request.Validate(); return request;
         }
     }
@@ -114,11 +136,40 @@ internal sealed class SetupTransaction
 {
     private readonly FeasibilityProbe probe;
     private readonly IProbeStore store;
-    internal SetupTransaction(FeasibilityProbe probe, IProbeStore store)
-    { this.probe = probe; this.store = store; }
+    private readonly LanFirewallTransaction lan;
+    private readonly string lanExecutableHash;
+    internal SetupTransaction(FeasibilityProbe probe, IProbeStore store,
+        LanFirewallTransaction lan = null)
+    { this.probe = probe; this.store = store; this.lan = lan;
+      lanExecutableHash = SunshineReleasePin.ExecutableSha256; }
+#if TEST_ONLY
+    internal SetupTransaction(LanFirewallTransaction lan, string fixtureExecutableHash)
+    { this.lan = lan; lanExecutableHash = fixtureExecutableHash; }
+#endif
     internal string Execute(SetupRequest request, bool explicitlyApproved)
     {
         request.Validate();
+        if (request.Operation == SetupOperation.PlanLan || request.Operation == SetupOperation.ApplyLan ||
+            request.Operation == SetupOperation.RecoverLan || request.Operation == SetupOperation.ReadLanJournal)
+        {
+            if (lan == null) throw new InvalidOperationException("The protected ChildStream LAN transaction is unavailable.");
+            if (request.Operation == SetupOperation.PlanLan)
+                return "LAN plan " + lan.Plan(request.LanAddress, lanExecutableHash).Hash;
+            if (request.Operation == SetupOperation.ReadLanJournal)
+                return "LAN journal " + lan.ReadJournalHash(request.LanAddress) +
+                    "; verified=" + lan.Verify(request.LanAddress);
+            if (!explicitlyApproved) throw new InvalidOperationException("The exact LAN transition was not approved.");
+            if (request.Operation == SetupOperation.ApplyLan)
+            {
+                if (lan.ApprovedNoOp(request.LanAddress, request.ApprovedPlanHash))
+                    return "LAN rules verified for " + request.LanAddress;
+                lan.Apply(lan.Plan(request.LanAddress, lanExecutableHash),
+                    request.ApprovedPlanHash);
+                return "LAN rules verified for " + request.LanAddress;
+            }
+            lan.RecoverApproved(request.LanAddress, request.ApprovedPlanHash);
+            return "LAN rules restored for " + request.LanAddress;
+        }
         if (request.Operation == SetupOperation.PlanConnected)
         {
             ProbePlan plan = probe.Plan(ProbeNetworkPosture.ConnectedRdpGuard);
@@ -152,6 +203,33 @@ internal sealed class SetupTransaction
 
 internal static class SetupInstallTrust
 {
+    private static bool TrustedOwner(string sid)
+    { return sid == "S-1-5-18" || sid == "S-1-5-32-544" ||
+        sid == "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"; }
+    internal static void VerifyProtectedAcl(FileSystemSecurity security)
+    {
+        if (security == null || !TrustedOwner(security.GetOwner(typeof(SecurityIdentifier)).Value))
+            throw new UnauthorizedAccessException("Installed code has an untrusted owner.");
+        // FileSystemRights.Write/Modify/FullControl are composites. In
+        // particular FullControl intersects ReadAndExecute, so testing it as a
+        // mask incorrectly rejects every normal standard-user reader.
+        const FileSystemRights mutation = FileSystemRights.WriteData |
+            FileSystemRights.AppendData | FileSystemRights.WriteExtendedAttributes |
+            FileSystemRights.WriteAttributes | FileSystemRights.Delete |
+            FileSystemRights.DeleteSubdirectoriesAndFiles |
+            FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership;
+        const FileSystemRights readable = FileSystemRights.ReadData | FileSystemRights.ExecuteFile |
+            FileSystemRights.ReadExtendedAttributes | FileSystemRights.ReadAttributes |
+            FileSystemRights.ReadPermissions | FileSystemRights.Synchronize;
+        foreach (FileSystemAccessRule rule in security.GetAccessRules(true, true, typeof(SecurityIdentifier)))
+        {
+            if (rule.AccessControlType != AccessControlType.Allow) continue;
+            string sid = rule.IdentityReference.Value;
+            if (!TrustedOwner(sid) && ((rule.FileSystemRights & mutation) != 0 ||
+                (rule.FileSystemRights & ~readable) != 0))
+                throw new UnauthorizedAccessException("Installed code is mutable by an untrusted principal.");
+        }
+    }
     internal static string RequireOwnedPath(string leaf)
     {
         if (leaf != "ChildStream.exe" && leaf != "ChildStreamSetup.exe" &&
@@ -163,23 +241,30 @@ internal static class SetupInstallTrust
             ? Path.Combine(root, "scripts", leaf) : Path.Combine(root, leaf);
         InstallerPolicy.ValidateCanonicalFilePath(path);
         if (!File.Exists(path)) throw new FileNotFoundException("Protected ChildStream install is incomplete.", path);
-        foreach (string item in new[] { root, Path.GetDirectoryName(path), path })
+        foreach (string item in new[] { Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+            root, Path.GetDirectoryName(path), path })
         {
             var security = File.Exists(item) ? (FileSystemSecurity)File.GetAccessControl(item) :
                 Directory.GetAccessControl(item);
-            foreach (FileSystemAccessRule rule in security.GetAccessRules(true, true, typeof(SecurityIdentifier)))
-            {
-                if (rule.AccessControlType != AccessControlType.Allow) continue;
-                string sid = rule.IdentityReference.Value;
-                bool trusted = sid == "S-1-5-18" || sid == "S-1-5-32-544" ||
-                    sid == "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
-                const FileSystemRights writes = FileSystemRights.Write | FileSystemRights.Modify |
-                    FileSystemRights.FullControl | FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership;
-                if (!trusted && (rule.FileSystemRights & writes) != 0)
-                    throw new UnauthorizedAccessException("ChildStream installed code is writable by an untrusted principal.");
-            }
+            VerifyProtectedAcl(security);
         }
         return path;
+    }
+    internal static string RequireOwnedSunshine()
+    {
+        string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        string root = Path.Combine(programFiles, "ChildStream");
+        string versions = Path.Combine(root, "versions");
+        string version = Path.Combine(versions, SunshineReleasePin.Version);
+        string sunshine = Path.Combine(version, "sunshine.exe");
+        InstallerPolicy.ValidateCanonicalFilePath(sunshine);
+        foreach (string directory in new[] { programFiles, root, versions, version })
+            VerifyProtectedAcl(Directory.GetAccessControl(directory));
+        VerifyProtectedAcl(File.GetAccessControl(sunshine));
+        if (!String.Equals(Hash(sunshine), SunshineReleasePin.ExecutableSha256,
+            StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("Portable ChildStream Sunshine executable differs from the build pin.");
+        return sunshine;
     }
     internal static string Hash(string path)
     {
@@ -294,20 +379,26 @@ internal static class SetupHelperProgram
                 appPath, expectedParentHash);
             if (!String.Equals(SetupInstallTrust.Hash(appPath), expectedParentHash, StringComparison.OrdinalIgnoreCase))
                 throw new UnauthorizedAccessException("Protected application bytes changed before helper authentication.");
-            using (var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.None))
+            using (var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
             {
                 pipe.Connect(30000);
                 uint serverPid;
                 if (!GetNamedPipeServerProcessId(pipe.SafePipeHandle, out serverPid) || serverPid != parentPid)
                     throw new UnauthorizedAccessException("Setup pipe server is not the requesting application.");
-                pipe.ReadTimeout = 30000; pipe.WriteTimeout = 30000;
-                SetupRequest request = SetupWire.ReadRequest(pipe);
+                using (var bounded = new BoundedPipe(pipe, 30000))
+                {
+                SetupRequest request = SetupWire.ReadRequest(bounded);
                 bool approved = request.Operation == SetupOperation.PlanConnected ||
                     request.Operation == SetupOperation.ReadJournal ||
+                    request.Operation == SetupOperation.PlanLan ||
+                    request.Operation == SetupOperation.ReadLanJournal ||
                     MessageBox.Show("Approve this exact ChildStream operation?\n" + request.Operation +
                         "\nPlan SHA-256: " + request.ApprovedPlanHash + "\nRequesting SID: " + requesterSid +
+                        (String.IsNullOrEmpty(request.LanAddress) ? "" : "\nSelected LAN IPv4: " + request.LanAddress) +
                         "\nAdministrator SID: " + WindowsIdentity.GetCurrent().User.Value +
-                        "\nNo sign-out or RDP/firewall change is part of this request.",
+                        (request.Operation == SetupOperation.ApplyLan || request.Operation == SetupOperation.RecoverLan
+                            ? "\nThis changes only the two exact ChildStream-owned LAN firewall rules; no RDP or sign-out change."
+                            : "\nNo sign-out or RDP/firewall change is part of this request."),
                         "ChildStream privileged setup", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes;
                 try
                 {
@@ -318,17 +409,36 @@ internal static class SetupHelperProgram
                         appPath, expectedParentHash);
                     // A read-only plan creates no journal. All later transitions use
                     // the same private, durable requester-scoped probe journal.
-                    string dir = request.Operation == SetupOperation.PlanConnected ? null :
+                    bool lanOperation = request.Operation == SetupOperation.PlanLan ||
+                        request.Operation == SetupOperation.ApplyLan ||
+                        request.Operation == SetupOperation.RecoverLan ||
+                        request.Operation == SetupOperation.ReadLanJournal;
+                    string dir = request.Operation == SetupOperation.PlanConnected || lanOperation ? null :
                         SetupPrivateJournal.PathFor(requesterSid, request.Operation == SetupOperation.BeginConnected);
                     var store = dir == null ? null : new FileProbeStore(Path.Combine(dir, "probe.journal"));
                     var host = new WindowsFeasibilityHost(new ScriptProbeInventory(script), new ProbeNative(),
                         null, SetupInstallTrust.AccountHash(requesterSid));
                     var probe = new FeasibilityProbe(host, store, dir == null ? null :
                         new FileTransactionOwnership(Path.Combine(dir, "probe.lock")));
-                    string result = new SetupTransaction(probe, store).Execute(request, approved);
-                    SetupWire.SendResult(pipe, true, result);
+                    string installedRoot = Path.Combine(Environment.GetFolderPath(
+                        Environment.SpecialFolder.ProgramFiles), "ChildStream");
+                    string lanExecutable = request.Operation == SetupOperation.PlanLan ||
+                        request.Operation == SetupOperation.ApplyLan ? SetupInstallTrust.RequireOwnedSunshine() :
+                        Path.Combine(installedRoot, "versions", SunshineReleasePin.Version, "sunshine.exe");
+                    if (request.Operation == SetupOperation.RecoverLan ||
+                        request.Operation == SetupOperation.ReadLanJournal)
+                        SetupInstallTrust.VerifyProtectedAcl(File.GetAccessControl(
+                            Path.Combine(installedRoot, "lan-firewall.journal")));
+                    LanFirewallTransaction lan = lanOperation ?
+                        new LanFirewallTransaction(new WindowsLanFirewallHost(), installedRoot,
+                            lanExecutable, new SunshinePortFamily(48089)) : null;
+                    string result = new SetupTransaction(probe, store, lan).Execute(request, approved);
+                    bounded.ResetDeadline(30000);
+                    SetupWire.SendResult(bounded, true, result);
                 }
-                catch (Exception ex) { SetupWire.SendResult(pipe, false, ex.GetType().Name + ": " + ex.Message); }
+                catch (Exception ex) { bounded.ResetDeadline(30000);
+                    SetupWire.SendResult(bounded, false, ex.GetType().Name + ": " + ex.Message); }
+                }
             }
             return 0;
         }
@@ -376,10 +486,7 @@ internal sealed class WindowsSetupGateway
             using (Process launched = elevation.Launch(helper, arguments))
             {
                 if (launched == null) throw new InvalidOperationException("Setup helper did not start.");
-                IAsyncResult pending = pipe.BeginWaitForConnection(null, null);
-                if (!pending.AsyncWaitHandle.WaitOne(90000))
-                    throw new TimeoutException("Setup helper did not authenticate within 90 seconds; no retry was attempted.");
-                pipe.EndWaitForConnection(pending);
+                BoundedPipe.WaitForConnection(pipe, 90000);
                 uint clientPid;
                 if (!GetNamedPipeClientProcessId(pipe.SafePipeHandle, out clientPid) || clientPid != launched.Id ||
                     !String.Equals(SetupInstallTrust.Hash(helper), helperHash, StringComparison.OrdinalIgnoreCase))
@@ -387,11 +494,13 @@ internal sealed class WindowsSetupGateway
                 var peer = WindowsProcessToken.Read((int)clientPid);
                 var image = new WindowsProductProcessHost().Read((int)clientPid);
                 SetupPeerPolicy.RequireAuthenticatedHelper(image, peer, launched.Id, session, helper, helperHash);
-                pipe.ReadTimeout = 240000; pipe.WriteTimeout = 30000;
-                SetupWire.SendRequest(pipe, request);
-                Task<string> result = Task.Run(() => SetupWire.ReadResult(pipe));
-                if (!result.Wait(240000)) throw new TimeoutException("Setup outcome is uncertain; inspect its journal before any retry.");
-                return result.GetAwaiter().GetResult();
+                using (var bounded = new BoundedPipe(pipe, 240000))
+                {
+                    SetupWire.SendRequest(bounded, request);
+                    // After dispatch, any deadline is an uncertain outcome. The
+                    // wrapper closes its pipe on expiry; never retry a write.
+                    return SetupWire.ReadResult(bounded);
+                }
             }
         }
     }

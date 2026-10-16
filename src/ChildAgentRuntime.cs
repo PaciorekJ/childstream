@@ -16,6 +16,7 @@ internal interface IChildRuntimeEnvironment
     string DiscoverDisplayLog(ChildSessionIdentity child);
     ChildAudioEndpointInventory ReadAudio(ChildSessionIdentity child);
     SunshineCollisionSnapshot ReadCollision(SunshinePortFamily family);
+    bool VerifyLanBoundary(string address, SunshinePortFamily family);
     IList<SunshineListener> ReadListeners(int pid, SunshinePortFamily family, out bool complete);
     IChildSunshineIdentity OpenIdentity();
     IChildSunshineTransport CreatePairingTransport(Uri endpoint, string certificateSha256,
@@ -53,14 +54,26 @@ internal sealed class VerifiedChildSunshineRuntime : IVerifiedChildSunshine
     private readonly IChildSunshineIdentity identity;
     private readonly SunshinePortFamily family;
     private readonly string certificateSha256;
+    private readonly string lanAddress;
     internal VerifiedChildSunshineRuntime(IChildRuntimeEnvironment environment, ChildSessionIdentity child,
-        ProductProcessIdentity expected, IChildSunshineIdentity identity, SunshinePortFamily family)
+        ProductProcessIdentity expected, IChildSunshineIdentity identity, SunshinePortFamily family,
+        string certificateSha256, string lanAddress)
     { this.environment = environment; this.child = child; this.expected = expected;
-      this.identity = identity; this.family = family;
-      certificateSha256 = identity.ReadCertificateSha256(); }
+      this.identity = identity; this.family = family; this.certificateSha256 = certificateSha256;
+      this.lanAddress = lanAddress; }
     public string HostName { get { AssertStillOwned(); return "ChildStream"; } }
-    public string ManualAddress { get { AssertStillOwned(); return "127.0.0.1:" + family.BasePort; } }
+    public string ManualAddress { get { AssertStillOwned(); return (lanAddress ?? "127.0.0.1") + ":" + family.BasePort; } }
     public void AssertStillOwned()
+    {
+        AssertProcessAndListener();
+        if (lanAddress != null && !environment.VerifyLanBoundary(lanAddress, family))
+            throw new InvalidOperationException("Approved LAN firewall or network boundary changed.");
+        if (String.IsNullOrEmpty(certificateSha256) ||
+            !String.Equals(identity.ReadCertificateSha256(), certificateSha256,
+                StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("ChildStream Sunshine certificate identity changed.");
+    }
+    internal void AssertProcessAndListener()
     {
         var process = environment.Processes.Read(expected.Pid);
         var token = environment.ReadToken(expected.Pid);
@@ -75,16 +88,14 @@ internal sealed class VerifiedChildSunshineRuntime : IVerifiedChildSunshine
             throw new InvalidOperationException("ChildStream Sunshine process, token or child generation changed.");
         bool complete;
         IList<SunshineListener> listeners = environment.ReadListeners(expected.Pid, family, out complete);
-        string problem = SunshineRuntimeGate.CheckCandidate(complete, expected.Pid, "127.0.0.1", family, listeners);
+        string expectedBind = lanAddress == null ? "127.0.0.1" : "0.0.0.0";
+        string problem = SunshineRuntimeGate.CheckCandidate(complete, expected.Pid, expectedBind, family, listeners);
         if (problem != null) throw new InvalidOperationException(problem);
         bool webUi = false;
         foreach (var endpoint in listeners)
             if (endpoint.Protocol == "TCP" && endpoint.Port == family.BasePort + 1 &&
-                endpoint.Pid == expected.Pid && endpoint.LocalAddress == "127.0.0.1") webUi = true;
+                endpoint.Pid == expected.Pid && endpoint.LocalAddress == expectedBind) webUi = true;
         if (!webUi) throw new InvalidOperationException("ChildStream HTTPS pairing listener is not owned by this process.");
-        if (!String.Equals(identity.ReadCertificateSha256(), certificateSha256,
-            StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("ChildStream Sunshine certificate identity changed.");
     }
 }
 
@@ -94,6 +105,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
     private readonly uint parentSessionId;
     private readonly IChildRuntimeEnvironment environment;
     private readonly SunshinePortFamily family = new SunshinePortFamily(48089);
+    private string lanAddress;
     private ChildOwnedProcess sunshine;
     private ProductProcessIdentity sunshineIdentity;
     private IChildSunshineIdentity identity;
@@ -126,8 +138,13 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
                 if (payload.Length != 0) throw new InvalidDataException("Status has no payload.");
                 return Status();
             case ChildAgentOperation.StartSunshine:
-                if (payload.Length != 0) throw new InvalidDataException("Sunshine start has no caller-selected executable or configuration.");
-                return StartSunshine();
+                return StartSunshine(null, ParseSelection(payload, false));
+            case ChildAgentOperation.StartSunshineLan:
+                var selectedLan = ParseSelection(payload, true);
+                return StartSunshine(selectedLan.Address, selectedLan);
+            case ChildAgentOperation.Capabilities:
+                if (payload.Length != 0) throw new InvalidDataException("Capability discovery has no payload.");
+                return Capabilities();
             case ChildAgentOperation.StopSunshine:
                 if (payload.Length != 0) throw new InvalidDataException("Sunshine stop has no payload.");
                 StopSunshine(); return Status();
@@ -155,13 +172,52 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
             default: throw new InvalidOperationException("This child operation is not available without verified ownership.");
         }
     }
+    private sealed class SelectedCapabilities
+    { internal string Address, Display, Audio; }
+    private static SelectedCapabilities ParseSelection(string payload, bool lan)
+    {
+        if (payload == null || payload.Length > 1024 || (lan && payload.Length == 0))
+            throw new InvalidDataException("Child capability selection is malformed.");
+        if (payload.Length == 0) return new SelectedCapabilities();
+        var values = new JavaScriptSerializer().DeserializeObject(payload) as IDictionary<string, object>;
+        object display, audio, address = null;
+        if (values == null || values.Count != (lan ? 3 : 2) ||
+            !values.TryGetValue("display", out display) || !values.TryGetValue("audio", out audio) ||
+            (lan && !values.TryGetValue("address", out address)) ||
+            !(display is string) || !(audio is string) ||
+            ((string)display).Length > 64 || ((string)audio).Length > 256 ||
+            (lan && !(address is string)))
+            throw new InvalidDataException("Child capability selection has unexpected fields.");
+        return new SelectedCapabilities { Display = (string)display, Audio = (string)audio,
+            Address = lan ? (string)address : null };
+    }
+    private string Capabilities()
+    {
+        string log = environment.DiscoverDisplayLog(child);
+        var displays = new List<object>();
+        foreach (SunshineDisplayObservation display in SunshineDisplayCatalog.ParseOwnedLog(log))
+            if (display.Active) displays.Add(new { id = display.Id, name = display.Name });
+        ChildAudioEndpointInventory audio = environment.ReadAudio(child);
+        if (audio == null || !audio.Complete || audio.SessionId != child.SessionId)
+            throw new InvalidOperationException("Child audio endpoint inventory is incomplete.");
+        var endpoints = new List<string>(audio.ActiveRenderIds);
+        endpoints.Sort(StringComparer.Ordinal);
+        return new JavaScriptSerializer().Serialize(new { displays = displays, audio = endpoints });
+    }
     private string Status()
     {
+        ObservePendingGame();
         string state = uncertain ? "Uncertain" : sunshineIdentity == null ? "NoSunshine" :
             sunshine != null && sunshine.VerifyRunning() ? "SunshineReady" : "SunshineLost";
+        if (state == "SunshineReady")
+            try { owner.AssertStillOwned(); }
+            catch (InvalidOperationException) { state = "SunshineBoundaryLost"; }
         return new JavaScriptSerializer().Serialize(new Dictionary<string, object> {
             { "stage", state }, { "childSession", child.SessionId }, { "childLogon", child.LogonTime },
-            { "host", "ChildStream" }, { "manualAddress", state == "SunshineReady" ? "127.0.0.1:48089" : "" },
+            { "host", "ChildStream" }, { "manualAddress", state == "SunshineReady" ?
+                (lanAddress ?? "127.0.0.1") + ":" + family.BasePort : "" },
+            { "lanPosture", lanAddress == null ? "LocalOnly" :
+                state == "SunshineReady" ? "ScopedRulesVerified" : "ChangedOrUnavailable" },
             { "steamStage", steam == null ? "NotStarted" : steam.Stage.ToString() }
         });
     }
@@ -199,24 +255,31 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
         try
         {
             steam.RequestMinecraftDungeons(observed.Complete, observed.ParentSteam, observed.UnrelatedSteam);
-            ProductProcessIdentity game = environment.ReadGameProcess(child, steamInstallation);
-            if (game != null)
-            { steam.ObserveGame(game); environment.RecordGameObserved(child, game); }
+            ObservePendingGame();
+        }
+        catch { uncertain = true; environment.RecordRuntimeUncertainty(child, "GameRequestUnknown"); throw; }
+    }
+    private bool ObservePendingGame()
+    {
+        if (steam == null || steam.Stage != SteamChildStage.GameRequested) return false;
+        ProductProcessIdentity game = environment.ReadGameProcess(child, steamInstallation);
+        if (game == null) return false;
+        try
+        {
+            steam.ObserveGame(game); // Exact path, image, session and generation check.
+            environment.RecordGameObserved(child, game); // Durable before any stop.
+            return true;
         }
         catch { uncertain = true; environment.RecordRuntimeUncertainty(child, "GameRequestUnknown"); throw; }
     }
     private void StopSteam()
     {
         if (steam == null) throw new InvalidOperationException("No exact owned Steam process exists.");
-        if (steam.Stage == SteamChildStage.GameRequested)
-        {
-            ProductProcessIdentity game = environment.ReadGameProcess(child, steamInstallation);
-            if (game == null) throw new InvalidOperationException("Game launch outcome is still uncertain; Steam is not stopped.");
-            steam.ObserveGame(game);
-        }
-        ProductProcessIdentity steamProcess = steam.SteamIdentity, gameProcess = steam.GameIdentity;
         try
         {
+            if (steam.Stage == SteamChildStage.GameRequested && !ObservePendingGame())
+                throw new InvalidOperationException("Game launch outcome is still uncertain; Steam is not stopped.");
+            ProductProcessIdentity steamProcess = steam.SteamIdentity, gameProcess = steam.GameIdentity;
             if (steam.Stage == SteamChildStage.GameObserved) steam.StopGame(5000);
             steam.StopSteam(5000);
             environment.ResolveSteamStopped(child, steamProcess, gameProcess);
@@ -224,31 +287,64 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
         }
         catch { uncertain = true; environment.RecordRuntimeUncertainty(child, "SteamStopUnknown"); throw; }
     }
-    private string StartSunshine()
+    private string StartSunshine(string requestedLanAddress, SelectedCapabilities selected)
     {
         if (sunshineIdentity != null)
-        { owner.AssertStillOwned(); return Status(); } // Reconnect never duplicates the owned process.
+        {
+            if (!String.Equals(lanAddress, requestedLanAddress, StringComparison.Ordinal))
+                throw new InvalidOperationException("The running Sunshine instance has a different network posture.");
+            owner.AssertStillOwned(); return Status();
+        } // Reconnect never duplicates the owned process.
+        if (requestedLanAddress != null)
+        {
+            new SunshineLanCandidate { Child = child, BindAddress = requestedLanAddress,
+                Port = family.BasePort }.Validate();
+            if (!environment.VerifyLanBoundary(requestedLanAddress, family))
+                throw new InvalidOperationException("Exact ChildStream LAN rules and physical network are not verified.");
+        }
         SunshineCollisionSnapshot collision = environment.ReadCollision(family);
         string conflict = SunshineStartupGate.CheckFamilyAvailable(collision, family);
         if (conflict != null) throw new InvalidOperationException(conflict);
         string log = environment.DiscoverDisplayLog(child);
-        SunshineDisplayObservation display = SunshineDisplayCatalog.RequireUniqueActive(log);
+        SunshineDisplayObservation display = null;
+        if (selected.Display == null) display = SunshineDisplayCatalog.RequireUniqueActive(log);
+        else
+        {
+            foreach (SunshineDisplayObservation candidate in SunshineDisplayCatalog.ParseOwnedLog(log))
+                if (candidate.Active && String.Equals(candidate.Id, selected.Display,
+                    StringComparison.OrdinalIgnoreCase)) display = candidate;
+            if (display == null) throw new InvalidOperationException("Selected child display is absent or inactive.");
+        }
         ChildAudioEndpointInventory audio = environment.ReadAudio(child);
-        if (audio == null || !audio.Complete || audio.SessionId != child.SessionId || audio.ActiveRenderIds.Count != 1)
-            throw new InvalidOperationException("Exactly one active child audio endpoint must be observed before automatic start.");
-        string audioId = null; foreach (string value in audio.ActiveRenderIds) audioId = value;
+        if (audio == null || !audio.Complete || audio.SessionId != child.SessionId)
+            throw new InvalidOperationException("Child audio endpoint inventory is incomplete.");
+        string audioId = selected.Audio;
+        if (audioId == null)
+        {
+            if (audio.ActiveRenderIds.Count != 1)
+                throw new InvalidOperationException("Multiple or no child audio endpoints require explicit selection.");
+            foreach (string value in audio.ActiveRenderIds) audioId = value;
+        }
+        if (!audio.ActiveRenderIds.Contains(audioId))
+            throw new InvalidOperationException("Selected child audio endpoint is not active in this child session.");
         identity = environment.OpenIdentity();
         bool startIntentRecorded = false;
         try
         {
             SunshineAdminCredential credential = identity.GetOrCreateCredentials();
+            string establishedCertificate = null;
+            try { establishedCertificate = identity.ReadCertificateSha256(); }
+            catch (FileNotFoundException) { } // Only an absent first-start file may appear later.
             var options = new ChildProductOptions { ParentSessionId = parentSessionId,
                 Child = child, OwnedInstallationRoot = environment.DataRoot,
                 OwnedRoot = Path.Combine(environment.DataRoot, "sessions", child.SessionId + "-" + child.LogonTime),
                 DisplayDeviceId = display.Id, DisplayActiveInChild = display.Active,
                 AudioEndpointId = audioId, AudioInventory = audio,
                 Capture = CaptureBackend.DesktopDuplication, Port = family.BasePort,
-                BindAddress = "127.0.0.1" };
+                BindAddress = requestedLanAddress ?? "127.0.0.1",
+                LanCandidate = requestedLanAddress == null ? null : new SunshineLanCandidate {
+                    Child = child, BindAddress = requestedLanAddress, Port = family.BasePort,
+                    BoundaryVerified = true } };
             environment.EnsureGenerationFile(child, "apps.json", ChildProductConfiguration.BuildApps());
             string config = environment.EnsureGenerationFile(child, "sunshine.conf", ChildProductConfiguration.BuildSunshine(options));
             environment.RecordStartIntent(child);
@@ -258,21 +354,39 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
             sunshine.Start("\"" + config + "\"");
             sunshineIdentity = sunshine.Identity;
             environment.RecordStarted(child, sunshineIdentity);
-            owner = new VerifiedChildSunshineRuntime(environment, child, sunshineIdentity, identity, family);
-            bool ready = false;
-            for (int i = 0; i < 30; i++)
+            var pendingOwner = new VerifiedChildSunshineRuntime(environment, child,
+                sunshineIdentity, identity, family, establishedCertificate, requestedLanAddress);
+            string readyCertificate = null;
+            for (int i = 0; i < 50; i++)
             {
-                try { owner.AssertStillOwned(); ready = true; break; }
-                catch { Thread.Sleep(100); }
+                if (!sunshine.VerifyRunning()) throw new InvalidOperationException("Owned Sunshine exited before certificate readiness.");
+                try
+                {
+                    pendingOwner.AssertProcessAndListener();
+                    readyCertificate = identity.ReadCertificateSha256();
+                    if (establishedCertificate != null && !String.Equals(readyCertificate,
+                        establishedCertificate, StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidOperationException("Existing owned Sunshine certificate changed on startup.");
+                    break;
+                }
+                catch (FileNotFoundException) { if (establishedCertificate != null) throw; }
+                catch (InvalidDataException) { if (establishedCertificate != null) throw; }
+                catch (InvalidOperationException) { if (establishedCertificate != null) throw; }
+                Thread.Sleep(100);
             }
-            if (!ready) throw new InvalidOperationException("Owned Sunshine did not expose its verified pairing listener and certificate.");
+            if (readyCertificate == null)
+                throw new InvalidOperationException("Owned Sunshine did not expose a complete certificate and pairing listener.");
+            owner = new VerifiedChildSunshineRuntime(environment, child, sunshineIdentity,
+                identity, family, readyCertificate, requestedLanAddress);
+            owner.AssertStillOwned();
             pairing = environment.CreatePairingTransport(new Uri("https://127.0.0.1:" + (family.BasePort + 1) + "/"),
-                identity.ReadCertificateSha256(), credential, owner);
+                readyCertificate, credential, owner);
             if (!identity.HasSunshineCredentials)
             {
                 if (!pairing.BootstrapFirstCredentials()) throw new InvalidOperationException("Owned Sunshine credential bootstrap was refused.");
             }
             pairing.Send("GET", "/api/pin", null); // Authenticated readiness, never native Sunshine.
+            lanAddress = requestedLanAddress;
             return Status();
         }
         catch
@@ -287,10 +401,11 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
         if (sunshine == null || sunshineIdentity == null) throw new InvalidOperationException("No exact owned Sunshine process exists.");
         try
         {
-            if (sunshine.VerifyRunning()) owner.AssertStillOwned();
+            // Exact process identity is sufficient to stop an owned process even
+            // if the LAN boundary has drifted and pairing/status are blocked.
             sunshine.Stop(5000);
             environment.ResolveStopped(child, sunshineIdentity);
-            sunshine = null; sunshineIdentity = null; pairing = null; owner = null;
+            sunshine = null; sunshineIdentity = null; pairing = null; owner = null; lanAddress = null;
             identity.Dispose(); identity = null;
         }
         catch { uncertain = true; throw; }

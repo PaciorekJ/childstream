@@ -16,6 +16,11 @@ static class LeastPrivilegeTests
         internal RuntimeTokenStatus Status;
         public RuntimeTokenStatus Read() { return Status; }
     }
+    private sealed class Attempt : IUnknownFeatureAttemptPolicy
+    {
+        internal bool Approved;
+        public bool IsApprovedInstalledAttempt() { return Approved; }
+    }
     private static int assertions;
     private static void Check(bool value, string description)
     { assertions++; if (!value) throw new Exception(description); }
@@ -55,6 +60,20 @@ static class LeastPrivilegeTests
         feature.Status = ChildFeatureStatus.Enabled;
         foreach (RuntimeTokenStatus state in new [] { RuntimeTokenStatus.Elevated, RuntimeTokenStatus.UnableToVerify })
         { token.Status = state; controller.Refresh(); Check(!controller.CanStart, "runtime token " + state + " rejected"); }
+        token.Status = RuntimeTokenStatus.Limited;
+        var attempt = new Attempt();
+        var installed = new FirstRunController(feature, token, attempt);
+        feature.Status = ChildFeatureStatus.AccessDenied; installed.Refresh();
+        Check(!installed.CanStart, "unknown feature without approved protected task is blocked");
+        attempt.Approved = true; installed.Refresh();
+        Check(installed.CanStart && installed.Feature.Status == ChildFeatureStatus.AccessDenied,
+            "inaccessible feature permits explicit attempt without relabeling current state");
+        feature.Status = ChildFeatureStatus.UnableToVerify; installed.Refresh();
+        Check(installed.CanStart, "other inaccessible feature query can use exact approved attempt");
+        feature.Status = ChildFeatureStatus.Disabled; installed.Refresh();
+        Check(!installed.CanStart, "known disabled feature cannot use historical approval");
+        token.Status = RuntimeTokenStatus.Elevated; feature.Status = ChildFeatureStatus.AccessDenied;
+        installed.Refresh(); Check(!installed.CanStart, "approved attempt cannot elevate daily runtime");
         Reject(() => new PinnedSunshinePairingTransport(new Uri("https://localhost:47990/"),
             new string('0', 64), "user", "pass", new PairingRuntime()), "localhost DNS alias rejected");
         Reject(() => new PinnedSunshinePairingTransport(new Uri("https://127.0.0.1:47990/"),

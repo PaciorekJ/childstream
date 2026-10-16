@@ -2,6 +2,9 @@
 
 ```text
 ordinary Windows user -> ChildStream.exe (asInvoker)
+  -> candidate ZIP + independent digest -> read-only protected-file bootstrap plan
+       -> separately approved physical-console UAC Apply/recover/uninstall
+       -> exact owned files + pinned portable Sunshine; pairing data retained
   -> first-run feature/token observation -> explicit setup dialog
        -> read-only connected-LAN plan via one short-lived UAC helper
        -> separately approved begin / feature preparation / exact restoration
@@ -10,6 +13,7 @@ ordinary Windows user -> ChildStream.exe (asInvoker)
   -> ActiveX loopback child viewer -> exact WTS child identity and generation
   -> RunEx request -> verified limited agent PID/image/token + bounded named pipe
        -> typed status / owned Sunshine / pairing / Steam / fixed game operations
+       -> optional selected-display/audio LAN launch only after separate scoped-rule approval
        -> stable per-user Sunshine certificate, state and DPAPI admin credential
        -> generation-scoped process records, configuration and logs
 ```
@@ -37,9 +41,13 @@ paths discovered inside the limited child, reject an existing parent or foreign
 Steam singleton, and require exact process observations for teardown. An
 unobserved game launch remains uncertain and blocks destructive cleanup.
 
-The current runtime Sunshine configuration binds only to loopback. A phone or
-Fire TV cannot connect through that mode; the existing distinct-port LAN
-candidate is not a production authorization or firewall plan. GPU capture,
+The default Sunshine configuration binds only to loopback. A phone or Fire TV
+cannot connect through that mode. The separate LAN command now requires a
+protected, fresh two-rule Private-profile firewall boundary for the exact
+ChildStream executable and a verified physical IPv4 interface. It reports a
+manual address only after the child-owned listener and pinned loopback admin
+API are verified. Actual Windows firewall containment, Moonlight compatibility,
+GPU capture,
 native Sunshine coexistence, child-only controller input, audio independence,
 LAN Moonlight and gameplay remain unverified. The unsigned candidate is not
 installed and does not contain Sunshine. No Stage A/B or host mutation occurred.

@@ -1,6 +1,7 @@
 using System;
 using System.ComponentModel;
 using System.Drawing;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Windows.Forms;
@@ -38,6 +39,15 @@ internal sealed class WindowsChildFeatureReader : IChildFeatureReader
 }
 internal enum RuntimeTokenStatus { Limited, Elevated, UnableToVerify }
 internal interface IRuntimeTokenReader { RuntimeTokenStatus Read(); }
+internal interface IUnknownFeatureAttemptPolicy { bool IsApprovedInstalledAttempt(); }
+internal sealed class WindowsUnknownFeatureAttemptPolicy : IUnknownFeatureAttemptPolicy
+{
+    public bool IsApprovedInstalledAttempt()
+    {
+        try { return WindowsChildAgentTaskSetup.ForCurrentLimitedUser().IsRegisteredExactly(); }
+        catch { return false; }
+    }
+}
 internal sealed class WindowsRuntimeTokenReader : IRuntimeTokenReader
 {
     [DllImport("advapi32.dll", SetLastError = true)]
@@ -63,14 +73,20 @@ internal sealed class FirstRunController
 {
     private readonly IChildFeatureReader feature;
     private readonly IRuntimeTokenReader token;
+    private readonly IUnknownFeatureAttemptPolicy unknownAttempt;
     internal ChildFeatureObservation Feature { get; private set; }
     internal RuntimeTokenStatus Token { get; private set; }
-    internal bool CanStart { get { return Feature != null && Feature.Status == ChildFeatureStatus.Enabled && Token == RuntimeTokenStatus.Limited; } }
-    internal FirstRunController(IChildFeatureReader feature, IRuntimeTokenReader token)
+    internal bool CanStart { get { return Feature != null && Token == RuntimeTokenStatus.Limited &&
+        (Feature.Status == ChildFeatureStatus.Enabled ||
+         ((Feature.Status == ChildFeatureStatus.AccessDenied ||
+           Feature.Status == ChildFeatureStatus.UnableToVerify) &&
+          unknownAttempt != null && unknownAttempt.IsApprovedInstalledAttempt())); } }
+    internal FirstRunController(IChildFeatureReader feature, IRuntimeTokenReader token,
+        IUnknownFeatureAttemptPolicy unknownAttempt = null)
     {
         if (feature == null) throw new ArgumentNullException("feature");
         if (token == null) throw new ArgumentNullException("token");
-        this.feature = feature; this.token = token;
+        this.feature = feature; this.token = token; this.unknownAttempt = unknownAttempt;
     }
     internal void Refresh()
     {
@@ -106,8 +122,18 @@ internal sealed class FirstRunForm : Form
         start.Click += (s, e) => { controller.Refresh(); RenderState(); if (!controller.CanStart) return;
             StartSelected = true; DialogResult = DialogResult.OK; Close(); };
         refresh.Click += (s, e) => { controller.Refresh(); RenderState(); };
-        setup.Click += (s, e) => { using (var dialog = new SetupDialog(new WindowsSetupWorkflow(), simulated))
-            dialog.ShowDialog(this); controller.Refresh(); RenderState(); };
+        setup.Click += (s, e) =>
+        {
+            string installed = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                "ChildStream", "ChildStream.exe");
+            if (String.Equals(Path.GetFullPath(Application.ExecutablePath), Path.GetFullPath(installed),
+                StringComparison.OrdinalIgnoreCase))
+            { using (var dialog = new SetupDialog(new WindowsSetupWorkflow(), simulated)) dialog.ShowDialog(this); }
+            else
+            { using (var dialog = new ProductInstallDialog(new WindowsProductInstallWorkflow(), simulated))
+                  dialog.ShowDialog(this); }
+            controller.Refresh(); RenderState();
+        };
         close.Click += (s, e) => Close();
         Shown += (s, e) => { controller.Refresh(); RenderState(); };
         RenderState();
@@ -124,6 +150,8 @@ internal sealed class FirstRunForm : Form
             ? "First setup requires a separately approved feature plan. ChildStream will not change Windows automatically."
             : controller.Feature != null && controller.Feature.Status == ChildFeatureStatus.Enabled
             ? "Start a verified child desktop. Pairing and reconnect do not require Windows sign-out."
-            : "The current feature state is unknown. Check access and refresh; previous setup evidence is not current state.";
+            : controller.CanStart
+            ? "Feature visibility is unavailable. This protected, approved installation may attempt one child connection; Windows session checks decide the result."
+            : "The current feature state is unknown. Install and approve ChildStream setup, then refresh. Past evidence is not a current feature measurement.";
     }
 }

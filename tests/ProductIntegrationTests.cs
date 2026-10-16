@@ -90,8 +90,10 @@ internal static class ProductIntegrationTests
         option.BindAddress = "192.168.50.10"; option.Port = 48089;
         option.LanCandidate = new SunshineLanCandidate { Child = option.Child,
             BindAddress = option.BindAddress, Port = option.Port };
+        Reject(() => ChildProductConfiguration.BuildSunshine(option), "unapproved LAN candidate cannot bind wildcard");
+        option.LanCandidate.BoundaryVerified = true;
         string lan = ChildProductConfiguration.BuildSunshine(option);
-        Check(lan.Contains("bind_address = 192.168.50.10") && lan.Contains("port = 48089") &&
+        Check(lan.Contains("bind_address = 0.0.0.0") && lan.Contains("port = 48089") &&
             lan.Contains("origin_web_ui_allowed = pc") && lan.Contains("upnp = disabled") &&
             lan.Contains("controller = disabled"), "scoped LAN candidate configuration, no input injection");
         option.LanCandidate.Child = new ChildSessionIdentity(3, 123);
@@ -341,6 +343,75 @@ internal static class ProductIntegrationTests
         Check(File.ReadAllText(unrelated) == "preserve", "unrelated sibling preserved");
     }
 
+    private static void ProductInstallation(string fixture)
+    {
+        string root = Path.Combine(fixture, "bootstrap", "ChildStream");
+        string journal = Path.Combine(root, "install.journal");
+        var host = new WindowsOwnedInstallerHost(root, journal);
+        var engine = new InstallerEngine(host, new FileJournalStore(journal), new InstallerPolicy(root),
+            new FileTransactionOwnership(Path.Combine(root, "install.lock")));
+        var payload = new ProductInstallPayload();
+        foreach (string name in ProductInstallPayload.InstalledFiles)
+            payload.Files.Add(name, Encoding.UTF8.GetBytes("reviewed:" + name));
+        using (var archive = Archive("Sunshine/sunshine.exe", "Sunshine/assets/icon.png"))
+        using (var sha = SHA256.Create())
+        {
+            string archiveHash = ProductInstallPayload.Hex(sha.ComputeHash(archive));
+            archive.Position = 0;
+            string exeHash;
+            using (var zip = new ZipArchive(archive, ZipArchiveMode.Read, true))
+            using (var input = zip.GetEntry("Sunshine/sunshine.exe").Open())
+                exeHash = ProductInstallPayload.Hex(sha.ComputeHash(input));
+            archive.Position = 0;
+            var package = new PortableSunshinePackage { Version = SunshineReleasePin.Version,
+                SourceUrl = SunshineReleasePin.AssetUrl, Sha256 = archiveHash, ExecutableSha256 = exeHash,
+                PortableRoot = Path.Combine(root, "versions", SunshineReleasePin.Version),
+                ConfigRoot = Path.Combine(root, "identity") };
+            var install = new ProductInstallCoordinator(engine, root, InstallPrivilege.CurrentUser, package);
+            var plan = install.Plan(payload, archive);
+            Check(!Directory.Exists(root), "read-only install plan creates no lock, journal or installation root");
+            Reject(() => install.Apply(plan, payload, archive, "wrong"), "unapproved combined plan cannot install");
+            Check(!File.Exists(Path.Combine(root, "ChildStream.exe")), "unapproved bootstrap made no file");
+            install.Apply(plan, payload, archive, plan.Hash);
+            Check(File.Exists(Path.Combine(root, "ChildStream.exe")) &&
+                File.Exists(Path.Combine(root, "versions", SunshineReleasePin.Version, "sunshine.exe")),
+                "combined owned binary and portable runtime installed");
+            install.Apply(plan, payload, archive, plan.Hash);
+            var committed = install.PlanCommitted(payload, archive, new FileJournalStore(journal).Load());
+            Check(committed.Hash == plan.Hash, "reviewed repair retains exact committed plan");
+            install.Apply(committed, payload, archive, committed.Hash);
+            string foreign = Path.Combine(root, "native-preserve.txt");
+            File.WriteAllText(foreign, "untouched");
+            string portable = Path.Combine(root, "versions", SunshineReleasePin.Version, "sunshine.exe");
+            File.WriteAllText(portable, "foreign drift");
+            Reject(() => install.RecoverOrUninstall(), "portable drift blocks all file deletion");
+            Check(File.Exists(Path.Combine(root, "ChildStream.exe")), "small files preserved until portable recovery");
+            archive.Position = 0;
+            using (var zip = new ZipArchive(archive, ZipArchiveMode.Read, true))
+            using (var input = zip.GetEntry("Sunshine/sunshine.exe").Open())
+            using (var output = new MemoryStream())
+            { input.CopyTo(output); File.WriteAllBytes(portable, output.ToArray()); }
+            install.RecoverOrUninstall();
+            Check(!File.Exists(Path.Combine(root, "ChildStream.exe")) &&
+                !Directory.Exists(Path.Combine(root, "versions", SunshineReleasePin.Version)) &&
+                File.ReadAllText(foreign) == "untouched", "exact rollback preserves unrelated sibling");
+            install.RecoverOrUninstall();
+            Check(File.ReadAllText(foreign) == "untouched", "repeated rollback idempotent");
+        }
+        string candidate = Path.Combine(fixture, "candidate-fixture.zip");
+        using (var output = new FileStream(candidate, FileMode.CreateNew, FileAccess.Write))
+        using (var zip = new ZipArchive(output, ZipArchiveMode.Create))
+            foreach (string name in ProductInstallPayload.InstalledFiles)
+            using (var writer = new StreamWriter(zip.CreateEntry(name).Open())) writer.Write("reviewed:" + name);
+        string digest;
+        using (var sha = SHA256.Create())
+        using (var input = File.OpenRead(candidate)) digest = ProductInstallPayload.Hex(sha.ComputeHash(input));
+        Reject(() => ProductInstallPayload.ReadCandidate(candidate, new string('0', 64)),
+            "candidate self-description cannot replace reviewed outer digest");
+        Check(ProductInstallPayload.ReadCandidate(candidate, digest).Files.Count == 4,
+            "exact reviewed candidate payload admitted");
+    }
+
     private static void Acceptance()
     {
         var child = new ChildSessionIdentity(2, 123);
@@ -451,7 +522,8 @@ internal static class ProductIntegrationTests
         try
         {
             Configuration(root); Processes(root); Archives(); Extraction(root); ExtractionRecovery(root);
-            Conflicts(); OwnedFileTransaction(root); Acceptance(); Steam(root); ChildBootstrap(root);
+            Conflicts(); OwnedFileTransaction(root); ProductInstallation(root);
+            Acceptance(); Steam(root); ChildBootstrap(root);
             if (args.Length == 1) PinnedArchive(args[0]);
             Console.WriteLine("Product integration offline assertions passed: " + assertions);
             return 0;
