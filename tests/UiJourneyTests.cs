@@ -120,6 +120,26 @@ internal static class UiJourneyTests
                 "approved simulated file install exposes the installed-app handoff");
             Save(form, folder, "install-handoff-simulated");
         }
+        var bundleFixture = new ProductBundle { Root = folder,
+            CandidatePath = Path.Combine(folder, "payload", "ChildStream-candidate.zip"),
+            SunshinePath = Path.Combine(folder, "payload", SunshineReleasePin.AssetName),
+            CandidateSha256 = new string('e', 64), SourceSha = new string('d', 40) };
+        var bundledInstaller = new Installer();
+        using (var bundled = new ProductInstallDialog(bundledInstaller, true, bundleFixture))
+        {
+            Save(bundled, folder, "install-bundled-audio-plan-simulated");
+            var zip = Find<TextBox>(bundled, b => b.AccessibleName == "Candidate ZIP:");
+            var digest = Find<TextBox>(bundled, b => b.AccessibleName == "Reviewed candidate SHA-256:");
+            var archive = Find<TextBox>(bundled, b => b.AccessibleName == "Pinned Sunshine ZIP:");
+            var hash = Find<TextBox>(bundled, b => b.AccessibleName == "Exact install plan SHA-256:");
+            for (int i = 0; i < 100 && hash.Text.Length != 64; i++)
+            { Application.DoEvents(); Thread.Sleep(10); }
+            Check(zip.Text == bundleFixture.CandidatePath && digest.Text == bundleFixture.CandidateSha256 &&
+                archive.Text == bundleFixture.SunshinePath && hash.Text == new string('a', 64) &&
+                bundledInstaller.Plans == 1 && zip.ReadOnly && digest.ReadOnly && archive.ReadOnly,
+                "normal installer form auto-carries verified bundled payloads into read-only plan");
+            Save(bundled, folder, "install-bundled-audio-ready-simulated");
+        }
         foreach (int percent in new[] { 150, 200 })
         using (var scaled = new ProductInstallDialog(new Installer(), true))
         {
@@ -191,6 +211,16 @@ internal static class UiJourneyTests
             guideItems[1].Enabled = false; guideItems[2].Enabled = true;
             guideStatus = "Local ChildStream Sunshine ready. Approve a scoped LAN plan for Moonlight.";
             guide.RefreshState(); Save(guide, folder, "guide-lan-reconfigure-simulated");
+            guideItems[2].Enabled = false; guideItems[3].Enabled = true;
+            guideItems[4].Enabled = true; guideItems[6].Enabled = true;
+            guideStatus = "Capture-only Sunshine verified with the selected child endpoint. Game render routing and physical isolation still need validation.";
+            guide.RefreshState(); Save(guide, folder, "guide-audio-ready-simulated");
+            guideStatus = "Moonlight reconnected to the same owned ChildStream certificate and audio endpoint.";
+            guide.RefreshState(); Save(guide, folder, "guide-audio-reconnect-simulated");
+            guideItems[3].Enabled = guideItems[4].Enabled = guideItems[6].Enabled = false;
+            guideItems[7].Enabled = true;
+            guideStatus = "Selected child audio endpoint disappeared. Recover only the exact owned stream.";
+            guide.RefreshState(); Save(guide, folder, "guide-audio-lost-simulated");
             guideItems[2].Enabled = false; guideItems[7].Enabled = true;
             guideStatus = "Owned startup outcome uncertain. Exact process recovery is required.";
             guide.RefreshState(); Save(guide, folder, "guide-recovery-simulated");
@@ -205,6 +235,10 @@ internal static class UiJourneyTests
             Check(lost.Recover && !lost.StartLan && !lost.Pair &&
                 Find<Button>(guide, b => b.Text == "Recover start").Enabled,
                 "idle local process loss exposes exact recovery through real guided controls");
+            var audioLost = ChildStreamingUiState.From(new System.Collections.Generic.Dictionary<string, object> {
+                { "stage", "SunshineAudioLost" }, { "lanPosture", "LocalOnly" } }, false);
+            Check(audioLost.Recover && !audioLost.Pair && !audioLost.StartLan,
+                "lost selected audio endpoint exposes exact recovery without pairing");
             var withdrawn = ChildStreamingUiState.From(new System.Collections.Generic.Dictionary<string, object> {
                 { "stage", "SunshineWithdrawn" }, { "lanPosture", "Withdrawn" } }, false);
             Check(withdrawn.StartLan && !withdrawn.Pair && !withdrawn.Recover,

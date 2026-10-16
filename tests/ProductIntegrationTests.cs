@@ -99,14 +99,15 @@ internal static class ProductIntegrationTests
             config.Contains("keyboard = enabled") && config.Contains("mouse = enabled") &&
             config.Contains("install_steam_audio_drivers = disabled"), "free input driver and no automatic driver install");
         Check(config.Contains("audio_sink = {audio-endpoint}") &&
-            config.Contains("stream_audio = disabled") && !config.Contains("virtual_sink ="),
-            "pinned Sunshine audio stays off until default-switching and parent effects are excluded");
+            config.Contains("external_audio = enabled") && config.Contains("stream_audio = enabled") &&
+            !config.Contains("virtual_sink ="),
+            "pinned capture-only Sunshine requests selected endpoint and Moonlight audio");
         var rdpAudio = new FakeRdpControl();
         rdpAudio.AdvancedSettings7.AudioCaptureRedirectionMode = true;
         ChildRdpAudioPolicy.Configure(rdpAudio);
-        Check(rdpAudio.SecuredSettings2.AudioRedirectionMode == 2 &&
+        Check(rdpAudio.SecuredSettings2.AudioRedirectionMode == 1 &&
             !rdpAudio.AdvancedSettings7.AudioCaptureRedirectionMode,
-            "production RDP policy suppresses unsafe playback and parent microphone redirection");
+            "production RDP policy plays on child host and blocks parent microphone redirection");
         var ignoredRdp = new FakeRdpControl(); ignoredRdp.SecuredSettings2.IgnoreWrites = true;
         Reject(() => ChildRdpAudioPolicy.Configure(ignoredRdp),
             "RDP control refusing child-side playback blocks connection");
@@ -154,8 +155,8 @@ internal static class ProductIntegrationTests
         option.AudioEndpointId = "{audio-endpoint}"; audio.Complete = false;
         Reject(() => ChildProductConfiguration.BuildSunshine(option), "incomplete child audio inventory blocked");
         audio.Complete = true; audio.DefaultRenderId = "{other-endpoint}";
-        Reject(() => ChildProductConfiguration.BuildSunshine(option),
-            "audio capture sink without the child render default is rejected");
+        Check(ChildProductConfiguration.BuildSunshine(option).Contains("audio_sink = {audio-endpoint}"),
+            "capture-only Sunshine supports explicitly selected active nondefault endpoint");
         audio.DefaultRenderId = "{audio-endpoint}";
         audio.SessionId = 1;
         Reject(() => ChildProductConfiguration.BuildSunshine(option), "parent audio inventory cannot qualify child");
@@ -702,6 +703,49 @@ internal static class ProductIntegrationTests
         Reject(() => request.Encode(), "unowned pipe name rejected");
     }
 
+    private static string Digest(byte[] bytes)
+    { using (var sha = SHA256.Create()) return ProductInstallPayload.Hex(sha.ComputeHash(bytes)); }
+
+    private static void UserBundle(string root)
+    {
+        string folder = Path.Combine(root, "user-bundle");
+        Directory.CreateDirectory(Path.Combine(folder, "payload"));
+        byte[] launcher = Encoding.UTF8.GetBytes("fixture-launcher");
+        byte[] bootstrap = Encoding.UTF8.GetBytes("fixture-bootstrap");
+        File.WriteAllBytes(Path.Combine(folder, "ChildStream.exe"), launcher);
+        File.WriteAllBytes(Path.Combine(folder, "ChildStreamBootstrap.exe"), bootstrap);
+        string candidate = Path.Combine(folder, "payload", "ChildStream-candidate.zip");
+        using (var file = new FileStream(candidate, FileMode.CreateNew))
+        using (var zip = new ZipArchive(file, ZipArchiveMode.Create))
+            foreach (string name in ProductInstallPayload.InstalledFiles)
+            {
+                byte[] bytes = name == "bin/ChildStream.exe" ? launcher :
+                    name == "bin/ChildStreamBootstrap.exe" ? bootstrap : Encoding.UTF8.GetBytes(name);
+                using (var entry = zip.CreateEntry(name).Open()) entry.Write(bytes, 0, bytes.Length);
+            }
+        byte[] sunshine = Encoding.UTF8.GetBytes("fixture-portable-sunshine");
+        string archive = Path.Combine(folder, "payload", SunshineReleasePin.AssetName);
+        File.WriteAllBytes(archive, sunshine);
+        byte[] candidateBytes = File.ReadAllBytes(candidate);
+        string manifest = new System.Web.Script.Serialization.JavaScriptSerializer().Serialize(new {
+            schema = "ChildStream.UserBundle.v1", sourceSha = new string('a', 40),
+            candidateSha256 = Digest(candidateBytes), sunshineSha256 = Digest(sunshine),
+            launcherSha256 = Digest(launcher), bootstrapSha256 = Digest(bootstrap) });
+        File.WriteAllText(Path.Combine(folder, "bundle.json"), manifest);
+        var admitted = ProductBundle.ReadFixture(folder, Digest(sunshine));
+        Check(admitted.CandidateSha256 == Digest(candidateBytes) &&
+            admitted.SunshinePath == archive, "user bundle carries exact candidate and Sunshine payload internally");
+        Reject(() => ProductBundle.Read(folder), "production bundle refuses unpinned Sunshine bytes");
+        File.AppendAllText(candidate, "changed");
+        Reject(() => ProductBundle.ReadFixture(folder, Digest(sunshine)), "changed candidate blocks bundled plan");
+        File.WriteAllBytes(candidate, candidateBytes);
+        File.AppendAllText(Path.Combine(folder, "ChildStreamBootstrap.exe"), "changed");
+        Reject(() => ProductBundle.ReadFixture(folder, Digest(sunshine)), "changed external bootstrap blocks UAC path");
+        File.WriteAllBytes(Path.Combine(folder, "ChildStreamBootstrap.exe"), bootstrap);
+        File.Delete(archive);
+        Reject(() => ProductBundle.ReadFixture(folder, Digest(sunshine)), "missing Sunshine blocks bundled plan");
+    }
+
     internal static int Main(string[] args)
     {
         string root = Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
@@ -712,6 +756,7 @@ internal static class ProductIntegrationTests
             Conflicts(); OwnedFileTransaction(root); ProductInstallation(root);
             SunshineRecoveryRecords(root); SteamRecoveryRecords(root);
             Acceptance(); Steam(root); ChildBootstrap(root);
+            UserBundle(root);
             if (args.Length == 1) PinnedArchive(args[0]);
             Console.WriteLine("Product integration offline assertions passed: " + assertions);
             return 0;

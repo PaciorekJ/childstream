@@ -137,9 +137,8 @@ internal static class ChildProductConfiguration
         SafeValue(option.AudioEndpointId, "Child audio endpoint");
         if (option.AudioInventory == null || !option.AudioInventory.Complete ||
             option.AudioInventory.SessionId != option.Child.SessionId ||
-            !option.AudioInventory.ActiveRenderIds.Contains(option.AudioEndpointId) ||
-            !String.Equals(option.AudioInventory.DefaultRenderId, option.AudioEndpointId, StringComparison.Ordinal))
-            throw new InvalidDataException("The selected audio sink must be the active child default render endpoint.");
+            !option.AudioInventory.ActiveRenderIds.Contains(option.AudioEndpointId))
+            throw new InvalidDataException("The selected audio sink must be an active child-observed render endpoint.");
         if (option.LanCandidate == null)
         {
             if (option.BindAddress != "127.0.0.1" ||
@@ -183,11 +182,11 @@ internal static class ChildProductConfiguration
         line("capture", option.Capture == CaptureBackend.WindowsGraphicsCapture ? "wgc" : "ddx");
         line("encoder", "nvenc");
         line("audio_sink", option.AudioEndpointId);
-        // The pinned Sunshine Windows backend can switch default endpoints
-        // when Moonlight disables host playback, even without virtual_sink.
-        // Keep capture disabled until an independently pinned capture-only
-        // backend and a child-only render path are qualified.
-        line("stream_audio", "disabled");
+        // The pinned capture-only backend never changes the Windows default or
+        // installs a driver. Routing game output to this endpoint remains an
+        // independent prerequisite; the child agent observes it separately.
+        line("external_audio", "enabled");
+        line("stream_audio", "enabled");
         AppendInputPolicy(line, true);
         line("gamepad", "x360");
         return config.ToString();

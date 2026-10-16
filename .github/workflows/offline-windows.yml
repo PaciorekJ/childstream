@@ -10,7 +10,7 @@ permissions:
 jobs:
   launcher:
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
@@ -22,6 +22,15 @@ jobs:
       - name: Build unsigned candidate package
         shell: pwsh
         run: .\scripts\build-candidate.ps1
+      - name: Build bundled unsigned Windows user distribution
+        shell: pwsh
+        run: .\scripts\build-user-package.ps1
+      - name: Retain installable user distribution for review
+        uses: actions/upload-artifact@v4
+        with:
+          name: childstream-windows-x64-unsigned-audio-candidate
+          path: tests/.artifacts/distribution/ChildStream-Windows-x64-*.zip
+          if-no-files-found: error
       - name: Retain candidate package for review
         uses: actions/upload-artifact@v4
         with:

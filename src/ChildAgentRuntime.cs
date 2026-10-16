@@ -144,6 +144,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
     private bool monitoringLan, boundaryWithdrawn;
     private string lastCapabilities;
     private string lanAddress;
+    private string selectedAudioId;
     private ChildOwnedProcess sunshine;
     private ProductProcessIdentity sunshineIdentity;
     private IChildSunshineIdentity identity;
@@ -199,7 +200,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
                 RecoverSunshine(); return Status();
             case ChildAgentOperation.PairingGet:
                 if (payload.Length != 0 || pairing == null) throw new InvalidOperationException("Verified Sunshine is required for pairing refresh.");
-                owner.AssertStillOwned(); return pairing.Send("GET", "/api/pin", null);
+                owner.AssertStillOwned(); AssertAudioReady(); return pairing.Send("GET", "/api/pin", null);
             case ChildAgentOperation.PairingPost:
                 if (pairing == null || payload.Length > 4096) throw new InvalidOperationException("Verified Sunshine is required for PIN approval.");
                 var selected = new JavaScriptSerializer().DeserializeObject(payload) as IDictionary<string, object>;
@@ -208,7 +209,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
                     !selected.TryGetValue("pin", out pin) || !selected.TryGetValue("name", out name))
                     throw new InvalidDataException("PIN approval request is malformed.");
                 string canonical = SunshinePairingProtocol.BuildPinRequest(id as string, pin as string, name as string);
-                owner.AssertStillOwned(); return pairing.Send("POST", "/api/pin", canonical);
+                owner.AssertStillOwned(); AssertAudioReady(); return pairing.Send("POST", "/api/pin", canonical);
             case ChildAgentOperation.StartSteam:
                 if (payload.Length != 0) throw new InvalidDataException("Steam start has no caller-selected path or arguments.");
                 StartSteam(); return Status();
@@ -279,6 +280,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
         if (state == "SunshineReady")
             try { owner.AssertStillOwned(); }
             catch (InvalidOperationException) { state = "SunshineBoundaryLost"; }
+        if (state == "SunshineReady" && !AudioReady()) state = "SunshineAudioLost";
         return new JavaScriptSerializer().Serialize(new Dictionary<string, object> {
             { "stage", state }, { "childSession", child.SessionId }, { "childLogon", child.LogonTime },
             { "host", "ChildStream" }, { "manualAddress", state == "SunshineReady" ?
@@ -288,11 +290,28 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
             { "steamStage", steam == null ? "NotStarted" : steam.Stage.ToString() }
         });
     }
+    private bool AudioReady()
+    {
+        if (String.IsNullOrEmpty(selectedAudioId)) return false;
+        try
+        {
+            ChildAudioEndpointInventory current = environment.ReadAudio(child);
+            return current != null && current.Complete && current.SessionId == (int)child.SessionId &&
+                current.ActiveRenderIds.Contains(selectedAudioId);
+        }
+        catch { return false; }
+    }
+    private void AssertAudioReady()
+    {
+        if (!AudioReady()) throw new InvalidOperationException(
+            "The exact selected child audio endpoint is unavailable; streaming audio cannot be verified.");
+    }
     private void StartSteam()
     {
         if (steam != null) throw new InvalidOperationException("Steam already has an owned or uncertain start outcome.");
         if (sunshineIdentity == null || owner == null) throw new InvalidOperationException("Verified child streaming runtime is required.");
         owner.AssertStillOwned();
+        AssertAudioReady();
         SteamInstallation installed = environment.ReadSteamInstallation();
         SteamLaunchObservation observed = environment.ReadSteamObservation(child, parentSessionId);
         if (installed == null || String.IsNullOrEmpty(installed.SteamPath) ||
@@ -316,6 +335,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
     {
         if (steam == null || steam.Stage != SteamChildStage.BigPictureStarted)
             throw new InvalidOperationException("Verified child Steam Big Picture is required.");
+        AssertAudioReady();
         SteamLaunchObservation observed = environment.ReadSteamObservation(child, parentSessionId);
         if (observed == null) throw new InvalidOperationException("Steam ownership observation is unavailable.");
         environment.RecordGameRequest(child);
@@ -360,7 +380,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
         {
             if (!String.Equals(lanAddress, requestedLanAddress, StringComparison.Ordinal))
                 throw new InvalidOperationException("The running Sunshine instance has a different network posture.");
-            owner.AssertStillOwned(); return Status();
+            owner.AssertStillOwned(); AssertAudioReady(); return Status();
         } // Reconnect never duplicates the owned process.
         if (requestedLanAddress != null)
         {
@@ -395,8 +415,6 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
         }
         if (!audio.ActiveRenderIds.Contains(audioId))
             throw new InvalidOperationException("Selected child audio endpoint is not active in this child session.");
-        if (!String.Equals(audio.DefaultRenderId, audioId, StringComparison.Ordinal))
-            throw new InvalidOperationException("Selected audio endpoint is not the current child default render endpoint; no game playback route is established.");
         identity = environment.OpenIdentity();
         bool startIntentRecorded = false;
         try
@@ -458,6 +476,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
                 if (!pairing.BootstrapFirstCredentials()) throw new InvalidOperationException("Owned Sunshine credential bootstrap was refused.");
             }
             pairing.Send("GET", "/api/pin", null); // Authenticated readiness, never native Sunshine.
+            selectedAudioId = audioId;
             lanAddress = requestedLanAddress;
             boundaryWithdrawn = false;
             if (requestedLanAddress != null)
@@ -485,6 +504,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
             environment.ResolveStopped(child, sunshineIdentity);
             monitoringLan = false; monitor.Stop();
             sunshine = null; sunshineIdentity = null; pairing = null; owner = null; lanAddress = null;
+            selectedAudioId = null;
             identity.Dispose(); identity = null;
         }
         catch { uncertain = true; throw; }
@@ -511,6 +531,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
                 sunshine.Stop(5000);
                 environment.ResolveStopped(child, sunshineIdentity);
                 sunshine = null; sunshineIdentity = null; lanAddress = null;
+                selectedAudioId = null;
                 if (identity != null) { identity.Dispose(); identity = null; }
                 boundaryWithdrawn = true;
             }
@@ -541,7 +562,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
             bool healthy = false;
             try { owner.AssertStillOwned(); healthy = true; }
             catch (InvalidOperationException) { }
-            if (healthy) throw new InvalidOperationException("Verified healthy Sunshine does not require recovery.");
+            if (healthy && AudioReady()) throw new InvalidOperationException("Verified healthy Sunshine does not require recovery.");
         }
         ChildOwnedProcess controlled = sunshine;
         if (controlled == null)
@@ -557,6 +578,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
         environment.ResolveFailedStart(child, exact);
         monitoringLan = false; monitor.Stop();
         sunshine = null; sunshineIdentity = null; pairing = null; owner = null; lanAddress = null;
+        selectedAudioId = null;
         if (identity != null) { identity.Dispose(); identity = null; }
         uncertain = false;
     }

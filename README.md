@@ -7,6 +7,20 @@ ChildStream is a Windows child-session and portable Sunshine proof of concept fo
 Read the [architecture and security audit](docs/audit.md) and [live acceptance plan](docs/live-acceptance.md) before testing on a Windows host. The intended outcome is independent physical and remote interaction with separate capture, input, and audio; none of those hardware claims has been established by this branch.
 The [runtime map](docs/product-runtime-map.md) identifies which product classes are actually invoked and which still require connection and live Windows proof.
 
+## Windows user package
+
+Draft PR #4 CI builds an unsigned Windows x64 user ZIP named
+`ChildStream-Windows-x64-<source>.zip`. It contains `ChildStream.exe` as the
+entry point, its protected-file bootstrap and payload, and the exact official
+Sunshine prerelease with capture-only audio support. Extract the ZIP to a
+persistent folder, independently verify its published outer SHA-256, and open
+`ChildStream.exe` as a standard user. The installer screen verifies the bundled
+files and plans the owned-file installation without requiring manual hash copy.
+It requests explicit approval and Windows UAC only for the reviewed file plan.
+Do not run that mutation on the protected workstation under the current gate.
+See [audio candidate delivery](docs/audio-candidate.md) for the precise
+dependency, tests and remaining game-routing and physical acceptance gaps.
+
 ## Offline work
 
 From PowerShell in the repository root:

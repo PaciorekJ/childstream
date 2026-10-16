@@ -26,19 +26,17 @@ public class RdpBox : AxHost
 
 internal static class ChildRdpAudioPolicy
 {
-    // Microsoft RDP ActiveX: 2 suppresses playback at both viewer and child;
-    // false prevents redirecting the parent's microphone into the child.
-    // Both values must be accepted before Connect; never fall back to the
-    // default mode 0, which sends child playback to the parent viewer.
-    // Mode 1 may be used only after an independent child render path and a
-    // capture-only Sunshine release are qualified; neither exists today.
+    // Microsoft RDP ActiveX: 1 leaves playback on the remote child computer.
+    // This is necessary for the selected render endpoint to receive game sound.
+    // It does not establish that the endpoint is private to that session.
+    // Never fall back to mode 0 (parent viewer) or 2 (no server playback).
     internal static void Configure(object control)
     {
         if (control == null) throw new InvalidOperationException("RDP audio control is unavailable.");
         dynamic rdp = control;
-        rdp.SecuredSettings2.AudioRedirectionMode = 2;
+        rdp.SecuredSettings2.AudioRedirectionMode = 1;
         rdp.AdvancedSettings7.AudioCaptureRedirectionMode = false;
-        if ((int)rdp.SecuredSettings2.AudioRedirectionMode != 2 ||
+        if ((int)rdp.SecuredSettings2.AudioRedirectionMode != 1 ||
             (bool)rdp.AdvancedSettings7.AudioCaptureRedirectionMode)
             throw new InvalidOperationException("RDP child audio redirection settings were not retained.");
     }
@@ -76,7 +74,7 @@ internal sealed class ChildStreamingUiState
         bool ready = stage == "SunshineReady";
         bool available = stage == "NoSunshine" || stage == "SunshineWithdrawn";
         bool lost = stage == "Uncertain" || stage == "SunshineLost" ||
-            stage == "SunshineBoundaryLost";
+            stage == "SunshineBoundaryLost" || stage == "SunshineAudioLost";
         if (!ready && !available && !lost)
             throw new InvalidDataException("Unrecognized owned runtime stage.");
         return new ChildStreamingUiState { StartLocal = available,
@@ -438,7 +436,8 @@ static class Program
                     await Task.Run(() => selected.Execute(ChildAgentOperation.StopSteam, ""));
                 if (Convert.ToString(observed["stage"]) == "SunshineReady" ||
                     Convert.ToString(observed["stage"]) == "SunshineBoundaryLost" ||
-                    Convert.ToString(observed["stage"]) == "SunshineLost")
+                    Convert.ToString(observed["stage"]) == "SunshineLost" ||
+                    Convert.ToString(observed["stage"]) == "SunshineAudioLost")
                     await Task.Run(() => selected.Execute(ChildAgentOperation.StopSunshine, ""));
                 if (Convert.ToString(observed["stage"]) == "Uncertain")
                     throw new InvalidOperationException("Resolve exact owned runtime uncertainty before closing the agent.");
@@ -569,6 +568,8 @@ static class Program
             pairItem.Enabled = !runtimeActionPending && state.Pair;
             if (stage == "SunshineWithdrawn")
                 statusText.Text = "LAN boundary changed; exact owned Sunshine was withdrawn. Review LAN setup.";
+            else if (stage == "SunshineAudioLost")
+                statusText.Text = "Selected child audio endpoint disappeared. Recover only the exact ChildStream stream, then choose an active endpoint.";
             else if (stage == "SunshineLost" || stage == "SunshineBoundaryLost")
                 statusText.Text = "Owned Sunshine was lost; reconcile its exact process before retrying.";
         };

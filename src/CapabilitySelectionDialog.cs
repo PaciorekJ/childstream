@@ -67,8 +67,8 @@ internal sealed class CapabilitySelectionDialog : Form
         Width = 660; Height = 445; MinimumSize = new Size(580, 400);
         StartPosition = FormStartPosition.CenterParent;
         var note = new Label { Left = 20, Top = 16, Width = 610, Height = 48,
-            Text = "Choose devices observed inside the exact child session. This selects capture and audio routing " +
-                "for ChildStream Sunshine; it does not change the parent desktop's defaults." };
+            Text = "Choose devices observed inside the exact child session. Sunshine captures the selected audio endpoint; " +
+                "the game must render to it through an existing route. ChildStream does not change Windows defaults." };
         var displayLabel = new Label { Left = 20, Top = 74, Width = 295, Text = "Child display" };
         var audioLabel = new Label { Left = 335, Top = 74, Width = 295, Text = "Child audio endpoint" };
         displays = new ListBox { Left = 20, Top = 99, Width = 295, Height = 220,

@@ -132,6 +132,7 @@ static class IntegratedRuntimeTests
           Process.GamePath = Path.Combine(root, "Game", "Dungeons-Win64-Shipping.exe"); Pairing = new Pairing(Identity);
           Directory.CreateDirectory(Root); }
         internal string AudioDefaultId = "{child-audio}";
+        internal bool AudioAvailable = true;
         public IProductProcessHost Processes { get { return Process; } }
         public string SunshineExecutable { get { return Process.Path; } }
         public string DataRoot { get { return Root; } }
@@ -145,7 +146,10 @@ static class IntegratedRuntimeTests
         public ChildAudioEndpointInventory ReadAudio(ChildSessionIdentity child)
         { var result = new ChildAudioEndpointInventory { SessionId = (int)child.SessionId,
               Complete = true, DefaultRenderId = AudioDefaultId };
-          result.ActiveRenderIds.Add("{child-audio}"); if (MultipleDevices) result.ActiveRenderIds.Add("{child-audio-2}");
+          if (AudioAvailable) {
+              result.ActiveRenderIds.Add("{child-audio}");
+              if (MultipleDevices) result.ActiveRenderIds.Add("{child-audio-2}");
+          }
           return result; }
         public SunshineCollisionSnapshot ReadCollision(SunshinePortFamily family)
         { return new SunshineCollisionSnapshot { ServiceObservationComplete = true, ProcessObservationComplete = true, PortObservationComplete = true }; }
@@ -687,7 +691,8 @@ static class IntegratedRuntimeTests
             string firstConfig = productionPath.LastConfig;
             Check(File.ReadAllText(firstConfig).Contains("gamepad_driver = vigembus") &&
                 File.ReadAllText(firstConfig).Contains("controller = disabled") &&
-                File.ReadAllText(firstConfig).Contains("stream_audio = disabled"),
+                File.ReadAllText(firstConfig).Contains("stream_audio = enabled") &&
+                File.ReadAllText(firstConfig).Contains("external_audio = enabled"),
                 "production local start pins free input backend and disables unsafe pinned audio");
             int beforePicker = productionPath.Discoveries;
             ChildStreamingPreparation lanChoice = presenter.Prepare("192.168.50.10");
@@ -706,7 +711,8 @@ static class IntegratedRuntimeTests
             string lanConfigA = productionPath.LastConfig;
             Check(File.ReadAllText(lanConfigA).Contains("gamepad_driver = vigembus") &&
                 File.ReadAllText(lanConfigA).Contains("controller = disabled") &&
-                File.ReadAllText(lanConfigA).Contains("stream_audio = disabled"),
+                File.ReadAllText(lanConfigA).Contains("stream_audio = enabled") &&
+                File.ReadAllText(lanConfigA).Contains("external_audio = enabled"),
                 "approved LAN transition retains disabled controller and unsafe-audio posture");
             Check(File.Exists(firstConfig) && File.Exists(lanConfigA) && firstConfig != lanConfigA &&
                 productionPath.Identity.Credentials,
@@ -794,15 +800,22 @@ static class IntegratedRuntimeTests
                 "multiple child devices cannot be chosen implicitly");
             string selected = catalog.SelectionPayload("{12100db6-5a9d-40c4-9c10-c3b1f606a632}",
                 "{child-audio-2}", null);
-            Reject(() => worker.Execute(ChildAgentOperation.StartSunshine, selected),
-                "selected capture endpoint without child default playback route cannot start");
-            Check(multiple.Process.Starts == 0,
-                "audio route rejection happens before an owned Sunshine process starts");
-            multiple.AudioDefaultId = "{child-audio-2}";
             worker.Execute(ChildAgentOperation.StartSunshine, selected);
             Check(multiple.SunshineConfiguration.Contains("audio_sink = {child-audio-2}") &&
+                multiple.SunshineConfiguration.Contains("external_audio = enabled") &&
+                multiple.SunshineConfiguration.Contains("stream_audio = enabled") &&
                 multiple.SunshineConfiguration.Contains("output_name = {12100db6-5a9d-40c4-9c10-c3b1f606a632}"),
-                "selected IDs reach the real Sunshine config builder");
+                "selected nondefault endpoint reaches capture-only audio and display config");
+            multiple.AudioAvailable = false;
+            Check(worker.Execute(ChildAgentOperation.Status, "").Contains("SunshineAudioLost"),
+                "production status detects disappearance of the exact selected endpoint");
+            Reject(() => worker.Execute(ChildAgentOperation.PairingGet, ""),
+                "pairing refresh cannot advertise a stream whose selected endpoint vanished");
+            worker.Execute(ChildAgentOperation.RecoverSunshine, "");
+            Check(multiple.Process.Current == null,
+                "audio-loss recovery stops only the exact owned Sunshine process");
+            multiple.AudioAvailable = true;
+            worker.Execute(ChildAgentOperation.StartSunshine, selected);
             worker.Execute(ChildAgentOperation.StopSunshine, "");
         }
         var delayed = new Environment(root + "-delayed"); delayed.Process.DelayGame = true;

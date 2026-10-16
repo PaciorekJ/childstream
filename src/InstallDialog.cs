@@ -39,6 +39,8 @@ internal sealed class WindowsProductInstallWorkflow : IProductInstallWorkflow
         string source = Path.GetDirectoryName(archive);
         string beside = Path.Combine(source, "ChildStreamBootstrap.exe");
         string insideBin = Path.Combine(source, "bin", "ChildStreamBootstrap.exe");
+        string userBundle = String.Equals(Path.GetFileName(source), "payload", StringComparison.OrdinalIgnoreCase)
+            ? Path.Combine(Path.GetDirectoryName(source), "ChildStreamBootstrap.exe") : null;
         bool installedApplication = String.Equals(app, root, StringComparison.OrdinalIgnoreCase);
         if (installedApplication || externalRequired)
         {
@@ -46,6 +48,9 @@ internal sealed class WindowsProductInstallWorkflow : IProductInstallWorkflow
                 StringComparison.OrdinalIgnoreCase)) return insideBin;
             if (File.Exists(beside) && !Path.GetFullPath(beside).StartsWith(root + Path.DirectorySeparatorChar,
                 StringComparison.OrdinalIgnoreCase)) return beside;
+            if (userBundle != null && File.Exists(userBundle) &&
+                !Path.GetFullPath(userBundle).StartsWith(root + Path.DirectorySeparatorChar,
+                    StringComparison.OrdinalIgnoreCase)) return userBundle;
             throw new FileNotFoundException("Choose a separately extracted reviewed candidate with its bootstrap. " +
                 "The installed executable cannot remove itself. A fresh copy of the same reviewed artifact is acceptable.");
         }
@@ -166,13 +171,25 @@ internal sealed class ProductInstallDialog : Form
     private readonly Label outcome;
     private readonly Button[] buttons;
     private readonly Button openInstalled;
+    private readonly ProductBundle bundle;
+    private readonly string bundleError;
     private bool installedReady;
     private bool busy;
     private readonly bool simulated;
     internal ProductInstallDialog(IProductInstallWorkflow workflow, bool simulated = false)
+        : this(workflow, simulated, null) { }
+#if TEST_ONLY
+    internal ProductInstallDialog(IProductInstallWorkflow workflow, bool simulated, ProductBundle testBundle)
+#else
+    private ProductInstallDialog(IProductInstallWorkflow workflow, bool simulated, ProductBundle testBundle)
+#endif
     {
         this.workflow = workflow;
         this.simulated = simulated;
+        bundle = testBundle;
+        if (!simulated && bundle == null)
+            try { bundle = ProductBundle.FindCurrent(); }
+            catch (Exception ex) { bundleError = ex.Message; }
         Text = simulated ? "ChildStream software install — simulated" : "ChildStream software installation";
         Width = 760; Height = 555; MinimumSize = new Size(700, 520);
         AutoScroll = true; // At high DPI or a smaller display, approval and recovery controls remain reachable.
@@ -208,6 +225,21 @@ internal sealed class ProductInstallDialog : Form
             plan, apply, fetch, recover, close, uninstall, openInstalled,
             chooseCandidate, chooseSunshine, outcome });
         CancelButton = close;
+        if (bundle != null)
+        {
+            candidate.Text = bundle.CandidatePath;
+            reviewedDigest.Text = bundle.CandidateSha256;
+            sunshine.Text = bundle.SunshinePath;
+            candidate.ReadOnly = reviewedDigest.ReadOnly = sunshine.ReadOnly = true;
+            chooseCandidate.Enabled = chooseSunshine.Enabled = fetch.Enabled = false;
+            description.Text = "Verified bundled ChildStream and capture-only Sunshine files are ready for a read-only install plan. " +
+                "Approve the exact plan only after independent review of this unsigned distribution. Windows setup and LAN need separate approval.";
+            outcome.Text = "Bundled payloads matched their manifest and the pinned Sunshine archive. Reviewing the install plan is read-only.";
+            Shown += async (s, e) => await Run("plan");
+        }
+        else if (bundleError != null)
+            outcome.Text = "Reviewed bundle could not be verified: " + bundleError +
+                " Reacquire the exact published package before installation or maintenance.";
         plan.Click += async (s, e) => await Run("plan");
         apply.Click += async (s, e) => await Run("apply");
         fetch.Click += async (s, e) => await Run("fetch");
@@ -244,7 +276,9 @@ internal sealed class ProductInstallDialog : Form
     private void SetBusy(bool value)
     {
         busy = value; UseWaitCursor = value;
-        foreach (Button button in buttons) button.Enabled = !value;
+        foreach (Button button in buttons) button.Enabled = !value &&
+            (bundle == null || (button.Text != "Fetch Sunshine" && button.Text != "Choose candidate" &&
+                                button.Text != "Choose Sunshine"));
         if (!value) openInstalled.Enabled = installedReady;
         foreach (TextBox box in new[] { candidate, reviewedDigest, sunshine, planHash }) box.Enabled = !value;
     }
@@ -273,8 +307,13 @@ internal sealed class ProductInstallDialog : Form
               planHash.Text = value; outcome.Text = "Read-only plan complete. Review the hash before approving installation."; }
             else if (action == "apply")
             { await Task.Run(() => workflow.Apply(zip, digest, archive, hash));
+              string rememberError = null;
+              if (bundle != null && !simulated)
+                  try { bundle.Remember(); }
+                  catch (Exception ex) { rememberError = ex.Message; }
               installedReady = true;
-              outcome.Text = "Protected software layout verified. Open the installed ChildStream application to continue setup."; }
+              outcome.Text = "Protected software layout verified. Open the installed ChildStream application to continue setup." +
+                  (rememberError == null ? "" : " Keep this reviewed bundle for maintenance: " + rememberError); }
             else if (action == "recover")
             {
               if (workflow.IsInstalledApplication)

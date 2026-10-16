@@ -19,6 +19,7 @@ $sources += (Join-Path $root 'src\ChildAgentTaskInstaller.cs')
 $sources += (Join-Path $root 'src\SetupBoundary.cs')
 $sources += (Join-Path $root 'src\BoundedPipe.cs')
 $sources += (Join-Path $root 'src\ProductInstall.cs')
+$sources += (Join-Path $root 'src\ProductBundle.cs')
 $sources += (Join-Path $root 'src\ProductInstallProgram.cs')
 $sources += (Join-Path $root 'src\LanFirewallTransaction.cs')
 $sources += (Join-Path $root 'src\WindowsLanFirewallHost.cs')
@@ -55,7 +56,7 @@ if ($env:CI -eq 'true' -or $env:CHILDSTREAM_RUN_PRIVATE_IDENTITY -eq '1') {
 }
 & (Join-Path $artifacts 'LeastPrivilegeTests.exe') (Join-Path $artifacts 'screenshots')
 if ($LASTEXITCODE -ne 0) { throw 'Least-privilege UI/transport tests failed.' }
-& $csc /nologo /target:exe /main:UiJourneyTests "/out:$artifacts\UiJourneyTests.exe" $productReferences $sources (Join-Path $PSScriptRoot 'UiJourneyTests.cs')
+& $csc /nologo /define:TEST_ONLY /target:exe /main:UiJourneyTests "/out:$artifacts\UiJourneyTests.exe" $productReferences $sources (Join-Path $PSScriptRoot 'UiJourneyTests.cs')
 if ($LASTEXITCODE -ne 0) { throw 'Guided UI fixture compilation failed.' }
 & (Join-Path $artifacts 'UiJourneyTests.exe') (Join-Path $artifacts 'screenshots')
 if ($LASTEXITCODE -ne 0) { throw 'Rendered guided UI fixture tests failed.' }
@@ -78,6 +79,8 @@ if ($LASTEXITCODE -ne 0) { throw 'Offline installer tests failed.' }
 if ($LASTEXITCODE -ne 0) { throw 'Product integration test compilation failed.' }
 & (Join-Path $artifacts 'ProductIntegrationTests.exe')
 if ($LASTEXITCODE -ne 0) { throw 'Offline product integration tests failed.' }
+& $csc /nologo /target:exe /main:UserPackageTests "/out:$artifacts\UserPackageTests.exe" $productReferences $sources (Join-Path $PSScriptRoot 'UserPackageTests.cs')
+if ($LASTEXITCODE -ne 0) { throw 'User bundle production-admission test compilation failed.' }
 & $csc /nologo /define:TEST_ONLY /target:exe /main:LanFirewallTests "/out:$artifacts\LanFirewallTests.exe" $productReferences $sources (Join-Path $PSScriptRoot 'LanFirewallTests.cs')
 if ($LASTEXITCODE -ne 0) { throw 'LAN firewall transaction test compilation failed.' }
 & (Join-Path $artifacts 'LanFirewallTests.exe')
