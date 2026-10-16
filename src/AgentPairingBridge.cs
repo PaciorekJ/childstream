@@ -153,4 +153,11 @@ internal sealed class ChildStreamingPresenter
     }
     internal string Stop() { return journey.Stop(); }
     internal string Recover() { return journey.RecoverFailedStart(); }
+    internal string OpenGameAudioRoute()
+    {
+        var state = Observe();
+        if ((string)state["steamStage"] != "GameObserved" || (string)state["stage"] != "SunshineReady")
+            throw new InvalidOperationException("The exact child game and owned Sunshine must be running before setting its route.");
+        return controller.Execute(ChildAgentOperation.OpenGameAudioRoute, "");
+    }
 }

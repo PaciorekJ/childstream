@@ -201,6 +201,7 @@ internal static class UiJourneyTests
             new ToolStripMenuItem("Pair Moonlight…") { Enabled = false },
             new ToolStripMenuItem("Start Steam Big Picture in child") { Enabled = false },
             new ToolStripMenuItem("Request Minecraft Dungeons in child") { Enabled = false },
+            new ToolStripMenuItem("Set game audio in child Volume Mixer…") { Enabled = false },
             new ToolStripMenuItem("Stop ChildStream streaming") { Enabled = false },
             new ToolStripMenuItem("Recover failed ChildStream start") { Enabled = false }
         };
@@ -212,16 +213,21 @@ internal static class UiJourneyTests
             guideStatus = "Local ChildStream Sunshine ready. Approve a scoped LAN plan for Moonlight.";
             guide.RefreshState(); Save(guide, folder, "guide-lan-reconfigure-simulated");
             guideItems[2].Enabled = false; guideItems[3].Enabled = true;
-            guideItems[4].Enabled = true; guideItems[6].Enabled = true;
-            guideStatus = "Capture-only Sunshine verified with the selected child endpoint. Game render routing and physical isolation still need validation.";
+            guideItems[4].Enabled = true; guideItems[7].Enabled = true;
+            guideItems[6].Enabled = true;
+            guideStatus = "Exact game launched. Select Minecraft Dungeons output in child Volume Mixer; render session pending on {child-audio-2}.";
+            guide.RefreshState(); Save(guide, folder, "guide-audio-route-pending-simulated");
+            guideStatus = "WrongEndpoint: game renders to {child-audio}; Sunshine captures {child-audio-2}. Change only the game's output in child Volume Mixer.";
+            guide.RefreshState(); Save(guide, folder, "guide-audio-route-wrong-simulated");
+            guideStatus = "Exact game render session observed on {child-audio-2}; Sunshine capture ready. Endpoint privacy and Moonlight playback still need physical checks.";
             guide.RefreshState(); Save(guide, folder, "guide-audio-ready-simulated");
             guideStatus = "Moonlight reconnected to the same owned ChildStream certificate and audio endpoint.";
             guide.RefreshState(); Save(guide, folder, "guide-audio-reconnect-simulated");
-            guideItems[3].Enabled = guideItems[4].Enabled = guideItems[6].Enabled = false;
-            guideItems[7].Enabled = true;
+            guideItems[3].Enabled = guideItems[4].Enabled = guideItems[7].Enabled = false;
+            guideItems[8].Enabled = true;
             guideStatus = "Selected child audio endpoint disappeared. Recover only the exact owned stream.";
             guide.RefreshState(); Save(guide, folder, "guide-audio-lost-simulated");
-            guideItems[2].Enabled = false; guideItems[7].Enabled = true;
+            guideItems[2].Enabled = false; guideItems[8].Enabled = true;
             guideStatus = "Owned startup outcome uncertain. Exact process recovery is required.";
             guide.RefreshState(); Save(guide, folder, "guide-recovery-simulated");
             Check(Find<Button>(guide, b => b.Text == "Recover start").Enabled &&

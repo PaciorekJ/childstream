@@ -6,6 +6,7 @@ using System.Security.Principal;
 using System.Text;
 using System.Threading;
 using System.Linq;
+using System.Diagnostics;
 
 internal sealed class WindowsChildAgentOperations : IChildAgentOperations
 {
@@ -120,6 +121,15 @@ internal sealed class WindowsChildRuntimeEnvironment : IChildRuntimeEnvironment
     public ProcessTokenObservation ReadToken(int pid) { return WindowsProcessToken.Read(pid); }
     public ChildAudioEndpointInventory ReadAudio(ChildSessionIdentity child)
     { return WindowsAudioEndpoints.ReadActiveRender((int)child.SessionId); }
+    public GameAudioSessionSnapshot ReadGameAudio(ChildSessionIdentity child, ChildAudioEndpointInventory endpoints, int exactGamePid)
+    { return WindowsGameAudioSessions.Read(child, endpoints, exactGamePid); }
+    public void OpenGameAudioRouteSettings(ChildSessionIdentity child)
+    {
+        if (processes.CurrentSessionId != (int)child.SessionId ||
+            processes.ReadSessionLogonTime((int)child.SessionId) != child.LogonTime)
+            throw new InvalidOperationException("The child generation changed before opening Volume Mixer.");
+        Process.Start(new ProcessStartInfo(GameAudioRoute.MixerUri) { UseShellExecute = true });
+    }
     public SunshineCollisionSnapshot ReadCollision(SunshinePortFamily family)
     { return WindowsSunshineCollisionReader.Read(family); }
     public bool VerifyLanBoundary(string address, SunshinePortFamily family)

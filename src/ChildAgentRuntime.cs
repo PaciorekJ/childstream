@@ -15,6 +15,8 @@ internal interface IChildRuntimeEnvironment
     ProcessTokenObservation ReadToken(int pid);
     string DiscoverDisplayLog(ChildSessionIdentity child);
     ChildAudioEndpointInventory ReadAudio(ChildSessionIdentity child);
+    GameAudioSessionSnapshot ReadGameAudio(ChildSessionIdentity child, ChildAudioEndpointInventory endpoints, int exactGamePid);
+    void OpenGameAudioRouteSettings(ChildSessionIdentity child);
     SunshineCollisionSnapshot ReadCollision(SunshinePortFamily family);
     bool VerifyLanBoundary(string address, SunshinePortFamily family);
     IList<SunshineListener> ReadListeners(int pid, SunshinePortFamily family, out bool complete);
@@ -153,6 +155,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
     private bool uncertain;
     private SteamChildRuntime steam;
     private SteamInstallation steamInstallation;
+    private bool volumeMixerOpenedForGame;
     internal ChildAgentRuntime(ChildSessionIdentity child, uint parentSessionId,
         IChildRuntimeEnvironment environment, IRuntimeMonitor monitor = null)
     {
@@ -200,7 +203,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
                 RecoverSunshine(); return Status();
             case ChildAgentOperation.PairingGet:
                 if (payload.Length != 0 || pairing == null) throw new InvalidOperationException("Verified Sunshine is required for pairing refresh.");
-                owner.AssertStillOwned(); AssertAudioReady(); return pairing.Send("GET", "/api/pin", null);
+                owner.AssertStillOwned(); AssertAudioReady(); AssertGameAudioForPairing(); return pairing.Send("GET", "/api/pin", null);
             case ChildAgentOperation.PairingPost:
                 if (pairing == null || payload.Length > 4096) throw new InvalidOperationException("Verified Sunshine is required for PIN approval.");
                 var selected = new JavaScriptSerializer().DeserializeObject(payload) as IDictionary<string, object>;
@@ -209,13 +212,16 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
                     !selected.TryGetValue("pin", out pin) || !selected.TryGetValue("name", out name))
                     throw new InvalidDataException("PIN approval request is malformed.");
                 string canonical = SunshinePairingProtocol.BuildPinRequest(id as string, pin as string, name as string);
-                owner.AssertStillOwned(); AssertAudioReady(); return pairing.Send("POST", "/api/pin", canonical);
+                owner.AssertStillOwned(); AssertAudioReady(); AssertGameAudioForPairing(); return pairing.Send("POST", "/api/pin", canonical);
             case ChildAgentOperation.StartSteam:
                 if (payload.Length != 0) throw new InvalidDataException("Steam start has no caller-selected path or arguments.");
                 StartSteam(); return Status();
             case ChildAgentOperation.RequestGame:
                 if (payload.Length != 0) throw new InvalidDataException("Only the fixed Minecraft Dungeons app request is supported.");
                 RequestGame(); return Status();
+            case ChildAgentOperation.OpenGameAudioRoute:
+                if (payload.Length != 0) throw new InvalidDataException("Audio route action has no caller arguments.");
+                OpenGameAudioRoute(); return Status();
             case ChildAgentOperation.StopSteam:
                 if (payload.Length != 0) throw new InvalidDataException("Steam stop has no payload.");
                 StopSteam(); return Status();
@@ -281,14 +287,64 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
             try { owner.AssertStillOwned(); }
             catch (InvalidOperationException) { state = "SunshineBoundaryLost"; }
         if (state == "SunshineReady" && !AudioReady()) state = "SunshineAudioLost";
+        string gameAudio = GameAudioStatus();
         return new JavaScriptSerializer().Serialize(new Dictionary<string, object> {
             { "stage", state }, { "childSession", child.SessionId }, { "childLogon", child.LogonTime },
             { "host", "ChildStream" }, { "manualAddress", state == "SunshineReady" ?
                 (lanAddress ?? "127.0.0.1") + ":" + family.BasePort : "" },
             { "lanPosture", boundaryWithdrawn ? "Withdrawn" : lanAddress == null ? "LocalOnly" :
                 state == "SunshineReady" ? "ScopedRulesVerified" : "ChangedOrUnavailable" },
-            { "steamStage", steam == null ? "NotStarted" : steam.Stage.ToString() }
+            { "steamStage", steam == null ? "NotStarted" : steam.Stage.ToString() },
+            { "gameAudio", gameAudio }, { "captureEndpoint", selectedAudioId ?? "" },
+            { "routeConfiguration", gameAudio == "GameRenderObserved" ? "AdoptedObservedOutput" :
+                volumeMixerOpenedForGame ? "OwnerSelectionRequested" : "NotEstablished" },
+            { "captureReady", state == "SunshineReady" && AudioReady() },
+            { "clientPlayback", "HardwareUnverified" }
         });
+    }
+    private string GameAudioStatus()
+    {
+        if (steam == null || (steam.Stage != SteamChildStage.GameRequested &&
+            steam.Stage != SteamChildStage.GameObserved)) return "NotRequested";
+        if (steam.Stage == SteamChildStage.GameRequested) return "WaitingForGame";
+        ProductProcessIdentity game = steam.GameIdentity;
+        if (game == null || environment.Processes.ReadSessionLogonTime((int)child.SessionId) != child.LogonTime)
+            return "GameIdentityLost";
+        if (String.IsNullOrEmpty(selectedAudioId)) return "CaptureNotConfigured";
+        ChildAudioEndpointInventory endpoints;
+        try { endpoints = environment.ReadAudio(child); }
+        catch { return "ObservationIncomplete"; }
+        if (endpoints == null || !endpoints.Complete || !endpoints.ActiveRenderIds.Contains(selectedAudioId ?? ""))
+            return "CaptureEndpointLost";
+        try
+        {
+            ProductProcessIdentity before = environment.Processes.Read(game.Pid);
+            GameAudioSessionSnapshot sessions = environment.ReadGameAudio(child, endpoints, game.Pid);
+            ProductProcessIdentity after = environment.Processes.Read(game.Pid);
+            string verdict = GameAudioRoute.Assess(game, before, child, selectedAudioId, endpoints, sessions);
+            if (verdict == "GameRenderObserved" &&
+                GameAudioRoute.Assess(game, after, child, selectedAudioId, endpoints, sessions) != "GameRenderObserved")
+                return "GameIdentityLost";
+            return verdict;
+        }
+        catch { return "ObservationIncomplete"; }
+    }
+    private void OpenGameAudioRoute()
+    {
+        if (steam == null || steam.Stage != SteamChildStage.GameObserved ||
+            GameAudioStatus() == "GameIdentityLost")
+            throw new InvalidOperationException("The exact owned game must be running before Windows Volume Mixer can show its route.");
+        AssertAudioReady();
+        // The owner chooses an app-specific output in Windows Settings. This
+        // action itself never edits a device, default or per-app preference.
+        environment.OpenGameAudioRouteSettings(child);
+        volumeMixerOpenedForGame = true;
+    }
+    private void AssertGameAudioForPairing()
+    {
+        if (steam != null && steam.Stage == SteamChildStage.GameObserved &&
+            GameAudioStatus() != "GameRenderObserved")
+            throw new InvalidOperationException("Exact game rendering on the selected capture endpoint is not observed.");
     }
     private bool AudioReady()
     {
@@ -339,6 +395,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
         SteamLaunchObservation observed = environment.ReadSteamObservation(child, parentSessionId);
         if (observed == null) throw new InvalidOperationException("Steam ownership observation is unavailable.");
         environment.RecordGameRequest(child);
+        volumeMixerOpenedForGame = false;
         try
         {
             steam.RequestMinecraftDungeons(observed.Complete, observed.ParentSteam, observed.UnrelatedSteam);
@@ -371,6 +428,7 @@ internal sealed class ChildAgentRuntime : IChildAgentOperations
             steam.StopSteam(5000);
             environment.ResolveSteamStopped(child, steamProcess, gameProcess);
             steam = null; steamInstallation = null;
+            volumeMixerOpenedForGame = false;
         }
         catch { uncertain = true; environment.RecordRuntimeUncertainty(child, "SteamStopUnknown"); throw; }
     }

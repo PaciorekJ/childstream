@@ -39,17 +39,31 @@ identity in the presenter request and a healthy game survives Sunshine recovery.
 The agent observes endpoint presence again while running; loss blocks pairing
 and new game actions and exposes exact-owned stream recovery.
 
-**Game render routing is a remaining source/product gap.** Sunshine's new mode
-captures an endpoint but does not route game playback to it. For a game using
-the observed child default endpoint, Windows' normal render selection may
-produce sound there; this is not evidence that the default is session-private.
-A nondefault selected endpoint is valid for capture but requires an established
-application or external mixer route. ChildStream does not yet provision or verify
-such a route and does not silently change any Windows default or per-app audio
-preference. Same-user per-app preferences may affect another instance of the
-same executable. If a designated child-only endpoint and application route
-cannot be established without parent effects, the audio requirement remains
-unsatisfied despite the capture-only backend.
+The game route has a **supported owner-configured adoption path**, rather than
+an automatic setter. Once the exact owned Minecraft Dungeons process starts,
+the normal app opens Windows' documented `ms-settings:apps-volume` Volume Mixer
+in that child desktop. The owner may choose the game's output there. The agent
+then reconciles active Core Audio sessions on all observed render endpoints
+with the durable game PID, start time, image digest, WTS session and logon
+generation. It reports `WaitingForRender`, `GameRenderObserved`,
+`WrongEndpoint`, `AmbiguousSession`, `ObservationIncomplete`, or
+`CaptureEndpointLost` separately from Sunshine capture readiness and client
+playback. A multi-process session, stale PID or failed API never becomes a
+positive observation. The positive synthetic production-path fixture names
+**Windows Volume Mixer per-app output to `{child-audio-2}`**, a nondefault
+endpoint, with Sunshine `audio_sink` set to that same endpoint. It exercises
+the presenter, controller, agent, owned game record, configuration file,
+observation and Sunshine-only recovery with unchanged game and pairing.
+
+This does **not** establish the Windows per-app preference programmatically,
+read its persisted value, prove it is scoped to the child session, or prove
+the endpoint is private. Core Audio sessions show an active rendering
+association; they do not prove exclusive ownership or audible Moonlight
+playback. A same-user preference may influence another instance of the game.
+The app changes no default or per-app preference itself, and opening Settings
+without the owner's selection changes nothing. Until a designated endpoint,
+its parent effects and the actual child game behavior are qualified on an
+authorized machine, game audio and parent noninterference remain incomplete.
 
 ## Separate physical acceptance
 

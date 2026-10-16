@@ -133,6 +133,9 @@ static class IntegratedRuntimeTests
           Directory.CreateDirectory(Root); }
         internal string AudioDefaultId = "{child-audio}";
         internal bool AudioAvailable = true;
+        internal bool AudioSnapshotComplete = true;
+        internal bool GameAudioActive, GameAudioWrong, GameAudioMulti;
+        internal int RouteSettingsOpened;
         public IProductProcessHost Processes { get { return Process; } }
         public string SunshineExecutable { get { return Process.Path; } }
         public string DataRoot { get { return Root; } }
@@ -151,6 +154,19 @@ static class IntegratedRuntimeTests
               if (MultipleDevices) result.ActiveRenderIds.Add("{child-audio-2}");
           }
           return result; }
+        public GameAudioSessionSnapshot ReadGameAudio(ChildSessionIdentity child, ChildAudioEndpointInventory endpoints, int exactGamePid)
+        {
+            if (exactGamePid != 140) throw new Exception("Only the exact owned game PID may be observed.");
+            var result = new GameAudioSessionSnapshot { Complete = AudioSnapshotComplete };
+            if (GameAudioActive && Process.GameCurrent != null)
+                result.Sessions.Add(new GameAudioSession { ProcessId = Process.GameCurrent.Pid,
+                    EndpointId = GameAudioWrong ? "{child-audio}" : "{child-audio-2}",
+                    Active = true, MultiProcess = GameAudioMulti });
+            return result;
+        }
+        public void OpenGameAudioRouteSettings(ChildSessionIdentity child)
+        { if (child.SessionId != 2 || child.LogonTime != Process.Generation) throw new Exception("Wrong child mixer route.");
+          RouteSettingsOpened++; }
         public SunshineCollisionSnapshot ReadCollision(SunshinePortFamily family)
         { return new SunshineCollisionSnapshot { ServiceObservationComplete = true, ProcessObservationComplete = true, PortObservationComplete = true }; }
         public bool VerifyLanBoundary(string address, SunshinePortFamily family)
@@ -674,6 +690,81 @@ static class IntegratedRuntimeTests
             app.Stop();
         }
         var multiple = new Environment(root + "-multiple") { MultipleDevices = true };
+        var gameAudio = new Environment(root + "-game-audio") { MultipleDevices = true };
+        using (var worker = new ChildAgentRuntime(child, 1, gameAudio))
+        {
+            var app = new ChildAgentController(new Bootstrap(worker, child, agentPath), 1,
+                child, agentPath, Digest);
+            app.Start(request);
+            var presenter = new ChildStreamingPresenter(app, child);
+            var choices = presenter.Prepare(null);
+            string display = choices.Catalog.Displays[0].Id;
+            string sink = "{child-audio-2}"; // Existing Windows Volume Mixer per-app output in this fixture.
+            presenter.Commit(choices, display, sink, false);
+            Check(File.ReadAllText(gameAudio.LastConfig).Contains("audio_sink = " + sink) &&
+                File.ReadAllText(gameAudio.LastConfig).Contains("external_audio = enabled"),
+                "positive route uses the nondefault Windows per-app output and same capture-only Sunshine sink");
+            app.Execute(ChildAgentOperation.StartSteam, "");
+            Check(Convert.ToString(presenter.Observe()["gameAudio"]) == "NotRequested",
+                "endpoint presence alone is not game audio");
+            app.Execute(ChildAgentOperation.RequestGame, "");
+            Check(Convert.ToString(presenter.Observe()["gameAudio"]) == "WaitingForRender",
+                "game may initialize its audio session after process observation without a circular launch gate");
+            Check(Convert.ToString(presenter.Observe()["routeConfiguration"]) == "NotEstablished",
+                "selected endpoint is not silently treated as a configured game route");
+            int ownedPid = gameAudio.Process.GameCurrent.Pid;
+            presenter.OpenGameAudioRoute();
+            Check(gameAudio.RouteSettingsOpened == 1 && gameAudio.Process.Current != null &&
+                gameAudio.Process.GameCurrent.Pid == ownedPid && gameAudio.Pairing.Bootstraps == 1,
+                "normal presenter opens the supported child Volume Mixer route without changing the stream, game or pairing");
+            Check(Convert.ToString(presenter.Observe()["routeConfiguration"]) == "OwnerSelectionRequested",
+                "opening Settings does not falsely claim the owner completed a route change");
+            gameAudio.GameAudioActive = true;
+            Check(Convert.ToString(presenter.Observe()["gameAudio"]) == "GameRenderObserved" &&
+                Convert.ToString(presenter.Observe()["routeConfiguration"]) == "AdoptedObservedOutput" &&
+                Convert.ToString(presenter.Observe()["captureEndpoint"]) == sink &&
+                Convert.ToBoolean(presenter.Observe()["captureReady"]),
+                "exact owned game render session on selected nondefault sink reaches capture-ready status");
+            gameAudio.GameAudioWrong = true;
+            Check(Convert.ToString(presenter.Observe()["gameAudio"]) == "WrongEndpoint",
+                "real output on the wrong endpoint never verifies the route");
+            Reject(() => app.Execute(ChildAgentOperation.PairingGet, ""),
+                "new pairing is blocked when the exact game renders on a different endpoint");
+            gameAudio.GameAudioWrong = false; gameAudio.GameAudioMulti = true;
+            Check(Convert.ToString(presenter.Observe()["gameAudio"]) == "AmbiguousSession",
+                "multi-process audio session cannot establish exact game ownership");
+            gameAudio.GameAudioMulti = false; gameAudio.AudioSnapshotComplete = false;
+            Check(Convert.ToString(presenter.Observe()["gameAudio"]) == "ObservationIncomplete",
+                "failed native observation stays incomplete");
+            gameAudio.AudioSnapshotComplete = true; gameAudio.AudioAvailable = false;
+            Check(Convert.ToString(presenter.Observe()["gameAudio"]) == "CaptureEndpointLost",
+                "selected endpoint removal invalidates render and capture readiness");
+            gameAudio.AudioAvailable = true;
+            Check(Convert.ToString(presenter.Observe()["gameAudio"]) == "GameRenderObserved",
+                "reappearing exact endpoint requires and obtains a new render observation");
+            ProductProcessIdentity originalGame = gameAudio.Process.GameCurrent;
+            gameAudio.Process.GameCurrent = new ProductProcessIdentity { Pid = originalGame.Pid,
+                SessionId = 3, StartTimeUtcTicks = originalGame.StartTimeUtcTicks,
+                ExecutablePath = originalGame.ExecutablePath,
+                ExecutableSha256 = originalGame.ExecutableSha256 };
+            Check(Convert.ToString(presenter.Observe()["gameAudio"]) == "GameIdentityLost",
+                "same image and PID in a different session cannot impersonate the owned game's audio");
+            gameAudio.Process.GameCurrent = originalGame;
+            gameAudio.Process.Current = null; // Exact owned Sunshine exited; game stays healthy.
+            Check(presenter.Observe()["stage"].Equals("SunshineLost"),
+                "Sunshine loss is separate from the healthy game audio route");
+            presenter.Recover();
+            Check(gameAudio.Process.GameCurrent == originalGame && gameAudio.Process.GameStops == 0,
+                "Sunshine-only recovery preserves exact game process");
+            choices = presenter.Prepare(null);
+            presenter.Commit(choices, display, sink, false);
+            Check(Convert.ToString(presenter.Observe()["gameAudio"]) == "GameRenderObserved" &&
+                gameAudio.Pairing.Bootstraps == 1 && gameAudio.Process.GameCurrent == originalGame,
+                "reconnect rechecks same game-to-sink association with retained pairing identity");
+            app.Execute(ChildAgentOperation.StopSteam, ""); presenter.Stop(); app.Stop();
+            Check(gameAudio.Process.UnrelatedTouched == 0,
+                "game audio path never closes an unrelated process");
+        }
         var productionPath = new Environment(root + "-ui-path") { MultipleDevices = true };
         using (var worker = new ChildAgentRuntime(child, 1, productionPath, new ManualMonitor()))
         {
@@ -874,7 +965,7 @@ static class IntegratedRuntimeTests
         string temporary = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar) +
             Path.DirectorySeparatorChar + "ChildStreamIntegrated-";
         foreach (string fixture in new [] { root, root + "-cold", root + "-replaced", root + "-exited",
-            root + "-never", root + "-warm-delayed", root + "-warm-never", root + "-resumed", root + "-lan", root + "-reused-lan", root + "-transition", root + "-ui-path", root + "-failed-switch", root + "-lost-local", root + "-multiple", root + "-delayed", root + "-vanished", root + "-reused", root + "-interrupted" })
+            root + "-never", root + "-warm-delayed", root + "-warm-never", root + "-resumed", root + "-lan", root + "-reused-lan", root + "-transition", root + "-ui-path", root + "-game-audio", root + "-failed-switch", root + "-lost-local", root + "-multiple", root + "-delayed", root + "-vanished", root + "-reused", root + "-interrupted" })
         { if (!Path.GetFullPath(fixture).StartsWith(temporary, StringComparison.OrdinalIgnoreCase))
               throw new InvalidOperationException("Fixture cleanup escaped ChildStream temp root.");
           if (Directory.Exists(fixture)) Directory.Delete(fixture, true); }
