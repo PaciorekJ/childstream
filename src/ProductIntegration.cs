@@ -8,6 +8,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.ServiceProcess;
 using System.Runtime.InteropServices;
+using System.Net;
 #pragma warning disable 0649 // Runtime observation records are populated by child-side adapters and tests.
 
 internal enum CaptureBackend { DesktopDuplication, WindowsGraphicsCapture }
@@ -22,6 +23,67 @@ internal sealed class ChildProductOptions
     internal CaptureBackend Capture;
     internal int Port = 47989;
     internal string BindAddress = "127.0.0.1";
+    internal SunshineLanCandidate LanCandidate;
+}
+
+// This object only permits deterministic configuration generation. It is not
+// evidence of firewall approval, Moonlight custom-port support, concurrent
+// capture, or an authorized Sunshine launch.
+internal sealed class SunshineLanCandidate
+{
+    internal ChildSessionIdentity Child;
+    internal string BindAddress;
+    internal int Port;
+
+    internal SunshinePortFamily Validate()
+    {
+        IPAddress address;
+        if (Child.SessionId == 0 || Child.SessionId == uint.MaxValue || Child.LogonTime <= 0 ||
+            !IPAddress.TryParse(BindAddress, out address) ||
+            address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork ||
+            IPAddress.IsLoopback(address) || address.Equals(IPAddress.Any) ||
+            !IsPrivateIpv4(address.GetAddressBytes()))
+            throw new InvalidDataException("A concrete RFC1918 IPv4 LAN endpoint is required.");
+        if (Port == 47989)
+            throw new InvalidDataException("The native Sunshine default port family must remain separate.");
+        var family = new SunshinePortFamily(Port);
+        if (family.Overlaps(new SunshinePortFamily(47989)))
+            throw new InvalidDataException("The ChildStream port family overlaps native Sunshine defaults.");
+        return family;
+    }
+
+    private static bool IsPrivateIpv4(byte[] bytes)
+    {
+        return bytes.Length == 4 && (bytes[0] == 10 ||
+            (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31) ||
+            (bytes[0] == 192 && bytes[1] == 168));
+    }
+}
+
+internal sealed class SunshinePortFamily
+{
+    internal readonly int BasePort;
+    internal readonly int[] Tcp;
+    internal readonly int[] Udp;
+    internal SunshinePortFamily(int basePort)
+    {
+        if (basePort < 1029 || basePort > 65514)
+            throw new InvalidDataException("Sunshine base port is outside its documented range.");
+        BasePort = basePort;
+        Tcp = new [] { basePort - 5, basePort, basePort + 1, basePort + 21 };
+        Udp = new [] { basePort + 9, basePort + 10, basePort + 11, basePort + 13 };
+    }
+    internal bool Contains(string protocol, int port)
+    {
+        int[] ports = protocol == "TCP" ? Tcp : protocol == "UDP" ? Udp : null;
+        return ports != null && Array.IndexOf(ports, port) >= 0;
+    }
+    internal bool Overlaps(SunshinePortFamily other)
+    {
+        foreach (int port in Tcp) if (Array.IndexOf(other.Tcp, port) >= 0) return true;
+        foreach (int port in Udp) if (Array.IndexOf(other.Udp, port) >= 0) return true;
+        return false;
+    }
 }
 
 internal static class ChildProductConfiguration
@@ -64,10 +126,19 @@ internal static class ChildProductConfiguration
             option.AudioInventory.SessionId != option.Child.SessionId ||
             !option.AudioInventory.ActiveRenderIds.Contains(option.AudioEndpointId))
             throw new InvalidDataException("The selected audio endpoint is not independently observed in the child session.");
-        if (option.BindAddress != "127.0.0.1")
-            throw new InvalidDataException("Non-loopback streaming requires a separately validated LAN security posture.");
-        if (option.Port != 47989)
-            throw new InvalidDataException("Custom Sunshine port offsets and Moonlight compatibility are not validated.");
+        if (option.LanCandidate == null)
+        {
+            if (option.BindAddress != "127.0.0.1" || option.Port != 47989)
+                throw new InvalidDataException("Non-loopback streaming requires a separate LAN candidate.");
+        }
+        else
+        {
+            option.LanCandidate.Validate();
+            if (!option.LanCandidate.Child.Equals(option.Child) ||
+                !String.Equals(option.LanCandidate.BindAddress, option.BindAddress, StringComparison.Ordinal) ||
+                option.LanCandidate.Port != option.Port)
+                throw new InvalidDataException("LAN candidate does not match the exact child and endpoint.");
+        }
         string root = Path.GetFullPath(option.OwnedRoot).TrimEnd(Path.DirectorySeparatorChar);
         var config = new StringBuilder();
         Action<string, string> line = (key, value) => config.Append(key).Append(" = ").Append(value).Append('\n');
@@ -92,8 +163,9 @@ internal static class ChildProductConfiguration
         line("encoder", "nvenc");
         line("audio_sink", option.AudioEndpointId);
         line("stream_audio", "enabled");
-        line("controller", option.ViGEmBusPresent ? "enabled" : "disabled");
-        line("gamepad_driver", "vigembus");
+        // A global virtual gamepad driver does not establish child-only input.
+        // Keep controller injection off until an independently observed route exists.
+        line("controller", "disabled");
         line("gamepad", "x360");
         return config.ToString();
     }
@@ -320,17 +392,45 @@ internal static class SunshineStartupGate
             if (state.UdpListeners.Contains(port)) return "UDP port " + port + " is already occupied.";
         return null;
     }
+
+    // A collision-free family is only a source-level prerequisite. It does
+    // not establish Moonlight compatibility or simultaneous GPU capture.
+    internal static string CheckCandidate(SunshineCollisionSnapshot state, SunshineLanCandidate candidate)
+    {
+        if (state == null || !state.ServiceObservationComplete || !state.ProcessObservationComplete ||
+            !state.PortObservationComplete || candidate == null)
+            return "Sunshine coexistence inventory is incomplete.";
+        SunshinePortFamily family;
+        try { family = candidate.Validate(); }
+        catch (Exception ex) { return ex.Message; }
+        foreach (int port in family.Tcp)
+            if (state.TcpListeners.Contains(port)) return "Candidate TCP port " + port + " is occupied.";
+        foreach (int port in family.Udp)
+            if (state.UdpListeners.Contains(port)) return "Candidate UDP port " + port + " is occupied.";
+        return null;
+    }
 }
 
 internal static class WindowsSunshineCollisionReader
 {
-    private const string PortFilter = "LocalPort=47984 OR LocalPort=47989 OR LocalPort=47990 OR " +
-        "LocalPort=48010 OR LocalPort=47998 OR LocalPort=47999 OR LocalPort=48000 OR LocalPort=48002";
     // Read only. Each source has an independent completeness bit; an inaccessible
     // WMI provider cannot masquerade as an empty listener table.
     internal static SunshineCollisionSnapshot Read()
+    { return Read(new SunshinePortFamily(47989)); }
+
+    private static string Filter(SunshinePortFamily family)
+    {
+        var ports = new HashSet<int>(family.Tcp);
+        foreach (int port in family.Udp) ports.Add(port);
+        var terms = new List<string>();
+        foreach (int port in ports) terms.Add("LocalPort=" + port.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        return String.Join(" OR ", terms.ToArray());
+    }
+
+    internal static SunshineCollisionSnapshot Read(SunshinePortFamily family)
     {
         var result = new SunshineCollisionSnapshot();
+        if (family == null) return result;
         try
         {
             using (var service = new ServiceController("SunshineService"))
@@ -361,7 +461,7 @@ internal static class WindowsSunshineCollisionReader
             {
                 using (var searcher = new ManagementObjectSearcher(scope,
                     new ObjectQuery("SELECT LocalPort" + (query.Tcp ? ", State" : "") +
-                        " FROM " + query.Class + " WHERE " + PortFilter)))
+                        " FROM " + query.Class + " WHERE " + Filter(family))))
                 using (ManagementObjectCollection rows = searcher.Get())
                     foreach (ManagementBaseObject row in rows)
                     {
@@ -378,9 +478,12 @@ internal static class WindowsSunshineCollisionReader
     }
 
     internal static IList<SunshineListener> ReadListeners(int ownedPid, out bool complete)
+    { return ReadListeners(ownedPid, new SunshinePortFamily(47989), out complete); }
+
+    internal static IList<SunshineListener> ReadListeners(int ownedPid, SunshinePortFamily family, out bool complete)
     {
         var listeners = new List<SunshineListener>();
-        if (ownedPid <= 0) { complete = false; return listeners; }
+        if (ownedPid <= 0 || family == null) { complete = false; return listeners; }
         try
         {
             var scope = new ManagementScope(@"\\.\root\StandardCimv2");
@@ -390,7 +493,7 @@ internal static class WindowsSunshineCollisionReader
                 using (var searcher = new ManagementObjectSearcher(scope,
                     new ObjectQuery("SELECT LocalAddress, LocalPort, OwningProcess" +
                         (query.Tcp ? ", State" : "") + " FROM " + query.Class +
-                        " WHERE OwningProcess=" + ownedPid + " OR " + PortFilter)))
+                        " WHERE OwningProcess=" + ownedPid + " OR " + Filter(family))))
                 using (ManagementObjectCollection rows = searcher.Get())
                     foreach (ManagementBaseObject row in rows)
                     {
@@ -437,6 +540,31 @@ internal static class SunshineRuntimeGate
             ownedCount++;
         }
         return ownedCount == 0 ? "Sunshine has not opened a verifiable listener." : null;
+    }
+
+    internal static string CheckCandidate(bool observationComplete, int ownedPid,
+        string bindAddress, SunshinePortFamily family, IEnumerable<SunshineListener> listeners)
+    {
+        if (!observationComplete || listeners == null || ownedPid <= 0 || family == null ||
+            String.IsNullOrEmpty(bindAddress))
+            return "Candidate Sunshine listener ownership could not be verified.";
+        var observed = new HashSet<string>(StringComparer.Ordinal);
+        foreach (SunshineListener endpoint in listeners)
+        {
+            bool inFamily = family.Contains(endpoint.Protocol, endpoint.Port);
+            if (endpoint.Pid == ownedPid)
+            {
+                if (!inFamily) return "Owned Sunshine opened a listener outside its approved port family.";
+                if (!String.Equals(endpoint.LocalAddress, bindAddress, StringComparison.Ordinal))
+                    return "Owned Sunshine listener bound outside the selected LAN address.";
+                if (!observed.Add(endpoint.Protocol + ":" + endpoint.Port))
+                    return "Duplicate owned Sunshine listener observation.";
+            }
+            else if (inFamily) return "Candidate Sunshine-family listener belongs to another process.";
+        }
+        // At least one owned listener is required for readiness. The full
+        // protocol family is checked during the live pairing/stream test.
+        return observed.Count == 0 ? "Candidate Sunshine opened no verifiable listener." : null;
     }
 }
 

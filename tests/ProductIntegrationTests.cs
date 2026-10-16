@@ -74,16 +74,32 @@ internal static class ProductIntegrationTests
             config.Contains("origin_web_ui_allowed = pc"), "loopback-only posture");
         Check(config.Contains("capture = wgc") && config.Contains("encoder = nvenc") &&
             config.Contains("dd_configuration_option = verify_only"), "explicit capture without display mutation");
-        Check(config.Contains("controller = disabled") && config.Contains("gamepad_driver = vigembus") &&
+        Check(config.Contains("controller = disabled") && !config.Contains("gamepad_driver =") &&
             config.Contains("install_steam_audio_drivers = disabled"), "free input driver and no automatic driver install");
         Check(config.Contains("credentials_file = " + Path.Combine(installed, "sessions", "2-123", "sunshine_state.json")),
             "credentials scoped to child config");
         option.ViGEmBusPresent = true;
-        Check(ChildProductConfiguration.BuildSunshine(option).Contains("controller = enabled"), "controller only with observed driver");
+        Check(ChildProductConfiguration.BuildSunshine(option).Contains("controller = disabled"),
+            "global ViGEmBus presence cannot enable child controller injection");
         option.BindAddress = "192.0.2.1";
         Reject(() => ChildProductConfiguration.BuildSunshine(option), "LAN requires independent posture");
         option.BindAddress = "127.0.0.1"; option.Port = 48000;
         Reject(() => ChildProductConfiguration.BuildSunshine(option), "unverified port offset blocked");
+        option.BindAddress = "192.168.50.10"; option.Port = 48089;
+        option.LanCandidate = new SunshineLanCandidate { Child = option.Child,
+            BindAddress = option.BindAddress, Port = option.Port };
+        string lan = ChildProductConfiguration.BuildSunshine(option);
+        Check(lan.Contains("bind_address = 192.168.50.10") && lan.Contains("port = 48089") &&
+            lan.Contains("origin_web_ui_allowed = pc") && lan.Contains("upnp = disabled") &&
+            lan.Contains("controller = disabled"), "scoped LAN candidate configuration, no input injection");
+        option.LanCandidate.Child = new ChildSessionIdentity(3, 123);
+        Reject(() => ChildProductConfiguration.BuildSunshine(option), "another child cannot reuse LAN candidate");
+        option.LanCandidate.Child = option.Child; option.LanCandidate.Port = 47990; option.Port = 47990;
+        Reject(() => ChildProductConfiguration.BuildSunshine(option), "overlapping native port family rejected");
+        option.LanCandidate.Port = 48089; option.Port = 48089;
+        option.LanCandidate.BindAddress = "0.0.0.0"; option.BindAddress = "0.0.0.0";
+        Reject(() => ChildProductConfiguration.BuildSunshine(option), "wildcard LAN bind rejected");
+        option.LanCandidate = null; option.BindAddress = "127.0.0.1"; option.Port = 47989;
         option.Port = 47989; option.AudioEndpointId = "bad\ninjection = enabled";
         Reject(() => ChildProductConfiguration.BuildSunshine(option), "config injection blocked");
         option.AudioEndpointId = "{audio-endpoint}"; audio.Complete = false;
@@ -252,6 +268,22 @@ internal static class ProductIntegrationTests
         Check(SunshineStartupGate.Check(state) != null, "existing Sunshine process preserved");
         state.ExistingSunshineProcess = false; state.PortObservationComplete = false;
         Check(SunshineStartupGate.Check(state) != null, "incomplete listener inventory fails closed");
+        state.PortObservationComplete = true; state.ExistingSunshineService = true;
+        var candidate = new SunshineLanCandidate { Child = new ChildSessionIdentity(2, 123),
+            BindAddress = "192.168.50.10", Port = 48089 };
+        SunshinePortFamily family = candidate.Validate();
+        Check(family.Tcp[0] == 48084 && family.Tcp[3] == 48110 &&
+            family.Udp[0] == 48098 && family.Udp[3] == 48102,
+            "published Sunshine port offsets applied to candidate");
+        Check(SunshineStartupGate.CheckCandidate(state, candidate) == null,
+            "native service does not occupy a distinct candidate port family");
+        state.UdpListeners.Add(48099);
+        Check(SunshineStartupGate.CheckCandidate(state, candidate) != null,
+            "occupied candidate UDP port rejected with native service preserved");
+        state.UdpListeners.Clear(); state.PortObservationComplete = false;
+        Check(SunshineStartupGate.CheckCandidate(state, candidate) != null,
+            "unknown candidate listener inventory fails closed");
+        state.PortObservationComplete = true;
         var endpoints = new [] { new SunshineListener { Pid = 77, Protocol = "TCP",
             Port = 47990, LocalAddress = "127.0.0.1" } };
         Check(SunshineRuntimeGate.Check(true, 77, endpoints) == null, "owned loopback listener accepted");
@@ -262,6 +294,15 @@ internal static class ProductIntegrationTests
         endpoints[0].Pid = 77; endpoints[0].Port = 50000;
         Check(SunshineRuntimeGate.Check(true, 77, endpoints) != null, "unexpected Sunshine port blocked");
         Check(SunshineRuntimeGate.Check(false, 77, endpoints) != null, "incomplete runtime listener snapshot blocked");
+        endpoints[0].Port = 48089; endpoints[0].LocalAddress = "192.168.50.10";
+        Check(SunshineRuntimeGate.CheckCandidate(true, 77, candidate.BindAddress, family, endpoints) == null,
+            "exact owned candidate listener accepted");
+        endpoints[0].LocalAddress = "0.0.0.0";
+        Check(SunshineRuntimeGate.CheckCandidate(true, 77, candidate.BindAddress, family, endpoints) != null,
+            "wildcard candidate bind rejected");
+        endpoints[0].LocalAddress = candidate.BindAddress; endpoints[0].Pid = 88;
+        Check(SunshineRuntimeGate.CheckCandidate(true, 77, candidate.BindAddress, family, endpoints) != null,
+            "another process cannot own candidate family");
         Check(SteamChildPolicy.Check(true, true, false, false) != null, "parent Steam conflict");
         Check(SteamChildPolicy.Check(false, false, false, false) != null, "Steam unknown fails closed");
         Check(SteamChildPolicy.Check(true, false, false, false) == null, "known empty Steam state");
