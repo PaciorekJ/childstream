@@ -65,7 +65,9 @@ internal static class UiJourneyTests
     {
         foreach (Control control in form.Controls)
             if (control.Visible && control is Button)
-                Check(form.ClientRectangle.Contains(control.Bounds), label + ": " + control.Text);
+                Check(form.ClientRectangle.Contains(control.Bounds) ||
+                    (form.AutoScroll && form.DisplayRectangle.Contains(control.Bounds)),
+                    label + ": " + control.Text);
     }
     private static void ScaleFixtureFonts(Control root, float factor)
     {
@@ -109,8 +111,21 @@ internal static class UiJourneyTests
             float factor = percent / 100f;
             scaled.Scale(new SizeF(factor, factor));
             ScaleFixtureFonts(scaled, factor);
+            scaled.Size = new Size(Math.Min(scaled.Width, 1000), Math.Min(scaled.Height, 700));
             Save(scaled, folder, "install-" + percent + "-simulated");
             CheckVisibleControlsInside(scaled, "scaled install action remains on screen");
+            scaled.AutoScrollPosition = new Point(0, scaled.VerticalScroll.Maximum);
+            Application.DoEvents();
+            var uninstall = Find<Button>(scaled, b => b.Text == "Uninstall files");
+            Check(uninstall != null && scaled.ClientRectangle.IntersectsWith(uninstall.Bounds),
+                "scrolled high-DPI recovery action is reachable");
+            Save(scaled, folder, "install-" + percent + "-recovery-simulated");
+            scaled.AutoScrollPosition = new Point(scaled.HorizontalScroll.Maximum,
+                scaled.VerticalScroll.Maximum);
+            Application.DoEvents();
+            var close = Find<Button>(scaled, b => b.Text == "Close");
+            Check(close != null && scaled.ClientRectangle.IntersectsWith(close.Bounds),
+                "scrolled high-DPI rightmost action is reachable");
         }
         using (var setup = new SetupDialog(new Setup(), true))
         {

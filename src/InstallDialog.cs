@@ -120,6 +120,7 @@ internal sealed class ProductInstallDialog : Form
         this.workflow = workflow;
         Text = simulated ? "ChildStream software install — simulated" : "ChildStream software installation";
         Width = 760; Height = 555; MinimumSize = new Size(700, 520);
+        AutoScroll = true; // At high DPI or a smaller display, approval and recovery controls remain reachable.
         StartPosition = FormStartPosition.CenterParent;
         var title = new Label { Left = 20, Top = 16, Width = 700, Height = 28,
             Font = new Font(SystemFonts.MessageBoxFont, FontStyle.Bold),
