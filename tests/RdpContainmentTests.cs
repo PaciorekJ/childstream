@@ -126,7 +126,9 @@ internal static class RdpContainmentTests
             Check(host.Adds == 0, "drift causes zero rule or feature writes");
             host.State.PolicyDenied = true;
             txn.Apply(hash);
-            Check(host.Adds == 2 && txn.Verify(), "approved exact rules written and read back");
+            Check(host.Adds == 2 && txn.Verify() &&
+                txn.BaselineSummary().Contains("original TermService=Running; original RDP port=3391"),
+                "approved exact rules written and actionable private baseline retained");
             txn.Apply(hash); Check(host.Adds == 2, "duplicate apply is an exact verified no-op");
             host.State.FeatureEnabled = true;
             Reject(() => txn.Recover(hash), "feature enabled retains protection");

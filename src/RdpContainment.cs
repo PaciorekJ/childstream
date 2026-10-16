@@ -60,13 +60,15 @@ internal interface IRdpContainmentHost
 internal sealed class RdpContainmentPlan
 {
     internal string Hash, BaselineHash, AccountHash;
+    internal string OriginalTermServiceState;
+    internal int OriginalRdpPort;
 }
 
 internal sealed class RdpContainmentTransaction
 {
     internal const string RemoteNonLoopback =
         "0.0.0.0-126.255.255.255,128.0.0.0-255.255.255.255,::,::2-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff";
-    private const string Marker = "ChildStream.RdpContainment.v1";
+    private const string Marker = "ChildStream.RdpContainment.v2";
     private readonly IRdpContainmentHost host;
     private readonly string journal, accountHash;
     internal RdpContainmentTransaction(IRdpContainmentHost host, string protectedRoot, string accountHash)
@@ -129,8 +131,9 @@ internal sealed class RdpContainmentTransaction
         catch { return false; }
         return OwnedExactly(state.PersistentRules, false) && OwnedExactly(state.ActiveRules, true);
     }
-    private static string PlanHash(string baselineHash, string account)
+    private static string PlanHash(string baselineHash, string account, string termService, int rdpPort)
     { return Digest(Marker + "\n" + account + "\n" + baselineHash + "\n" +
+        termService + "\n" + rdpPort + "\n" +
         String.Join("\n", Rules().Select(r => r.Configuration())) + "\n"); }
     internal RdpContainmentPlan Plan()
     {
@@ -139,20 +142,33 @@ internal sealed class RdpContainmentTransaction
             throw new InvalidOperationException("An owned containment rule or journal already exists; inspect or recover it.");
         string baseline = Digest(state.Baseline());
         return new RdpContainmentPlan { AccountHash = accountHash, BaselineHash = baseline,
-            Hash = PlanHash(baseline, accountHash) };
+            Hash = PlanHash(baseline, accountHash, state.TermServiceState, state.ConfiguredRdpPort),
+            OriginalTermServiceState = state.TermServiceState,
+            OriginalRdpPort = state.ConfiguredRdpPort };
     }
     private RdpContainmentPlan ReadJournal()
     {
         InstallerPolicy.ValidateCanonicalFilePath(journal);
         string[] lines = File.ReadAllLines(journal);
-        if (lines.Length != 4 || lines[0] != Marker ||
+        int port = 0;
+        if (lines.Length != 6 || lines[0] != Marker ||
             !ProductInstallPayload.IsHex256(lines[1]) || !ProductInstallPayload.IsHex256(lines[2]) ||
             !ProductInstallPayload.IsHex256(lines[3]) || lines[1] != accountHash ||
-            lines[3] != PlanHash(lines[2], lines[1]))
+            (lines[4] != "Running" && lines[4] != "Stopped") ||
+            !Int32.TryParse(lines[5], out port) || port < 1 || port > 65535 ||
+            lines[3] != PlanHash(lines[2], lines[1], lines[4], port))
             throw new InvalidDataException("RDP containment journal is not exact or belongs to another account.");
-        return new RdpContainmentPlan { AccountHash = lines[1], BaselineHash = lines[2], Hash = lines[3] };
+        return new RdpContainmentPlan { AccountHash = lines[1], BaselineHash = lines[2], Hash = lines[3],
+            OriginalTermServiceState = lines[4], OriginalRdpPort = port };
     }
     internal string JournalHash() { return ReadJournal().Hash; }
+    internal string BaselineSummary()
+    {
+        RdpContainmentPlan saved = ReadJournal();
+        return "original TermService=" + saved.OriginalTermServiceState +
+            "; original RDP port=" + saved.OriginalRdpPort +
+            "; feature=disabled; ordinary RDP=denied; listeners=absent";
+    }
     internal bool Verify()
     {
         if (!File.Exists(journal)) return false;
@@ -175,7 +191,8 @@ internal sealed class RdpContainmentTransaction
             throw new InvalidOperationException("Containment source or approved plan changed.");
         // Record intent durably before the first non-atomic firewall API call.
         byte[] bytes = Encoding.UTF8.GetBytes(Marker + "\n" + accountHash + "\n" +
-            plan.BaselineHash + "\n" + plan.Hash + "\n");
+            plan.BaselineHash + "\n" + plan.Hash + "\n" +
+            plan.OriginalTermServiceState + "\n" + plan.OriginalRdpPort + "\n");
         using (var file = new FileStream(journal, FileMode.CreateNew, FileAccess.Write, FileShare.None))
         { file.Write(bytes, 0, bytes.Length); file.Flush(true); }
         foreach (RdpContainmentRule rule in Rules()) host.Add(rule);

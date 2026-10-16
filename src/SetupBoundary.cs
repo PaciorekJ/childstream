@@ -166,6 +166,7 @@ internal sealed class SetupTransaction
                 return "RDP plan " + containment.Plan().Hash;
             if (request.Operation == SetupOperation.ReadRdpContainment)
                 return "RDP journal " + containment.JournalHash() + "; configured=" + containment.Verify() +
+                    "; " + containment.BaselineSummary() +
                     "; live child-loopback qualification=unrun";
             if (!explicitlyApproved) throw new InvalidOperationException("Exact RDP containment operation was not approved.");
             if (request.Operation == SetupOperation.ApplyRdpContainment)
