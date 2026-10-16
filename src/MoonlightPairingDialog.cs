@@ -21,18 +21,29 @@ internal sealed class MoonlightPairingDialog : Form
     }
 
     internal MoonlightPairingDialog(MoonlightPairingCoordinator verifiedCoordinator)
+        : this(verifiedCoordinator, null, null) { }
+
+    internal MoonlightPairingDialog(MoonlightPairingCoordinator verifiedCoordinator,
+        string verifiedHostName, string verifiedManualAddress)
     {
         coordinator = verifiedCoordinator;
+        if (coordinator != null)
+        {
+            if (verifiedHostName == null) verifiedHostName = coordinator.HostName;
+            if (verifiedManualAddress == null) verifiedManualAddress = coordinator.ManualAddress;
+        }
         Text = "Pair Moonlight with ChildStream";
         Width = 650; Height = 410; MinimumSize = new Size(580, 370);
         StartPosition = FormStartPosition.CenterParent;
         var instructions = new Label { Left = 16, Top = 14, Width = 600, Height = 66,
             Text = coordinator == null
                 ? "ChildStream has no verified child-session Sunshine runtime. Pairing is unavailable. The existing native Sunshine instance will not be used."
-                : "Open Moonlight on your phone or Fire TV. Select the verified ChildStream host, or add it manually at " + coordinator.ManualAddress +
-                  ". When Moonlight displays a PIN, select its matching request below and enter that PIN here." };
+                : (verifiedManualAddress != null && verifiedManualAddress.StartsWith("127.0.0.1", StringComparison.Ordinal)
+                    ? "ChildStream is local-only. Phone and Fire TV access require separately verified LAN streaming."
+                    : "Open Moonlight on your phone or Fire TV. Select the verified ChildStream host, or add it manually at " + verifiedManualAddress +
+                      ". When Moonlight displays a PIN, select its matching request below and enter that PIN here.") };
         status = new Label { Left = 16, Top = 82, Width = 600, Height = 36,
-            Text = coordinator == null ? "Waiting for Stage A/B and child runtime acceptance." : "Verified host: " + coordinator.HostName };
+            Text = coordinator == null ? "Waiting for a verified child runtime." : "Verified host: " + verifiedHostName };
         requests = new ListBox { Left = 16, Top = 122, Width = 600, Height = 150, Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right };
         refresh = new Button { Left = 16, Top = 282, Width = 150, Text = "Refresh requests", Enabled = coordinator != null };
         pin = new TextBox { Left = 184, Top = 284, Width = 100, MaxLength = 4, UseSystemPasswordChar = true, Enabled = coordinator != null };

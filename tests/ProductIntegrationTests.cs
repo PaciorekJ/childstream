@@ -76,15 +76,17 @@ internal static class ProductIntegrationTests
             config.Contains("dd_configuration_option = verify_only"), "explicit capture without display mutation");
         Check(config.Contains("controller = disabled") && !config.Contains("gamepad_driver =") &&
             config.Contains("install_steam_audio_drivers = disabled"), "free input driver and no automatic driver install");
-        Check(config.Contains("credentials_file = " + Path.Combine(installed, "sessions", "2-123", "sunshine_state.json")),
-            "credentials scoped to child config");
+        Check(config.Contains("credentials_file = " + Path.Combine(installed, "identity", "credentials.json")) &&
+            config.Contains("file_state = " + Path.Combine(installed, "identity", "sunshine_state.json")) &&
+            config.Contains("pkey = " + Path.Combine(installed, "identity", "sunshine.key")),
+            "stable ChildStream-owned identity across child generations");
         option.ViGEmBusPresent = true;
         Check(ChildProductConfiguration.BuildSunshine(option).Contains("controller = disabled"),
             "global ViGEmBus presence cannot enable child controller injection");
         option.BindAddress = "192.0.2.1";
         Reject(() => ChildProductConfiguration.BuildSunshine(option), "LAN requires independent posture");
-        option.BindAddress = "127.0.0.1"; option.Port = 48000;
-        Reject(() => ChildProductConfiguration.BuildSunshine(option), "unverified port offset blocked");
+        option.BindAddress = "127.0.0.1"; option.Port = 47990;
+        Reject(() => ChildProductConfiguration.BuildSunshine(option), "native-overlapping loopback port offset blocked");
         option.BindAddress = "192.168.50.10"; option.Port = 48089;
         option.LanCandidate = new SunshineLanCandidate { Child = option.Child,
             BindAddress = option.BindAddress, Port = option.Port };
@@ -99,8 +101,8 @@ internal static class ProductIntegrationTests
         option.LanCandidate.Port = 48089; option.Port = 48089;
         option.LanCandidate.BindAddress = "0.0.0.0"; option.BindAddress = "0.0.0.0";
         Reject(() => ChildProductConfiguration.BuildSunshine(option), "wildcard LAN bind rejected");
-        option.LanCandidate = null; option.BindAddress = "127.0.0.1"; option.Port = 47989;
-        option.Port = 47989; option.AudioEndpointId = "bad\ninjection = enabled";
+        option.LanCandidate = null; option.BindAddress = "127.0.0.1"; option.Port = 48089;
+        option.AudioEndpointId = "bad\ninjection = enabled";
         Reject(() => ChildProductConfiguration.BuildSunshine(option), "config injection blocked");
         option.AudioEndpointId = "{audio-endpoint}"; audio.Complete = false;
         Reject(() => ChildProductConfiguration.BuildSunshine(option), "incomplete child audio inventory blocked");
@@ -409,7 +411,8 @@ internal static class ProductIntegrationTests
         string path = Path.Combine(root, "ChildStream.exe");
         var child = new ChildSessionIdentity(2, 123);
         var request = new ChildAgentRequest { ParentSessionId = 1, Child = child,
-            PipeName = "ChildStream-" + new string('a', 32), Nonce = new string('d', 64) };
+            PipeName = "ChildStream-" + new string('a', 32), Nonce = new string('d', 64),
+            ParentPid = 17, ParentExecutableSha256 = SunshineDigest, RequesterSid = "S-1-5-21-100" };
         Check(ChildAgentRequest.Decode(request.Encode()).Child.Equals(child), "agent request round trip");
         var fake = new FakeBootstrap { Agent = new ProductProcessIdentity { Pid = 42, SessionId = 2,
             StartTimeUtcTicks = 12, ExecutablePath = path, ExecutableSha256 = SunshineDigest } };

@@ -4,6 +4,10 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Diagnostics;
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Security.Principal;
+using System.Threading.Tasks;
+using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
 [ComImport, Guid("302D8188-0052-4807-806A-362B628F9AC5"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -22,7 +26,7 @@ public class RdpBox : AxHost
 
 static class Program
 {
-    [DllImport("wtsapi32.dll")]
+    [DllImport("wtsapi32.dll", SetLastError = true)]
     static extern bool WTSIsChildSessionsEnabled(out bool enabled);
     [DllImport("wtsapi32.dll", SetLastError = true)]
     static extern bool WTSGetChildSessionId(out uint sessionId);
@@ -88,7 +92,8 @@ static class Program
     }
 
     static string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-    static string logPath = Path.Combine(baseDir, "launcher.log");
+    static string logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "ChildStream", "launcher.log");
     static string intentDir = GetIntentDirectory();
 
     static string GetIntentDirectory()
@@ -98,9 +103,30 @@ static class Program
         return Path.Combine(local, "ChildStream", "session-intents");
     }
 
+    static string RandomHex(int bytes)
+    {
+        byte[] value = new byte[bytes];
+        using (var rng = RandomNumberGenerator.Create()) rng.GetBytes(value);
+        return BitConverter.ToString(value).Replace("-", "").ToLowerInvariant();
+    }
+
+    static ChildAgentRequest CreateAgentRequest(uint parent, ChildSessionIdentity child)
+    {
+        int pid = Process.GetCurrentProcess().Id;
+        ProductProcessIdentity image = new WindowsProductProcessHost().Read(pid);
+        if (image == null || image.SessionId != (int)parent ||
+            new WindowsRuntimeTokenReader().Read() != RuntimeTokenStatus.Limited)
+            throw new InvalidOperationException("Limited parent process identity cannot be verified.");
+        return new ChildAgentRequest { ParentSessionId = parent, Child = child,
+            ParentPid = pid, ParentExecutableSha256 = image.ExecutableSha256,
+            RequesterSid = WindowsIdentity.GetCurrent().User.Value,
+            PipeName = "ChildStream-" + RandomHex(16), Nonce = RandomHex(32) };
+    }
+
     static void Log(string msg)
     {
-        try { File.AppendAllText(logPath, DateTime.Now.ToString("HH:mm:ss.fff") + " " + msg + Environment.NewLine); } catch { }
+        try { Directory.CreateDirectory(Path.GetDirectoryName(logPath));
+            File.AppendAllText(logPath, DateTime.Now.ToString("HH:mm:ss.fff") + " " + msg + Environment.NewLine); } catch { }
     }
 
     static int[] ParseDisplayConfig(string value)
@@ -168,6 +194,16 @@ static class Program
             catch (Exception ex) { Log("session reconciliation failed: " + ex.Message); return 4; }
         }
 
+        Application.EnableVisualStyles();
+        var firstRun = new FirstRunController(new WindowsChildFeatureReader(), new WindowsRuntimeTokenReader());
+        using (var shell = new FirstRunForm(firstRun))
+            if (shell.ShowDialog() != DialogResult.OK || !shell.StartSelected) return 0;
+        if (!firstRun.CanStart) return 1;
+        return RunViewer();
+    }
+
+    private static int RunViewer()
+    {
         bool en;
         if (!WTSIsChildSessionsEnabled(out en))
         {
@@ -180,8 +216,6 @@ static class Program
             MessageBox.Show("Child sessions are not enabled. Installation is blocked until the transactional installer is validated.", "ChildStream");
             return 1;
         }
-
-        Application.EnableVisualStyles();
 
         // Microsoft documents automatic child-session logon from an existing parent
         // session. Do not set UserName or ClearTextPassword on the RDP control.
@@ -199,6 +233,13 @@ static class Program
         f.Icon = appIcon;
         var tray = new NotifyIcon { Icon = appIcon, Visible = true, Text = "Child Session" };
         dynamic ocx = null;
+        WindowsChildTaskBootstrapHost agentHost = null;
+        ChildAgentController agent = null;
+        MoonlightPairingCoordinator pairingCoordinator = null;
+        bool agentStartPending = false;
+        var statusBar = new StatusStrip();
+        var statusText = new ToolStripStatusLabel("Waiting for a verified child desktop.");
+        statusBar.Items.Add(statusText);
         var menu = new ContextMenuStrip();
         menu.Items.Add("Show", null, (s, e) => { f.Show(); f.WindowState = FormWindowState.Normal; f.Activate(); });
         ToolStripMenuItem reconnectItem = new ToolStripMenuItem("Reconnect now");
@@ -213,21 +254,68 @@ static class Program
             string conflict = SunshineStartupGate.Check(collision);
             MessageBox.Show(session + "\n" +
                 (conflict ?? "No Sunshine service, process or default-family port collision was observed.") +
-                "\nPortable streaming remains disabled until child process launch, capture, input, audio, " +
-                "network and rollback acceptance pass on an independent Windows target.",
+                "\nThe child runtime may start its own loopback Sunshine after exact session verification. " +
+                "LAN streaming, independent capture, controllers and hardware rollback still require acceptance.",
                 "ChildStream readiness", MessageBoxButtons.OK, MessageBoxIcon.Information);
         });
         menu.Items.Add("Inspect/remove legacy saved password", null, (s, e) => { RemoveLegacyPasswordExplicitly(); });
-        menu.Items.Add("Pair Moonlight…", null, (s, e) =>
+        var sunshineItem = new ToolStripMenuItem("Start ChildStream Sunshine") { Enabled = false };
+        menu.Items.Add(sunshineItem);
+        var steamItem = new ToolStripMenuItem("Start Steam Big Picture in child") { Enabled = false };
+        var gameItem = new ToolStripMenuItem("Request Minecraft Dungeons in child") { Enabled = false };
+        var stopSteamItem = new ToolStripMenuItem("Stop exact owned child Steam/game") { Enabled = false };
+        menu.Items.Add(steamItem); menu.Items.Add(gameItem); menu.Items.Add(stopSteamItem);
+        var pairItem = new ToolStripMenuItem("Pair Moonlight…") { Enabled = false };
+        menu.Items.Add(pairItem);
+        pairItem.Click += async (s, e) =>
         {
-            // The pairing coordinator is unavailable until a ChildStream-owned
-            // Sunshine process in the exact child generation is verified.
-            // Never fall back to the native Sunshine service or web UI.
-            using (var dialog = new MoonlightPairingDialog(null)) dialog.ShowDialog(f);
-        });
+            if (pairingCoordinator == null) return;
+            try
+            {
+                string[] verified = await Task.Run(() => new [] { pairingCoordinator.HostName,
+                    pairingCoordinator.ManualAddress });
+                using (var dialog = new MoonlightPairingDialog(pairingCoordinator, verified[0], verified[1]))
+                    dialog.ShowDialog(f);
+            }
+            catch (Exception ex)
+            { statusText.Text = "Pairing ownership changed: " + ex.Message; pairItem.Enabled = false; pairingCoordinator = null; }
+        };
+        Func<Task<bool>> stopAgent = async () =>
+        {
+            if (agent == null) return true;
+            try
+            {
+                var selected = agent;
+                string state = await Task.Run(() => selected.Execute(ChildAgentOperation.Status, ""));
+                var observed = new JavaScriptSerializer().DeserializeObject(state) as System.Collections.Generic.Dictionary<string, object>;
+                if (observed == null || !observed.ContainsKey("steamStage") || !observed.ContainsKey("stage"))
+                    throw new InvalidDataException("Child runtime status is incomplete.");
+                string steamState = Convert.ToString(observed["steamStage"]);
+                if (steamState != "NotStarted" && steamState != "Ended")
+                    await Task.Run(() => selected.Execute(ChildAgentOperation.StopSteam, ""));
+                if (Convert.ToString(observed["stage"]) == "SunshineReady" ||
+                    Convert.ToString(observed["stage"]) == "SunshineLost")
+                    await Task.Run(() => selected.Execute(ChildAgentOperation.StopSunshine, ""));
+                await Task.Run(() => selected.Stop());
+                if (agentHost != null) agentHost.Dispose();
+                agentHost = null; agent = null; pairingCoordinator = null;
+                pairItem.Enabled = false; sunshineItem.Enabled = false;
+                steamItem.Enabled = false; gameItem.Enabled = false; stopSteamItem.Enabled = false;
+                statusText.Text = "Child agent and owned Sunshine stopped. Child desktop remains available.";
+                return true;
+            }
+            catch (Exception ex)
+            {
+                statusText.Text = "Child runtime stop is uncertain: " + ex.Message;
+                Log(statusText.Text);
+                MessageBox.Show(f, statusText.Text + "\nNo unrelated process was stopped.",
+                    "ChildStream", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return false;
+            }
+        };
         ToolStripMenuItem signOutItem = new ToolStripMenuItem("End session (sign out, closes games)");
         menu.Items.Add(signOutItem);
-        signOutItem.Click += (s, e) =>
+        signOutItem.Click += async (s, e) =>
         {
             int viewerState;
             try { viewerState = (int)ocx.Connected; }
@@ -244,6 +332,7 @@ static class Program
                 return;
             }
             if (MessageBox.Show("Sign out the child session? All apps running in it will close.", "Child Session", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            if (!await stopAgent()) return;
             SignOutResult result = lifecycle.SignOut();
             Log("signout result: " + result + "; lifecycle: " + lifecycle.State + "; reason: " + lifecycle.FailureReason);
             if (result != SignOutResult.Complete)
@@ -261,7 +350,8 @@ static class Program
             tray.Visible = false;
             Application.Exit();
         };
-        menu.Items.Add("Exit", null, (s, e) => { tray.Visible = false; Application.Exit(); });
+        menu.Items.Add("Exit", null, async (s, e) =>
+        { if (!await stopAgent()) return; tray.Visible = false; Application.Exit(); });
         tray.ContextMenuStrip = menu;
         tray.DoubleClick += (s, e) => { f.Show(); f.WindowState = FormWindowState.Normal; f.Activate(); };
 
@@ -270,8 +360,110 @@ static class Program
 
         var rdp = new RdpBox { Dock = DockStyle.Fill };
         f.Controls.Add(rdp);
+        f.Controls.Add(statusBar);
         rdp.CreateControl();
         ocx = rdp.Ocx;
+
+        Action bootstrapAgent = () =>
+        {
+            if (agent != null || agentStartPending || lifecycle.State != ChildLifecycleState.Connected ||
+                !lifecycle.ObservedChild.HasValue) return;
+            ChildSessionIdentity exactChild = lifecycle.ObservedChild.Value;
+            agentStartPending = true;
+            statusText.Text = "Starting the limited child runtime…";
+            Task.Run(() =>
+            {
+                var host = new WindowsChildTaskBootstrapHost(new WindowsChildSessionApi(),
+                    Application.ExecutablePath, CreateAgentRequest(parentSessionId, exactChild).ParentExecutableSha256);
+                try
+                {
+                    ChildAgentRequest request = CreateAgentRequest(parentSessionId, exactChild);
+                    var controller = new ChildAgentController(host, parentSessionId, exactChild,
+                        Application.ExecutablePath, request.ParentExecutableSha256);
+                    controller.Start(request);
+                    return Tuple.Create(host, controller);
+                }
+                catch { host.Dispose(); throw; }
+            }).ContinueWith(task =>
+            {
+                if (f.IsDisposed) { if (task.Status == TaskStatus.RanToCompletion) task.Result.Item1.Dispose(); return; }
+                f.BeginInvoke((Action)(() =>
+                {
+                    agentStartPending = false;
+                    if (task.IsFaulted || task.IsCanceled)
+                    {
+                        statusText.Text = "Child runtime unavailable: " +
+                            (task.Exception == null ? "launch cancelled" : task.Exception.GetBaseException().Message);
+                        Log(statusText.Text); return;
+                    }
+                    if (lifecycle.State != ChildLifecycleState.Connected || !lifecycle.ObservedChild.HasValue ||
+                        !lifecycle.ObservedChild.Value.Equals(exactChild) || !lifecycle.CheckConnectedIdentity())
+                    { task.Result.Item1.Dispose(); statusText.Text = "Child identity changed during runtime launch."; return; }
+                    agentHost = task.Result.Item1; agent = task.Result.Item2;
+                    sunshineItem.Enabled = true;
+                    statusText.Text = "Limited child agent verified. Start ChildStream Sunshine when ready.";
+                }));
+            });
+        };
+        sunshineItem.Click += async (s, e) =>
+        {
+            if (agent == null || lifecycle.State != ChildLifecycleState.Connected ||
+                !lifecycle.CheckConnectedIdentity()) return;
+            sunshineItem.Enabled = false;
+            statusText.Text = "Checking child display/audio and starting owned Sunshine…";
+            try
+            {
+                var selectedAgent = agent;
+                await Task.Run(() => selectedAgent.Execute(ChildAgentOperation.StartSunshine, ""));
+                var runtime = new VerifiedAgentSunshine(selectedAgent, lifecycle.ObservedChild.Value);
+                await Task.Run(() => runtime.AssertStillOwned());
+                pairingCoordinator = new MoonlightPairingCoordinator(runtime,
+                    new AgentSunshinePairingApi(selectedAgent));
+                pairItem.Enabled = true;
+                steamItem.Enabled = true;
+                statusText.Text = "ChildStream Sunshine verified on loopback. LAN streaming requires separate acceptance.";
+            }
+            catch (Exception ex)
+            { statusText.Text = "ChildStream Sunshine unavailable: " + ex.Message; Log(statusText.Text); }
+            finally { sunshineItem.Enabled = agent != null && agent.Stage == ChildAgentStage.Ready; }
+        };
+        steamItem.Click += async (s, e) =>
+        {
+            if (agent == null || !lifecycle.CheckConnectedIdentity()) return;
+            steamItem.Enabled = false;
+            try
+            {
+                await Task.Run(() => agent.Execute(ChildAgentOperation.StartSteam, ""));
+                gameItem.Enabled = true; stopSteamItem.Enabled = true;
+                statusText.Text = "Exact child Steam Big Picture process verified. Game is not yet observed.";
+            }
+            catch (Exception ex) { statusText.Text = "Child Steam unavailable: " + ex.Message; Log(statusText.Text); }
+        };
+        gameItem.Click += async (s, e) =>
+        {
+            if (agent == null || !lifecycle.CheckConnectedIdentity()) return;
+            gameItem.Enabled = false;
+            try
+            {
+                string status = await Task.Run(() => agent.Execute(ChildAgentOperation.RequestGame, ""));
+                statusText.Text = status.Contains("GameObserved") ?
+                    "Exact Minecraft Dungeons child process observed." :
+                    "Game request sent; process outcome is not yet verified. Review before shutdown.";
+            }
+            catch (Exception ex) { statusText.Text = "Game request failed or uncertain: " + ex.Message; Log(statusText.Text); }
+        };
+        stopSteamItem.Click += async (s, e) =>
+        {
+            if (agent == null || !lifecycle.CheckConnectedIdentity()) return;
+            stopSteamItem.Enabled = false;
+            try
+            {
+                await Task.Run(() => agent.Execute(ChildAgentOperation.StopSteam, ""));
+                gameItem.Enabled = false; statusText.Text = "Exact child game and Steam stop verified.";
+            }
+            catch (Exception ex)
+            { statusText.Text = "Child Steam stop uncertain: " + ex.Message; Log(statusText.Text); stopSteamItem.Enabled = true; }
+        };
 
         int last = -1;
         DateTime lastAttempt = DateTime.MinValue;
@@ -368,7 +560,7 @@ static class Program
                         Log("connected child rejected: " + lifecycle.FailureReason);
                         ocx.Disconnect();
                     }
-                    else Log("verified child session " + lifecycle.ObservedChild.Value.SessionId);
+                    else { Log("verified child session " + lifecycle.ObservedChild.Value.SessionId); bootstrapAgent(); }
                 }
                 else if (state == 0) lifecycle.ObserveViewerDisconnected();
                 if (state == 1 && lifecycle.State == ChildLifecycleState.Connected &&
@@ -407,7 +599,18 @@ static class Program
         };
         timer.Start();
 
-        f.FormClosing += (s, e) => { timer.Stop(); tray.Visible = false; };
+        bool closeAuthorized = false;
+        f.FormClosing += async (s, e) =>
+        {
+            if (agent != null && !closeAuthorized)
+            {
+                e.Cancel = true;
+                if (await stopAgent()) { closeAuthorized = true; f.Close(); }
+                return;
+            }
+            timer.Stop(); tray.Visible = false;
+            if (agentHost != null) agentHost.Dispose();
+        };
         connect();
         Application.Run(f);
         instanceMutex.ReleaseMutex();

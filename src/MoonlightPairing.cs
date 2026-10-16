@@ -36,6 +36,10 @@ internal interface IVerifiedSunshinePairingTransport
 {
     string Send(string method, string path, string jsonBody);
 }
+internal interface IChildSunshineTransport : IVerifiedSunshinePairingTransport
+{
+    bool BootstrapFirstCredentials();
+}
 
 internal sealed class SunshinePairingApi : ISunshinePairingApi
 {

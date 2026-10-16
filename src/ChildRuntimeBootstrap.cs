@@ -18,6 +18,9 @@ internal sealed class ChildAgentRequest
     internal ChildSessionIdentity Child;
     internal string PipeName;
     internal string Nonce;
+    internal int ParentPid;
+    internal string ParentExecutableSha256;
+    internal string RequesterSid;
 
     internal string Encode()
     {
@@ -25,8 +28,9 @@ internal sealed class ChildAgentRequest
         using (var bytes = new MemoryStream())
         using (var writer = new BinaryWriter(bytes, Encoding.UTF8))
         {
-            writer.Write(1); writer.Write(ParentSessionId); writer.Write(Child.SessionId);
+            writer.Write(2); writer.Write(ParentSessionId); writer.Write(Child.SessionId);
             writer.Write(Child.LogonTime); writer.Write(PipeName); writer.Write(Nonce);
+            writer.Write(ParentPid); writer.Write(ParentExecutableSha256); writer.Write(RequesterSid);
             writer.Flush();
             return Convert.ToBase64String(bytes.ToArray());
         }
@@ -39,10 +43,12 @@ internal sealed class ChildAgentRequest
         byte[] bytes = Convert.FromBase64String(value);
         using (var reader = new BinaryReader(new MemoryStream(bytes), Encoding.UTF8))
         {
-            if (reader.ReadInt32() != 1) throw new InvalidDataException("Unsupported child agent request version.");
+            if (reader.ReadInt32() != 2) throw new InvalidDataException("Unsupported child agent request version.");
             var request = new ChildAgentRequest { ParentSessionId = reader.ReadUInt32(),
                 Child = new ChildSessionIdentity(reader.ReadUInt32(), reader.ReadInt64()),
-                PipeName = reader.ReadString(), Nonce = reader.ReadString() };
+                PipeName = reader.ReadString(), Nonce = reader.ReadString(),
+                ParentPid = reader.ReadInt32(), ParentExecutableSha256 = reader.ReadString(),
+                RequesterSid = reader.ReadString() };
             if (reader.BaseStream.Position != reader.BaseStream.Length)
                 throw new InvalidDataException("Child agent request has trailing data.");
             request.Validate();
@@ -57,7 +63,11 @@ internal sealed class ChildAgentRequest
             String.IsNullOrEmpty(PipeName) || PipeName.Length > 120 ||
             !System.Text.RegularExpressions.Regex.IsMatch(PipeName, "\\AChildStream-[0-9a-f]{32}\\z") ||
             String.IsNullOrEmpty(Nonce) ||
-            !System.Text.RegularExpressions.Regex.IsMatch(Nonce, "\\A[0-9a-f]{64}\\z"))
+            !System.Text.RegularExpressions.Regex.IsMatch(Nonce, "\\A[0-9a-f]{64}\\z") ||
+            ParentPid <= 0 || String.IsNullOrEmpty(ParentExecutableSha256) ||
+            !System.Text.RegularExpressions.Regex.IsMatch(ParentExecutableSha256, "\\A[0-9a-fA-F]{64}\\z") ||
+            String.IsNullOrEmpty(RequesterSid) || !System.Text.RegularExpressions.Regex.IsMatch(
+                RequesterSid, "\\AS-1-[0-9-]{5,100}\\z"))
             throw new InvalidDataException("Child agent request has invalid session or correlation identity.");
     }
 }
@@ -160,6 +170,16 @@ internal sealed class ChildAgentController
         return false;
     }
 
+    internal string Execute(ChildAgentOperation operation, string payload)
+    {
+        if (!Reconcile()) throw new InvalidOperationException("A verified child agent is required for runtime operation.");
+        var commands = host as IChildAgentCommandHost;
+        if (commands == null) throw new InvalidOperationException("This host has no authenticated child command channel.");
+        try { return commands.Exchange(operation, payload, operation == ChildAgentOperation.PairingPost ? 30000 : 15000); }
+        catch (ChildAgentCommandRejectedException) { throw; }
+        catch (Exception ex) { Failure = ex.Message; Stage = ChildAgentStage.Uncertain; throw; }
+    }
+
     internal void Stop()
     {
         if (!Reconcile()) throw new InvalidOperationException("Exact running child agent is required for stop.");
@@ -185,7 +205,9 @@ internal static class WindowsChildAgentEntry
         catch { return 2; }
         var process = new WindowsProductProcessHost();
         if (process.CurrentSessionId != (int)request.Child.SessionId ||
-            process.ReadSessionLogonTime((int)request.Child.SessionId) != request.Child.LogonTime)
+            process.ReadSessionLogonTime((int)request.Child.SessionId) != request.Child.LogonTime ||
+            new WindowsRuntimeTokenReader().Read() != RuntimeTokenStatus.Limited ||
+            !String.Equals(WindowsIdentity.GetCurrent().User.Value, request.RequesterSid, StringComparison.Ordinal))
             return 3;
         try
         {
@@ -193,6 +215,18 @@ internal static class WindowsChildAgentEntry
                 PipeOptions.None, TokenImpersonationLevel.Identification))
             {
                 pipe.Connect(10000);
+                uint serverPid;
+                if (!GetNamedPipeServerProcessId(pipe.SafePipeHandle, out serverPid) ||
+                    serverPid != (uint)request.ParentPid) return 4;
+                ProcessTokenObservation parentToken = WindowsProcessToken.Read(request.ParentPid);
+                ProductProcessIdentity parentProcess = process.Read(request.ParentPid);
+                if (parentToken.Elevation != RuntimeTokenStatus.Limited ||
+                    !String.Equals(parentToken.Sid, request.RequesterSid, StringComparison.Ordinal) ||
+                    parentProcess == null || parentProcess.SessionId != (int)request.ParentSessionId ||
+                    !String.Equals(parentProcess.ExecutableSha256, request.ParentExecutableSha256, StringComparison.OrdinalIgnoreCase) ||
+                    !String.Equals(Path.GetFullPath(parentProcess.ExecutablePath),
+                        Path.GetFullPath(Process.GetCurrentProcess().MainModule.FileName), StringComparison.OrdinalIgnoreCase))
+                    return 4;
                 using (var writer = new BinaryWriter(pipe, Encoding.UTF8, true))
                 {
                     writer.Write(0x43534131); writer.Write(Encoding.ASCII.GetBytes(request.Nonce));
@@ -201,22 +235,43 @@ internal static class WindowsChildAgentEntry
                     if (process.CurrentSessionId != (int)request.Child.SessionId ||
                         process.ReadSessionLogonTime((int)request.Child.SessionId) != request.Child.LogonTime)
                         return 4;
-                    // Remain owned by this local parent connection. A closed pipe
-                    // ends the agent; no unattended Sunshine or OS mutation starts.
-                    int command = pipe.ReadByte();
-                    return command == 0x53 ? 0 : 5;
+                    using (var operations = new WindowsChildAgentOperations(request))
+                    using (var lifetime = new Timer(state => { try { pipe.Dispose(); } catch { } },
+                        null, TimeSpan.FromHours(8), System.Threading.Timeout.InfiniteTimeSpan))
+                    {
+                        Func<bool> stillOwned = () =>
+                        {
+                            ProductProcessIdentity currentParent = process.Read(request.ParentPid);
+                            ProcessTokenObservation currentToken = WindowsProcessToken.Read(request.ParentPid);
+                            return process.CurrentSessionId == (int)request.Child.SessionId &&
+                                process.ReadSessionLogonTime((int)request.Child.SessionId) == request.Child.LogonTime &&
+                                new WindowsRuntimeTokenReader().Read() == RuntimeTokenStatus.Limited &&
+                                currentParent != null && currentParent.SessionId == (int)request.ParentSessionId &&
+                                currentParent.StartTimeUtcTicks == parentProcess.StartTimeUtcTicks &&
+                                String.Equals(currentParent.ExecutableSha256, request.ParentExecutableSha256,
+                                    StringComparison.OrdinalIgnoreCase) &&
+                                currentToken.Elevation == RuntimeTokenStatus.Limited &&
+                                currentToken.Sid == request.RequesterSid;
+                        };
+                        while (ChildAgentWire.ServeOne(pipe, operations, stillOwned)) { }
+                        return 0;
+                    }
                 }
             }
         }
         catch { return 6; }
     }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetNamedPipeServerProcessId(Microsoft.Win32.SafeHandles.SafePipeHandle pipe,
+        out uint serverPid);
 }
 
 // Uses only an already registered, exact ChildStream interactive-token task.
 // Registration/removal belong to the separately approved installer journal.
 // RunEx is a process-start request and never counts as a successful bootstrap
 // until the pipe peer, WTS generation and executable identity are rechecked.
-internal sealed class WindowsChildTaskBootstrapHost : IChildBootstrapHost, IDisposable
+internal sealed class WindowsChildTaskBootstrapHost : IChildBootstrapHost, IChildAgentCommandHost, IDisposable
 {
     private readonly IChildSessionApi sessions;
     private readonly WindowsProductProcessHost processes = new WindowsProductProcessHost();
@@ -224,6 +279,9 @@ internal sealed class WindowsChildTaskBootstrapHost : IChildBootstrapHost, IDisp
     private readonly string digest;
     private NamedPipeServerStream pipe;
     private int peerPid;
+    private long peerStartTime;
+    private ChildSessionIdentity? peerChild;
+    private string peerSid;
 
     internal WindowsChildTaskBootstrapHost(IChildSessionApi sessions, string executable, string digest)
     {
@@ -272,8 +330,15 @@ internal sealed class WindowsChildTaskBootstrapHost : IChildBootstrapHost, IDisp
     public void RequestAgentInSession(ChildAgentRequest request)
     {
         request.Validate();
-        if (pipe != null || processes.CurrentSessionId != (int)request.ParentSessionId)
+        if (pipe != null || processes.CurrentSessionId != (int)request.ParentSessionId ||
+            Process.GetCurrentProcess().Id != request.ParentPid ||
+            new WindowsRuntimeTokenReader().Read() != RuntimeTokenStatus.Limited ||
+            !String.Equals(WindowsIdentity.GetCurrent().User.Value, request.RequesterSid, StringComparison.Ordinal))
             throw new InvalidOperationException("Only the exact parent can request one child agent.");
+        ProductProcessIdentity parent = processes.Read(request.ParentPid);
+        if (parent == null || parent.SessionId != (int)request.ParentSessionId ||
+            !String.Equals(parent.ExecutableSha256, request.ParentExecutableSha256, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Parent executable changed before child-agent request.");
         var security = new PipeSecurity();
         security.SetAccessRuleProtection(true, false);
         security.AddAccessRule(new PipeAccessRule(WindowsIdentity.GetCurrent().User,
@@ -286,8 +351,8 @@ internal sealed class WindowsChildTaskBootstrapHost : IChildBootstrapHost, IDisp
             if (serviceType == null) throw new InvalidOperationException("Task Scheduler COM is unavailable.");
             dynamic service = Activator.CreateInstance(serviceType);
             service.Connect();
-            dynamic folder = service.GetFolder("\\ChildStream");
-            dynamic task = folder.GetTask("ChildAgent");
+            dynamic folder = service.GetFolder("\\");
+            dynamic task = folder.GetTask(ChildAgentTaskPolicy.Name(request.RequesterSid));
             CheckTask(task);
             task.RunEx(request.Encode(), 4, (int)request.Child.SessionId, null);
         }
@@ -305,6 +370,10 @@ internal sealed class WindowsChildTaskBootstrapHost : IChildBootstrapHost, IDisp
         uint pid;
         if (!GetNamedPipeClientProcessId(pipe.SafePipeHandle, out pid) || pid == 0 || pid > int.MaxValue)
             throw new InvalidOperationException("Child agent pipe peer PID is unavailable.");
+        ProcessTokenObservation peerToken = WindowsProcessToken.Read((int)pid);
+        if (peerToken.Elevation != RuntimeTokenStatus.Limited ||
+            !String.Equals(peerToken.Sid, request.RequesterSid, StringComparison.Ordinal))
+            throw new InvalidOperationException("Child agent pipe peer has the wrong user or elevated token.");
         Task<ChildAgentHello> read = Task.Run(() =>
         {
             using (var reader = new BinaryReader(pipe, Encoding.UTF8, true))
@@ -323,7 +392,19 @@ internal sealed class WindowsChildTaskBootstrapHost : IChildBootstrapHost, IDisp
         if (!read.Wait(timeoutMs))
         { Dispose(); throw new TimeoutException("Child agent handshake did not complete within the time limit."); }
         ChildAgentHello verified = read.GetAwaiter().GetResult();
+        ProductProcessIdentity image = processes.Read(verified.Pid);
+        ChildSessionIdentity? associated = sessions.ReadAssociatedChild();
+        if (image == null || image.SessionId != (int)request.Child.SessionId ||
+            image.StartTimeUtcTicks <= 0 ||
+            !String.Equals(Path.GetFullPath(image.ExecutablePath), executable, StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(image.ExecutableSha256, digest, StringComparison.OrdinalIgnoreCase) ||
+            processes.ReadSessionLogonTime((int)request.Child.SessionId) != request.Child.LogonTime ||
+            !associated.HasValue || !request.Child.Equals(associated.Value))
+            throw new InvalidOperationException("Child agent process, executable or session generation changed during handshake.");
         peerPid = verified.Pid;
+        peerStartTime = image.StartTimeUtcTicks;
+        peerChild = request.Child;
+        peerSid = request.RequesterSid;
         return verified;
     }
 
@@ -331,6 +412,14 @@ internal sealed class WindowsChildTaskBootstrapHost : IChildBootstrapHost, IDisp
     {
         if (pipe == null || !pipe.IsConnected || pid != peerPid || pid <= 0)
             throw new InvalidOperationException("Exact connected child agent is required for shutdown.");
+        string status = Exchange(ChildAgentOperation.Status, "", 5000);
+        var state = new System.Web.Script.Serialization.JavaScriptSerializer().DeserializeObject(status)
+            as System.Collections.Generic.Dictionary<string, object>;
+        if (state == null || !state.ContainsKey("stage") || !state.ContainsKey("steamStage") ||
+            Convert.ToString(state["stage"]) != "NoSunshine" ||
+            (Convert.ToString(state["steamStage"]) != "NotStarted" &&
+             Convert.ToString(state["steamStage"]) != "Ended"))
+            throw new InvalidOperationException("Exact owned Sunshine and Steam must be stopped before child agent exit.");
         pipe.WriteByte(0x53); pipe.Flush();
         for (int i = 0; i < 50; i++)
         {
@@ -340,8 +429,34 @@ internal sealed class WindowsChildTaskBootstrapHost : IChildBootstrapHost, IDisp
         throw new TimeoutException("Child agent did not exit after the bounded shutdown request.");
     }
 
+    public string Exchange(ChildAgentOperation operation, string payload, int timeoutMs)
+    {
+        if (pipe == null || !pipe.IsConnected || peerPid <= 0 || !peerChild.HasValue ||
+            timeoutMs < 1000 || timeoutMs > 30000)
+            throw new InvalidOperationException("No verified child agent channel exists.");
+        ProductProcessIdentity current = processes.Read(peerPid);
+        ProcessTokenObservation peer = WindowsProcessToken.Read(peerPid);
+        ChildSessionIdentity? associated = sessions.ReadAssociatedChild();
+        if (current == null || current.SessionId != (int)peerChild.Value.SessionId ||
+            current.StartTimeUtcTicks != peerStartTime ||
+            processes.ReadSessionLogonTime((int)peerChild.Value.SessionId) != peerChild.Value.LogonTime ||
+            !associated.HasValue || !peerChild.Value.Equals(associated.Value) ||
+            !String.Equals(Path.GetFullPath(current.ExecutablePath), executable, StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(current.ExecutableSha256, digest, StringComparison.OrdinalIgnoreCase) ||
+            peer.Elevation != RuntimeTokenStatus.Limited ||
+            !String.Equals(peer.Sid, peerSid, StringComparison.Ordinal) ||
+            processes.CurrentSessionId == (int)peerChild.Value.SessionId ||
+            !String.Equals(WindowsIdentity.GetCurrent().User.Value, peerSid, StringComparison.Ordinal))
+            throw new InvalidOperationException("Child agent channel peer changed.");
+        ChildAgentWire.WriteRequest(pipe, operation, payload);
+        Task<string> read = Task.Run(() => ChildAgentWire.ReadResponse(pipe));
+        if (!read.Wait(timeoutMs)) { Dispose(); throw new TimeoutException("Child agent operation outcome is unknown."); }
+        return read.GetAwaiter().GetResult();
+    }
+
     public void Dispose()
     {
         if (pipe != null) { pipe.Dispose(); pipe = null; }
+        peerPid = 0; peerStartTime = 0; peerChild = null; peerSid = null;
     }
 }

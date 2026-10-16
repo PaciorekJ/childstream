@@ -1,7 +1,7 @@
 # Third-party notices
 
 This unsigned ChildStream candidate includes ChildStream source, scripts, documentation,
-and two executables compiled from that source with the Windows .NET Framework compiler.
+and three executables compiled from that source with the Windows .NET Framework compiler.
 The repository's MIT license is in `LICENSE`.
 
 The candidate does **not** include Sunshine, ViGEmBus, Virtual HID Broker, Steam,

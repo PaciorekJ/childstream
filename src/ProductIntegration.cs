@@ -21,7 +21,7 @@ internal sealed class ChildProductOptions
     internal bool DisplayActiveInChild, ViGEmBusPresent;
     internal ChildAudioEndpointInventory AudioInventory;
     internal CaptureBackend Capture;
-    internal int Port = 47989;
+    internal int Port = 48089;
     internal string BindAddress = "127.0.0.1";
     internal SunshineLanCandidate LanCandidate;
 }
@@ -128,8 +128,9 @@ internal static class ChildProductConfiguration
             throw new InvalidDataException("The selected audio endpoint is not independently observed in the child session.");
         if (option.LanCandidate == null)
         {
-            if (option.BindAddress != "127.0.0.1" || option.Port != 47989)
-                throw new InvalidDataException("Non-loopback streaming requires a separate LAN candidate.");
+            if (option.BindAddress != "127.0.0.1" ||
+                new SunshinePortFamily(option.Port).Overlaps(new SunshinePortFamily(47989)))
+                throw new InvalidDataException("Loopback ChildStream streaming needs a non-native port family.");
         }
         else
         {
@@ -140,9 +141,11 @@ internal static class ChildProductConfiguration
                 throw new InvalidDataException("LAN candidate does not match the exact child and endpoint.");
         }
         string root = Path.GetFullPath(option.OwnedRoot).TrimEnd(Path.DirectorySeparatorChar);
+        string identityRoot = Path.Combine(install, "identity");
+        InstallerPolicy.ValidateCanonicalFilePath(identityRoot, true);
         var config = new StringBuilder();
         Action<string, string> line = (key, value) => config.Append(key).Append(" = ").Append(value).Append('\n');
-        line("sunshine_name", "ChildStream-child-" + option.Child.SessionId);
+        line("sunshine_name", "ChildStream");
         line("address_family", "ipv4");
         line("bind_address", option.BindAddress);
         line("port", option.Port.ToString(System.Globalization.CultureInfo.InvariantCulture));
@@ -150,11 +153,11 @@ internal static class ChildProductConfiguration
         line("upnp", "disabled");
         line("install_steam_audio_drivers", "disabled");
         line("file_apps", SafePath(root, "apps.json"));
-        line("credentials_file", SafePath(root, "sunshine_state.json"));
-        line("file_state", SafePath(root, "sunshine_state.json"));
+        line("credentials_file", SafePath(identityRoot, "credentials.json"));
+        line("file_state", SafePath(identityRoot, "sunshine_state.json"));
         line("log_path", SafePath(root, "sunshine.log"));
-        line("pkey", SafePath(root, "sunshine.key"));
-        line("cert", SafePath(root, "sunshine.cert"));
+        line("pkey", SafePath(identityRoot, "sunshine.key"));
+        line("cert", SafePath(identityRoot, "sunshine.cert"));
         line("output_name", "{" + displayGuid.ToString() + "}");
         line("dd_configuration_option", "verify_only");
         line("dd_resolution_option", "disabled");
@@ -409,6 +412,17 @@ internal static class SunshineStartupGate
             if (state.UdpListeners.Contains(port)) return "Candidate UDP port " + port + " is occupied.";
         return null;
     }
+    internal static string CheckFamilyAvailable(SunshineCollisionSnapshot state, SunshinePortFamily family)
+    {
+        if (state == null || family == null || !state.ServiceObservationComplete ||
+            !state.ProcessObservationComplete || !state.PortObservationComplete)
+            return "Sunshine coexistence inventory is incomplete.";
+        foreach (int port in family.Tcp)
+            if (state.TcpListeners.Contains(port)) return "ChildStream TCP port " + port + " is occupied.";
+        foreach (int port in family.Udp)
+            if (state.UdpListeners.Contains(port)) return "ChildStream UDP port " + port + " is occupied.";
+        return null;
+    }
 }
 
 internal static class WindowsSunshineCollisionReader
@@ -592,6 +606,8 @@ internal sealed class SteamChildRuntime
     private ChildOwnedProcess steam, game;
     internal SteamChildStage Stage { get; private set; }
     internal string Failure { get; private set; }
+    internal ProductProcessIdentity SteamIdentity { get { return steam == null ? null : steam.Identity; } }
+    internal ProductProcessIdentity GameIdentity { get { return game == null ? null : game.Identity; } }
 
     internal SteamChildRuntime(IProductProcessHost host, ChildSessionIdentity child,
         string steamPath, string steamDigest, string gamePath, string gameDigest)
