@@ -73,6 +73,8 @@ internal sealed class ChildStreamingJourney
             ((approvedLan && posture == "ScopedRulesVerified") ||
              (!approvedLan && posture == "LocalOnly")))
         {
+            if (!String.IsNullOrEmpty(selectionJson))
+                throw new InvalidOperationException("Stop the owned stream before selecting different child devices.");
             var existing = new VerifiedAgentSunshine(controller, child);
             existing.AssertStillOwned();
             return existing;

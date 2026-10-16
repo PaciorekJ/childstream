@@ -310,6 +310,18 @@ static class IntegratedRuntimeTests
                 "existing certificate waits for its own delayed pairing listener");
             worker.Execute(ChildAgentOperation.StopSunshine, "");
         }
+        var warmNever = new Environment(root + "-warm-never") { ListenerDelay = 100 };
+        using (var worker = new ChildAgentRuntime(child, 1, warmNever))
+        {
+            Reject(() => worker.Execute(ChildAgentOperation.StartSunshine, ""),
+                "existing unchanged certificate cannot hide a listener that never appears");
+            Check(worker.Execute(ChildAgentOperation.Status, "").Contains("Uncertain") &&
+                warmNever.ListenerReads >= 50,
+                "warm missing listener reaches a bounded uncertain state");
+            Check(worker.Execute(ChildAgentOperation.RecoverSunshine, "").Contains("NoSunshine") &&
+                warmNever.Process.Stops == 1,
+                "warm listener timeout has exact-owned recovery");
+        }
         var replaced = new Environment(root + "-replaced");
         replaced.Identity.ChangeAfterFirstRead = true;
         using (var first = new ChildAgentRuntime(child, 1, replaced))
@@ -420,9 +432,11 @@ static class IntegratedRuntimeTests
                 transition.Process.Starts == 2 && transition.Process.Stops == 1 &&
                 transition.Identity.Credentials,
                 "app switches exact owned local process to approved LAN without recreating child or pairing identity");
-            Check(journey.Start(chosen, true).ManualAddress == "192.168.50.10:48089" &&
+            Check(journey.Start("", true).ManualAddress == "192.168.50.10:48089" &&
                 transition.Process.Starts == 2,
                 "repeat approved LAN action reuses the exact verified runtime");
+            Reject(() => journey.Start(chosen, true),
+                "running LAN stream cannot silently ignore a new device selection");
             journey.Stop();
             Check(transition.Process.Stops == 2 && transition.Process.UnrelatedTouched == 0,
                 "normal application stops only its exact second Sunshine process");
@@ -500,7 +514,7 @@ static class IntegratedRuntimeTests
         string temporary = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar) +
             Path.DirectorySeparatorChar + "ChildStreamIntegrated-";
         foreach (string fixture in new [] { root, root + "-cold", root + "-replaced", root + "-exited",
-            root + "-never", root + "-warm-delayed", root + "-resumed", root + "-lan", root + "-reused-lan", root + "-transition", root + "-multiple", root + "-delayed", root + "-vanished", root + "-reused", root + "-interrupted" })
+            root + "-never", root + "-warm-delayed", root + "-warm-never", root + "-resumed", root + "-lan", root + "-reused-lan", root + "-transition", root + "-multiple", root + "-delayed", root + "-vanished", root + "-reused", root + "-interrupted" })
         { if (!Path.GetFullPath(fixture).StartsWith(temporary, StringComparison.OrdinalIgnoreCase))
               throw new InvalidOperationException("Fixture cleanup escaped ChildStream temp root.");
           if (Directory.Exists(fixture)) Directory.Delete(fixture, true); }
