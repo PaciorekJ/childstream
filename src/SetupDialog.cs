@@ -31,7 +31,7 @@ internal sealed class SetupDialog : Form
     {
         this.workflow = workflow;
         Text = simulated ? "ChildStream setup — simulated test environment" : "ChildStream setup and recovery";
-        Width = 730; Height = 640; MinimumSize = new Size(670, 590);
+        Width = 730; Height = 730; MinimumSize = new Size(670, 680);
         StartPosition = FormStartPosition.CenterParent;
         var title = new Label { Left = 20, Top = 15, Width = 670, Height = 28,
             Font = new Font(SystemFonts.MessageBoxFont, FontStyle.Bold),
@@ -44,7 +44,7 @@ internal sealed class SetupDialog : Form
             Text = "Reviewed plan SHA-256:" };
         planHash = new TextBox { Left = 20, Top = 134, Width = 670, Height = 26,
             MaxLength = 64, AccessibleName = "Exact reviewed setup plan hash" };
-        outcome = new Label { Left = 20, Top = 510, Width = 670, Height = 85,
+        outcome = new Label { Left = 20, Top = 610, Width = 670, Height = 80,
             Text = "No setup operation has run. A past journal does not prove the current feature state." };
         var plan = ButtonAt("Read-only plan", 20, 176);
         var journal = ButtonAt("Read journal", 183, 176);
@@ -55,21 +55,28 @@ internal sealed class SetupDialog : Form
         var remove = ButtonAt("Remove child agent", 346, 224);
         var close = ButtonAt("Close", 509, 224);
         var reviewed = ButtonAt("Reviewed restore", 20, 272);
-        var lanLabel = new Label { Left = 20, Top = 320, Width = 670, Height = 22,
+        var rdpLabel = new Label { Left = 20, Top = 315, Width = 670, Height = 22,
+            Text = "Separate pre-enable ordinary-RDP containment; live loopback qualification is still required:" };
+        var rdpPlan = ButtonAt("Review RDP plan", 20, 344);
+        var rdpApply = ButtonAt("Approve RDP blocks", 183, 344);
+        var rdpRead = ButtonAt("Read RDP journal", 346, 344);
+        var rdpRecover = ButtonAt("Restore RDP blocks", 509, 344);
+        var lanLabel = new Label { Left = 20, Top = 403, Width = 670, Height = 22,
             Text = "Separate ChildStream LAN streaming approval (private IPv4 on this PC):" };
-        lanAddress = new TextBox { Left = 20, Top = 345, Width = 320, Height = 26,
+        lanAddress = new TextBox { Left = 20, Top = 428, Width = 320, Height = 26,
             MaxLength = 45, AccessibleName = "Exact selected ChildStream LAN IPv4 address" };
-        var lanPlan = ButtonAt("Review LAN plan", 20, 390);
-        var lanApply = ButtonAt("Approve LAN rules", 183, 390);
-        var lanRecover = ButtonAt("Restore LAN rules", 346, 390);
-        var lanJournal = ButtonAt("Read LAN journal", 509, 390);
-        var lanNote = new Label { Left = 20, Top = 442, Width = 670, Height = 52,
+        var lanPlan = ButtonAt("Review LAN plan", 20, 473);
+        var lanApply = ButtonAt("Approve LAN rules", 183, 473);
+        var lanRecover = ButtonAt("Restore LAN rules", 346, 473);
+        var lanJournal = ButtonAt("Read LAN journal", 509, 473);
+        var lanNote = new Label { Left = 20, Top = 525, Width = 670, Height = 65,
             Text = "LAN rules are separate from the Windows child feature. Sunshine permits only local Web UI clients; " +
                 "its Web UI port is excluded from the LAN allow rules. Current firewall and interface state must verify." };
         actions = new[] { plan, journal, begin, prepare, restore, task, remove, reviewed, close,
-            lanPlan, lanApply, lanRecover, lanJournal };
+            lanPlan, lanApply, lanRecover, lanJournal, rdpPlan, rdpApply, rdpRead, rdpRecover };
         Controls.AddRange(new Control[] { title, detail, hashLabel, planHash, outcome,
             plan, journal, begin, prepare, restore, task, remove, reviewed, close,
+            rdpLabel, rdpPlan, rdpApply, rdpRead, rdpRecover,
             lanLabel, lanAddress, lanPlan, lanApply, lanRecover, lanJournal, lanNote });
         plan.Click += async (s, e) => await Run(SetupOperation.PlanConnected);
         journal.Click += async (s, e) => await Run(SetupOperation.ReadJournal);
@@ -81,6 +88,10 @@ internal sealed class SetupDialog : Form
         lanApply.Click += async (s, e) => await Run(SetupOperation.ApplyLan);
         lanRecover.Click += async (s, e) => await Run(SetupOperation.RecoverLan);
         lanJournal.Click += async (s, e) => await Run(SetupOperation.ReadLanJournal);
+        rdpPlan.Click += async (s, e) => await Run(SetupOperation.PlanRdpContainment);
+        rdpApply.Click += async (s, e) => await Run(SetupOperation.ApplyRdpContainment);
+        rdpRead.Click += async (s, e) => await Run(SetupOperation.ReadRdpContainment);
+        rdpRecover.Click += async (s, e) => await Run(SetupOperation.RecoverRdpContainment);
         task.Click += async (s, e) => await RunTask(false);
         remove.Click += async (s, e) => await RunTask(true);
         close.Click += (s, e) => Close();
@@ -100,7 +111,8 @@ internal sealed class SetupDialog : Form
     private async Task Run(SetupOperation operation)
     {
         string hash = operation == SetupOperation.PlanConnected || operation == SetupOperation.ReadJournal ||
-            operation == SetupOperation.PlanLan || operation == SetupOperation.ReadLanJournal
+            operation == SetupOperation.PlanLan || operation == SetupOperation.ReadLanJournal ||
+            operation == SetupOperation.PlanRdpContainment || operation == SetupOperation.ReadRdpContainment
             ? "" : planHash.Text.Trim();
         bool lan = operation == SetupOperation.PlanLan || operation == SetupOperation.ApplyLan ||
             operation == SetupOperation.RecoverLan || operation == SetupOperation.ReadLanJournal;
@@ -110,9 +122,12 @@ internal sealed class SetupDialog : Form
         catch (Exception ex) { outcome.Text = ex.Message; return; }
         if (operation != SetupOperation.PlanConnected && operation != SetupOperation.ReadJournal &&
             operation != SetupOperation.PlanLan && operation != SetupOperation.ReadLanJournal &&
+            operation != SetupOperation.PlanRdpContainment && operation != SetupOperation.ReadRdpContainment &&
             MessageBox.Show(this, "Authorize exactly " + operation + " for plan " + hash +
                 "?\nA separate elevated helper will verify the current console and safety gates. " +
-                (lan ? "Only the two scoped ChildStream LAN firewall rules are in this request. " : "") +
+                (lan ? "Only the two scoped ChildStream LAN firewall rules are in this request. " :
+                    operation == SetupOperation.ApplyRdpContainment || operation == SetupOperation.RecoverRdpContainment
+                    ? "Only the two scoped ChildStream TermService block rules are in this request. " : "") +
                 (operation == SetupOperation.ReviewedRestore ?
                     "This acknowledges an ambiguous earlier feature write. Verify the journal and current Windows state first." :
                     "Feature preparation may require a later manual Windows sign-in."),
@@ -124,6 +139,10 @@ internal sealed class SetupDialog : Form
             string result = await Task.Run(() => workflow.Execute(request));
             if (result.StartsWith("LAN plan ", StringComparison.Ordinal))
                 planHash.Text = result.Substring("LAN plan ".Length, 64);
+            else if (result.StartsWith("RDP plan ", StringComparison.Ordinal))
+                planHash.Text = result.Substring("RDP plan ".Length, 64);
+            else if (result.StartsWith("RDP journal ", StringComparison.Ordinal))
+                planHash.Text = result.Substring("RDP journal ".Length, 64);
             else if (result.StartsWith("LAN journal ", StringComparison.Ordinal))
                 planHash.Text = result.Substring("LAN journal ".Length, 64);
             else if (result.StartsWith("Plan ", StringComparison.Ordinal) ||

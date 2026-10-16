@@ -63,7 +63,7 @@ internal static class ProductInstallProgram
             SetupInstallTrust.VerifyProtectedAcl(Directory.GetAccessControl(path));
         foreach (string leaf in new[] { "ChildStream.exe", "ChildStreamSetup.exe",
             "ChildStreamBootstrap.exe",
-            "feasibility-inventory.ps1" }) SetupInstallTrust.RequireOwnedPath(leaf);
+            "feasibility-inventory.ps1", "rdp-containment-observe.ps1" }) SetupInstallTrust.RequireOwnedPath(leaf);
         string sunshine = Path.Combine(root, "versions", SunshineReleasePin.Version, "sunshine.exe");
         SetupInstallTrust.VerifyProtectedAcl(File.GetAccessControl(sunshine));
     }
@@ -90,6 +90,17 @@ internal static class ProductInstallProgram
     private static void ReverseOwnedFiles()
     {
         string root = Root();
+        string setup = Path.Combine(Environment.GetFolderPath(
+            Environment.SpecialFolder.CommonApplicationData), "ChildStream", "setup");
+        if (Directory.Exists(setup))
+            foreach (string requester in Directory.GetDirectories(setup))
+            {
+                InstallerPolicy.ValidateCanonicalFilePath(requester, true);
+                if (File.Exists(Path.Combine(requester, "rdp-containment.journal")))
+                    throw new InvalidOperationException("Recover exact requester-owned RDP containment before reversing installed code.");
+            }
+        if (WindowsRdpContainmentHost.AnyOwnedPolicyRule())
+            throw new InvalidOperationException("ChildStream RDP containment rules still exist; restore them before uninstall.");
         if (File.Exists(Path.Combine(root, "lan-firewall.journal"))) Lan(root, false).Recover();
         Coordinator(root).RecoverOrUninstall();
         Console.WriteLine("Exact ChildStream-owned installation bytes reversed. Per-user pairing identity remains.");

@@ -73,7 +73,7 @@ internal sealed class ScriptProbeInventory : IProbeInventory, IProbeBoundaryInve
 {
     private readonly string script;
     internal ScriptProbeInventory(string scriptPath) { script = Path.GetFullPath(scriptPath); }
-    private static string Run(string path, string arguments, string description)
+    internal static string Run(string path, string arguments, string description)
     {
         if (!File.Exists(path)) throw new FileNotFoundException("Reviewed read-only script is missing.", path);
         string pwsh = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),

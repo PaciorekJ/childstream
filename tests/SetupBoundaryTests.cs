@@ -38,6 +38,17 @@ internal static class SetupBoundaryTests
     {
         public IDisposable Acquire() { return new MemoryStream(); }
     }
+    private sealed class RdpHost : IRdpContainmentHost
+    {
+        internal RdpContainmentObservation State;
+        internal int Adds;
+        public RdpContainmentObservation Read() { return State; }
+        public void Add(RdpContainmentRule rule)
+        { Adds++; State.PersistentRules.Add(rule); State.ActiveRules.Add(rule); }
+        public void Remove(RdpContainmentRule rule)
+        { State.PersistentRules.RemoveAll(x => x.Name == rule.Name);
+          State.ActiveRules.RemoveAll(x => x.Name == rule.Name); }
+    }
     private sealed class TaskStore : IChildAgentTaskStore
     {
         internal ChildAgentTaskDefinition Definition;
@@ -102,6 +113,46 @@ internal static class SetupBoundaryTests
         Reject(() => transaction.Execute(Request(SetupOperation.PlanConnected, ""), true),
             "connected-network firewall gate rejects planning");
         Check(host.Writes == 0 && store.Journal == null, "protected host has zero native writes/journal");
+        string rdpDir = Path.Combine(Directory.GetCurrentDirectory(), "tests", ".artifacts",
+            "ChildStream-setup-rdp-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(rdpDir);
+        try
+        {
+            var rdpHost = new RdpHost { State = new RdpContainmentObservation {
+                Complete = true, FeatureKnown = true, PolicyDenied = true,
+                TermServiceState = "Running", ListenersAbsent = true,
+                ConfiguredRdpPort = 3391, BypassCountKnown = true } };
+            foreach (string name in new[] { "Domain", "Private", "Public" })
+                rdpHost.State.Profiles.Add(new RdpContainmentProfile { Name = name,
+                    Enabled = "True", DefaultInboundAction = "Block",
+                    AllowLocalFirewallRules = "True", ExclusionsKnown = true });
+            var rdp = new RdpContainmentTransaction(rdpHost, rdpDir, new string('a',64));
+            var integrated = new SetupTransaction(new FeasibilityProbe(host, store, new Lock()),
+                store, null, rdp, true);
+            string rdpPlan = integrated.Execute(Request(SetupOperation.PlanRdpContainment, ""), true);
+            string rdpHash = rdpPlan.Substring("RDP plan ".Length);
+            Reject(() => integrated.Execute(Request(SetupOperation.ApplyRdpContainment, rdpHash), false),
+                "normal setup requires separate containment approval");
+            Check(rdpHost.Adds == 0 && host.Writes == 0,
+                "denied containment has zero firewall and feature writes");
+            integrated.Execute(Request(SetupOperation.ApplyRdpContainment, rdpHash), true);
+            Check(rdpHost.Adds == 2 && rdp.Verify() && host.Writes == 0,
+                "normal setup invokes approved policy adapter and effective readback");
+            Check(integrated.Execute(Request(SetupOperation.ReadRdpContainment, ""), true)
+                .Contains("live child-loopback qualification=unrun"),
+                "normal setup reports unrun packet and loopback qualification");
+            host.State.LocalRdpPostureAccepted = true;
+            string qualifiedPlan = integrated.Execute(Request(SetupOperation.PlanConnected, ""), true)
+                .Substring(5,64);
+            Reject(() => integrated.Execute(Request(SetupOperation.BeginConnected, qualifiedPlan), true),
+                "configured policy alone cannot reach feature transaction");
+            Check(host.Writes == 0 && store.Journal == null,
+                "unrun live qualification causes zero feature writes and no feature journal");
+            integrated.Execute(Request(SetupOperation.RecoverRdpContainment, rdpHash), true);
+            Check(rdpHost.State.PersistentRules.Count == 0,
+                "normal setup recovery removes only exact owned containment");
+        }
+        finally { Directory.Delete(rdpDir, true); }
         host.State.LocalRdpPostureAccepted = true;
         string plan = transaction.Execute(Request(SetupOperation.PlanConnected, ""), true);
         string hash = plan.Substring(5, 64);

@@ -587,7 +587,7 @@ internal static class ProductIntegrationTests
         using (var input = File.OpenRead(candidate)) digest = ProductInstallPayload.Hex(sha.ComputeHash(input));
         Reject(() => ProductInstallPayload.ReadCandidate(candidate, new string('0', 64)),
             "candidate self-description cannot replace reviewed outer digest");
-        Check(ProductInstallPayload.ReadCandidate(candidate, digest).Files.Count == 5,
+        Check(ProductInstallPayload.ReadCandidate(candidate, digest).Files.Count == ProductInstallPayload.InstalledFiles.Length,
             "exact reviewed candidate payload admitted");
         string reacquired = Path.Combine(fixture, "reacquired", "candidate.zip");
         Directory.CreateDirectory(Path.Combine(fixture, "reacquired", "bin"));
@@ -595,7 +595,7 @@ internal static class ProductIntegrationTests
         File.WriteAllText(Path.Combine(fixture, "reacquired", "bin", "ChildStreamBootstrap.exe"),
             "reviewed:bin/ChildStreamBootstrap.exe");
         File.Delete(candidate);
-        Check(ProductInstallPayload.ReadCandidate(reacquired, digest).Files.Count == 5 &&
+        Check(ProductInstallPayload.ReadCandidate(reacquired, digest).Files.Count == ProductInstallPayload.InstalledFiles.Length &&
             WindowsProductInstallWorkflow.SelectBootstrapPath(root, reacquired, root, true) ==
                 Path.Combine(fixture, "reacquired", "bin", "ChildStreamBootstrap.exe"),
             "installed-app maintenance accepts a reacquired identical candidate and external bootstrap after original download is gone");

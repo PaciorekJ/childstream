@@ -25,6 +25,8 @@ $sources += (Join-Path $root 'src\ProductBundle.cs')
 $sources += (Join-Path $root 'src\ProductInstallProgram.cs')
 $sources += (Join-Path $root 'src\LanFirewallTransaction.cs')
 $sources += (Join-Path $root 'src\WindowsLanFirewallHost.cs')
+$sources += (Join-Path $root 'src\RdpContainment.cs')
+$sources += (Join-Path $root 'src\WindowsRdpContainmentHost.cs')
 $sources += (Join-Path $root 'src\InstallDialog.cs')
 $sources += (Join-Path $root 'src\CapabilitySelectionDialog.cs')
 $sources += (Join-Path $root 'src\SetupDialog.cs')
@@ -87,6 +89,10 @@ if ($LASTEXITCODE -ne 0) { throw 'User bundle production-admission test compilat
 if ($LASTEXITCODE -ne 0) { throw 'LAN firewall transaction test compilation failed.' }
 & (Join-Path $artifacts 'LanFirewallTests.exe')
 if ($LASTEXITCODE -ne 0) { throw 'LAN firewall transaction fixture tests failed.' }
+& $csc /nologo /target:exe /main:RdpContainmentTests "/out:$artifacts\RdpContainmentTests.exe" $productReferences $sources (Join-Path $PSScriptRoot 'RdpContainmentTests.cs')
+if ($LASTEXITCODE -ne 0) { throw 'RDP containment native-contract test compilation failed.' }
+& (Join-Path $artifacts 'RdpContainmentTests.exe')
+if ($LASTEXITCODE -ne 0) { throw 'RDP containment native-contract transaction tests failed.' }
 & $csc /nologo /target:exe /main:ControllerWitnessProgram "/out:$artifacts\ChildStreamControllerWitness.exe" /r:System.Web.Extensions.dll (Join-Path $root 'src\ControllerWitness.cs')
 if ($LASTEXITCODE -ne 0) { throw 'Opt-in controller witness compilation failed.' }
 & $csc /nologo /target:exe /main:ControllerWitnessTests "/out:$artifacts\ControllerWitnessTests.exe" /r:System.Web.Extensions.dll (Join-Path $root 'src\ControllerWitness.cs') (Join-Path $PSScriptRoot 'ControllerWitnessTests.cs')
@@ -114,6 +120,10 @@ if ($LASTEXITCODE -ne 0) { throw 'Offline feasibility probe tests failed.' }
 & $csc /nologo /target:exe /main:FeasibilityProbeProgram "/out:$artifacts\ChildStreamFeasibilityProbe.exe" /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll /r:Microsoft.CSharp.dll (Join-Path $root 'src\FeasibilityProbe.cs') (Join-Path $root 'src\WindowsFeasibilityHost.cs') (Join-Path $root 'src\FirewallRdpAssessment.cs') (Join-Path $root 'src\NetworkIsolationAssessment.cs') (Join-Path $root 'src\FeasibilityProbeProgram.cs') (Join-Path $root 'src\InstallerFoundation.cs') (Join-Path $root 'src\TransactionOwnership.cs') (Join-Path $root 'src\ChildSessionLifecycle.cs')
 if ($LASTEXITCODE -ne 0) { throw 'Windows feasibility adapter compilation failed.' }
 $inventorySource = Get-Content (Join-Path $root 'scripts\feasibility-inventory.ps1') -Raw
+$rdpSource = Get-Content (Join-Path $root 'scripts\rdp-containment-observe.ps1') -Raw
+$rdpTokens = $null; $rdpErrors = $null
+[System.Management.Automation.Language.Parser]::ParseInput($rdpSource, [ref]$rdpTokens, [ref]$rdpErrors) | Out-Null
+if ($rdpErrors.Count -ne 0) { throw "RDP observation script syntax failed: $($rdpErrors[0].Message)" }
 $inventoryTokens = $null
 $inventoryErrors = $null
 [System.Management.Automation.Language.Parser]::ParseInput($inventorySource, [ref]$inventoryTokens, [ref]$inventoryErrors) | Out-Null
