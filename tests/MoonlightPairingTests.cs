@@ -84,6 +84,10 @@ static class MoonlightPairingTests
         var api = new Api();
         Reject<ArgumentNullException>(() => new MoonlightPairingCoordinator(null, api), "no unverified runtime");
         Reject<ArgumentNullException>(() => new MoonlightPairingCoordinator(runtime, null), "no implicit API");
+        var snapshotFlow = new MoonlightPairingCoordinator(new Runtime(), new Api());
+        var callerList = snapshotFlow.Refresh();
+        callerList.Clear();
+        Check(snapshotFlow.Approve(IdA, "1234", true), "caller cannot alter displayed snapshot by editing returned list");
         var flow = new MoonlightPairingCoordinator(runtime, api);
         Check(flow.HostName == "ChildStream-child-7" && flow.ManualAddress.Contains(":48050"), "verified host display");
         Reject<InvalidOperationException>(() => flow.Approve(IdA, "1234", true), "refresh required");

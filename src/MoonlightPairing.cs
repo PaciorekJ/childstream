@@ -18,7 +18,9 @@ internal interface IVerifiedChildSunshine
 
 internal sealed class PendingMoonlightPairing
 {
-    internal string Id, Name, Address;
+    internal readonly string Id, Name, Address;
+    internal PendingMoonlightPairing(string id, string name, string address)
+    { Id = id; Name = name; Address = address; }
 }
 
 internal interface ISunshinePairingApi
@@ -90,7 +92,7 @@ internal static class SunshinePairingProtocol
                 nameText.IndexOfAny(new[] { '\r', '\n', '\0' }) >= 0 ||
                 addressText.IndexOfAny(new[] { '\r', '\n', '\0' }) >= 0)
                 throw new InvalidDataException("A pairing request is malformed or ambiguous.");
-            result.Add(new PendingMoonlightPairing { Id = idText, Name = nameText, Address = addressText });
+            result.Add(new PendingMoonlightPairing(idText, nameText, addressText));
         }
         return result;
     }
@@ -139,8 +141,8 @@ internal sealed class MoonlightPairingCoordinator
         runtime.AssertStillOwned();
         IList<PendingMoonlightPairing> requests = SunshinePairingProtocol.ParsePending(api.GetPendingJson());
         runtime.AssertStillOwned();
-        lastSeen = requests;
-        return requests;
+        lastSeen = new List<PendingMoonlightPairing>(requests);
+        return new List<PendingMoonlightPairing>(requests);
     }
 
     internal bool Approve(string selectedId, string pin, bool explicitConsent)
