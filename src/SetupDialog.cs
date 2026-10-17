@@ -26,12 +26,19 @@ internal sealed class SetupDialog : Form
     private readonly TextBox planHash, lanAddress;
     private readonly Label outcome;
     private readonly Button[] actions;
+    private string connectedPlanHash, qualificationHash, qualificationPresentedHash;
+    private Func<SetupOperation, string, bool> simulatedApproval = null;
     private bool busy;
+#if TEST_ONLY
+    internal SetupDialog(ISetupWorkflow workflow, bool simulated,
+        Func<SetupOperation, string, bool> approval) : this(workflow, simulated)
+    { simulatedApproval = approval; }
+#endif
     internal SetupDialog(ISetupWorkflow workflow, bool simulated = false)
     {
         this.workflow = workflow;
         Text = simulated ? "ChildStream setup — simulated test environment" : "ChildStream setup and recovery";
-        Width = 730; Height = 730; MinimumSize = new Size(670, 680);
+        Width = 730; Height = 845; MinimumSize = new Size(670, 790);
         StartPosition = FormStartPosition.CenterParent;
         var title = new Label { Left = 20, Top = 15, Width = 670, Height = 28,
             Font = new Font(SystemFonts.MessageBoxFont, FontStyle.Bold),
@@ -44,7 +51,7 @@ internal sealed class SetupDialog : Form
             Text = "Reviewed plan SHA-256:" };
         planHash = new TextBox { Left = 20, Top = 134, Width = 670, Height = 26,
             MaxLength = 64, AccessibleName = "Exact reviewed setup plan hash" };
-        outcome = new Label { Left = 20, Top = 610, Width = 670, Height = 80,
+        outcome = new Label { Left = 20, Top = 695, Width = 670, Height = 90,
             Text = "No setup operation has run. A past journal does not prove the current feature state." };
         var plan = ButtonAt("Read-only plan", 20, 176);
         var journal = ButtonAt("Read journal", 183, 176);
@@ -55,6 +62,7 @@ internal sealed class SetupDialog : Form
         var remove = ButtonAt("Remove child agent", 346, 224);
         var close = ButtonAt("Close", 509, 224);
         var reviewed = ButtonAt("Reviewed restore", 20, 272);
+        var verifyStageA = ButtonAt("Verify Stage A", 183, 272);
         var rdpLabel = new Label { Left = 20, Top = 315, Width = 670, Height = 22,
             Text = "Separate pre-enable ordinary-RDP containment; live loopback qualification is still required:" };
         var rdpPlan = ButtonAt("Review RDP plan", 20, 344);
@@ -72,18 +80,27 @@ internal sealed class SetupDialog : Form
         var lanNote = new Label { Left = 20, Top = 525, Width = 670, Height = 65,
             Text = "LAN rules are separate from the Windows child feature. Sunshine permits only local Web UI clients; " +
                 "its Web UI port is excluded from the LAN allow rules. Current firewall and interface state must verify." };
+        var qualificationLabel = new Label { Left = 20, Top = 587, Width = 670, Height = 35,
+            Text = "Pre-feature WFP packet evidence is reviewed separately. Child loopback is a later Stage A/B test." };
+        var observe = ButtonAt("Capture packet proof", 20, 630);
+        var review = ButtonAt("Review proof hash", 183, 630);
+        var qualification = ButtonAt("Read proof status", 346, 630);
+        var retire = ButtonAt("Retire proof", 509, 630);
         actions = new[] { plan, journal, begin, prepare, restore, task, remove, reviewed, close,
-            lanPlan, lanApply, lanRecover, lanJournal, rdpPlan, rdpApply, rdpRead, rdpRecover };
+            lanPlan, lanApply, lanRecover, lanJournal, rdpPlan, rdpApply, rdpRead, rdpRecover,
+            observe, review, qualification, retire, verifyStageA };
         Controls.AddRange(new Control[] { title, detail, hashLabel, planHash, outcome,
-            plan, journal, begin, prepare, restore, task, remove, reviewed, close,
+            plan, journal, begin, prepare, restore, task, remove, reviewed, verifyStageA, close,
             rdpLabel, rdpPlan, rdpApply, rdpRead, rdpRecover,
-            lanLabel, lanAddress, lanPlan, lanApply, lanRecover, lanJournal, lanNote });
+            lanLabel, lanAddress, lanPlan, lanApply, lanRecover, lanJournal, lanNote,
+            qualificationLabel, observe, review, qualification, retire });
         plan.Click += async (s, e) => await Run(SetupOperation.PlanConnected);
         journal.Click += async (s, e) => await Run(SetupOperation.ReadJournal);
         begin.Click += async (s, e) => await Run(SetupOperation.BeginConnected);
         prepare.Click += async (s, e) => await Run(SetupOperation.PrepareFeature);
         restore.Click += async (s, e) => await Run(SetupOperation.RestoreOriginal);
         reviewed.Click += async (s, e) => await Run(SetupOperation.ReviewedRestore);
+        verifyStageA.Click += async (s, e) => await Run(SetupOperation.VerifyStageA);
         lanPlan.Click += async (s, e) => await Run(SetupOperation.PlanLan);
         lanApply.Click += async (s, e) => await Run(SetupOperation.ApplyLan);
         lanRecover.Click += async (s, e) => await Run(SetupOperation.RecoverLan);
@@ -92,6 +109,10 @@ internal sealed class SetupDialog : Form
         rdpApply.Click += async (s, e) => await Run(SetupOperation.ApplyRdpContainment);
         rdpRead.Click += async (s, e) => await Run(SetupOperation.ReadRdpContainment);
         rdpRecover.Click += async (s, e) => await Run(SetupOperation.RecoverRdpContainment);
+        observe.Click += async (s, e) => await Run(SetupOperation.ObserveQualification);
+        review.Click += async (s, e) => await Run(SetupOperation.ReviewQualification);
+        qualification.Click += async (s, e) => await Run(SetupOperation.ReadQualification);
+        retire.Click += async (s, e) => await Run(SetupOperation.RetireQualification);
         task.Click += async (s, e) => await RunTask(false);
         remove.Click += async (s, e) => await RunTask(true);
         close.Click += (s, e) => Close();
@@ -112,26 +133,38 @@ internal sealed class SetupDialog : Form
     {
         string hash = operation == SetupOperation.PlanConnected || operation == SetupOperation.ReadJournal ||
             operation == SetupOperation.PlanLan || operation == SetupOperation.ReadLanJournal ||
-            operation == SetupOperation.PlanRdpContainment || operation == SetupOperation.ReadRdpContainment
-            ? "" : planHash.Text.Trim();
+            operation == SetupOperation.PlanRdpContainment || operation == SetupOperation.ReadRdpContainment ||
+            operation == SetupOperation.ReadQualification
+            ? "" : operation == SetupOperation.RetireQualification ? qualificationHash ?? "" :
+            planHash.Text.Trim();
         bool lan = operation == SetupOperation.PlanLan || operation == SetupOperation.ApplyLan ||
             operation == SetupOperation.RecoverLan || operation == SetupOperation.ReadLanJournal;
         var request = new SetupRequest { Operation = operation, ApprovedPlanHash = hash,
             LanAddress = lan ? lanAddress.Text.Trim() : "" };
         try { request.Validate(); }
         catch (Exception ex) { outcome.Text = ex.Message; return; }
+        if (operation == SetupOperation.ReviewQualification &&
+            !String.Equals(qualificationPresentedHash, hash, StringComparison.OrdinalIgnoreCase))
+        { outcome.Text = "Read the private qualification summary and exact hash before reviewing it."; return; }
         if (operation != SetupOperation.PlanConnected && operation != SetupOperation.ReadJournal &&
             operation != SetupOperation.PlanLan && operation != SetupOperation.ReadLanJournal &&
             operation != SetupOperation.PlanRdpContainment && operation != SetupOperation.ReadRdpContainment &&
+            operation != SetupOperation.ReadQualification &&
+            !(simulatedApproval != null ? simulatedApproval(operation, hash) :
             MessageBox.Show(this, "Authorize exactly " + operation + " for plan " + hash +
                 "?\nA separate elevated helper will verify the current console and safety gates. " +
+                (operation == SetupOperation.ReviewQualification ? "\nReviewed evidence: " + outcome.Text + "\n" : "") +
                 (lan ? "Only the two scoped ChildStream LAN firewall rules are in this request. " :
                     operation == SetupOperation.ApplyRdpContainment || operation == SetupOperation.RecoverRdpContainment
                     ? "Only the two scoped ChildStream TermService block rules are in this request. " : "") +
                 (operation == SetupOperation.ReviewedRestore ?
                     "This acknowledges an ambiguous earlier feature write. Verify the journal and current Windows state first." :
+                    operation == SetupOperation.VerifyStageA ?
+                    "This verifies the fresh physical-console sign-in and WTS result; it does not create a child." :
+                    operation == SetupOperation.ObserveQualification || operation == SetupOperation.ReviewQualification ?
+                    "This reads and reviews native WFP packet evidence. It does not approve a feature write." :
                     "Feature preparation may require a later manual Windows sign-in."),
-                "ChildStream setup approval", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+                "ChildStream setup approval", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes))
             return;
         SetBusy(true); outcome.Text = "Waiting for the scoped helper. No automatic retry will occur.";
         try
@@ -143,13 +176,32 @@ internal sealed class SetupDialog : Form
                 planHash.Text = result.Substring("RDP plan ".Length, 64);
             else if (result.StartsWith("RDP journal ", StringComparison.Ordinal))
                 planHash.Text = result.Substring("RDP journal ".Length, 64);
+            else if (result.StartsWith("Qualification ", StringComparison.Ordinal) &&
+                result.Contains(" retired after verified feature restoration."))
+            { qualificationHash = null; qualificationPresentedHash = null;
+              if (!String.IsNullOrEmpty(connectedPlanHash)) planHash.Text = connectedPlanHash; }
+            else if (result.StartsWith("Qualification ", StringComparison.Ordinal))
+            { qualificationHash = result.Substring("Qualification ".Length, 64);
+              planHash.Text = qualificationHash; }
+            else if (result.StartsWith("Reviewed qualification ", StringComparison.Ordinal))
+            { qualificationHash = result.Substring("Reviewed qualification ".Length, 64);
+              qualificationPresentedHash = qualificationHash;
+              if (!String.IsNullOrEmpty(connectedPlanHash)) planHash.Text = connectedPlanHash; }
+            else if (result.StartsWith("Pending qualification ", StringComparison.Ordinal))
+            { qualificationHash = result.Substring("Pending qualification ".Length, 64);
+              qualificationPresentedHash = qualificationHash; planHash.Text = qualificationHash; }
             else if (result.StartsWith("LAN journal ", StringComparison.Ordinal))
                 planHash.Text = result.Substring("LAN journal ".Length, 64);
             else if (result.StartsWith("Plan ", StringComparison.Ordinal) ||
                 result.StartsWith("Journal ", StringComparison.Ordinal))
             {
                 string candidate = result.Substring(result.IndexOf(' ') + 1);
-                if (candidate.Length >= 64) planHash.Text = candidate.Substring(0, 64);
+                if (candidate.Length >= 64)
+                {
+                    planHash.Text = candidate.Substring(0, 64);
+                    if (result.StartsWith("Plan ", StringComparison.Ordinal))
+                        connectedPlanHash = planHash.Text;
+                }
             }
             outcome.Text = result + "\nRefresh the feature observation after any approved change.";
         }

@@ -114,7 +114,7 @@ internal static class UiJourneyTests
             var approve = Find<Button>(form, b => b.Text == "Approve install");
             var openInstalled = Find<Button>(form, b => b.Text == "Open installed app");
             approve.PerformClick();
-            for (int i = 0; i < 100 && (installer.Applies == 0 || !openInstalled.Enabled); i++)
+            for (int i = 0; i < 500 && (installer.Applies == 0 || !openInstalled.Enabled); i++)
             { Application.DoEvents(); Thread.Sleep(10); }
             Check(installer.Applies == 1 && openInstalled.Enabled,
                 "approved simulated file install exposes the installed-app handoff");

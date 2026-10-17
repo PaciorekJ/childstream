@@ -19,6 +19,8 @@ $sources += (Join-Path $root 'src\WindowsChildAgentOperations.cs')
 $sources += (Join-Path $root 'src\AgentPairingBridge.cs')
 $sources += (Join-Path $root 'src\ChildAgentTaskInstaller.cs')
 $sources += (Join-Path $root 'src\SetupBoundary.cs')
+$sources += (Join-Path $root 'src\ConnectedQualification.cs')
+$sources += (Join-Path $root 'src\WindowsConnectedQualificationHost.cs')
 $sources += (Join-Path $root 'src\BoundedPipe.cs')
 $sources += (Join-Path $root 'src\ProductInstall.cs')
 $sources += (Join-Path $root 'src\ProductBundle.cs')
@@ -103,7 +105,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Synthetic controller witness tests failed.' }
 if ($LASTEXITCODE -ne 0) { throw 'Integrated runtime test compilation failed.' }
 & (Join-Path $artifacts 'IntegratedRuntimeTests.exe')
 if ($LASTEXITCODE -ne 0) { throw 'Integrated runtime tests failed.' }
-& $csc /nologo /target:exe /main:SetupBoundaryTests "/out:$artifacts\SetupBoundaryTests.exe" $productReferences $sources (Join-Path $PSScriptRoot 'SetupBoundaryTests.cs')
+& $csc /nologo /define:TEST_ONLY /target:exe /main:SetupBoundaryTests "/out:$artifacts\SetupBoundaryTests.exe" $productReferences $sources (Join-Path $PSScriptRoot 'SetupBoundaryTests.cs')
 if ($LASTEXITCODE -ne 0) { throw 'Scoped setup test compilation failed.' }
 & (Join-Path $artifacts 'SetupBoundaryTests.exe') (Join-Path $artifacts 'screenshots')
 if ($LASTEXITCODE -ne 0) { throw 'Scoped setup tests failed.' }
@@ -119,6 +121,8 @@ if ($LASTEXITCODE -ne 0) { throw 'Feasibility probe test compilation failed.' }
 if ($LASTEXITCODE -ne 0) { throw 'Offline feasibility probe tests failed.' }
 & $csc /nologo /target:exe /main:FeasibilityProbeProgram "/out:$artifacts\ChildStreamFeasibilityProbe.exe" /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll /r:Microsoft.CSharp.dll (Join-Path $root 'src\FeasibilityProbe.cs') (Join-Path $root 'src\WindowsFeasibilityHost.cs') (Join-Path $root 'src\FirewallRdpAssessment.cs') (Join-Path $root 'src\NetworkIsolationAssessment.cs') (Join-Path $root 'src\FeasibilityProbeProgram.cs') (Join-Path $root 'src\InstallerFoundation.cs') (Join-Path $root 'src\TransactionOwnership.cs') (Join-Path $root 'src\ChildSessionLifecycle.cs')
 if ($LASTEXITCODE -ne 0) { throw 'Windows feasibility adapter compilation failed.' }
+& (Join-Path $artifacts 'ChildStreamFeasibilityProbe.exe') prepare-a 2>$null
+if ($LASTEXITCODE -eq 0) { throw 'Standalone connected CLI retained an unqualified feature-write entry.' }
 $inventorySource = Get-Content (Join-Path $root 'scripts\feasibility-inventory.ps1') -Raw
 $rdpSource = Get-Content (Join-Path $root 'scripts\rdp-containment-observe.ps1') -Raw
 $rdpTokens = $null; $rdpErrors = $null

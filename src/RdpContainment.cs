@@ -176,6 +176,21 @@ internal sealed class RdpContainmentTransaction
         RdpContainmentObservation state = host.Read();
         return Digest(state.Baseline()) == saved.BaselineHash && Configured(state);
     }
+    internal bool VerifyRulesDuringFeature()
+    {
+        if (!File.Exists(journal)) return false;
+        ReadJournal();
+        RdpContainmentObservation state = host.Read();
+        return state != null && state.Complete && state.FeatureKnown && state.FeatureEnabled &&
+            state.PolicyDenied && state.ListenersAbsent && state.BypassCountKnown && state.BypassCount == 0 &&
+            (state.TermServiceState == "Running" || state.TermServiceState == "Stopped") &&
+            state.Profiles.Count == 3 && new[] { "Domain", "Private", "Public" }.All(name =>
+                state.Profiles.Count(p => p.Name == name && p.Enabled == "True" &&
+                    p.DefaultInboundAction == "Block" && p.AllowLocalFirewallRules == "True" &&
+                    p.ExclusionsKnown && p.ExcludedInterfaces.Count == 0) == 1) &&
+            OwnedExactly(state.PersistentRules, false) && OwnedExactly(state.ActiveRules, true);
+    }
+    internal RdpContainmentObservation Observation() { return host.Read(); }
     internal void Apply(string approvedHash)
     {
         if (!ProductInstallPayload.IsHex256(approvedHash))

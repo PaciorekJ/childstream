@@ -4,6 +4,8 @@ ChildStream is a Windows child-session and portable Sunshine proof of concept fo
 
 **Execution target:** The shared development workstation is blocked for Stage A/B under the permanent [scope boundary](docs/scope-boundary.md). ChildStream must not inspect or interrupt unrelated work, Docker Desktop, WSL2, Tailscale or shared networking to make a feasibility plan pass. No independent Windows target is currently available; its [minimum requirements and no-purchase options](docs/independent-test-environment.md) are documented. The next live test belongs on a [separate Windows environment](docs/stage-ab-physical-window.md); no host mutation is authorized by this repository.
 
+The [connected qualification handoff](docs/connected-qualification.md) now binds a reviewed, time-limited native WFP packet record to the exact containment and feature plan before the installed helper can write the child feature. The intended workstation has no qualifying packet evidence, so its connected feature path remains closed.
+
 Read the [architecture and security audit](docs/audit.md) and [live acceptance plan](docs/live-acceptance.md) before testing on a Windows host. The intended outcome is independent physical and remote interaction with separate capture, input, and audio; none of those hardware claims has been established by this branch.
 The [runtime map](docs/product-runtime-map.md) identifies which product classes are actually invoked and which still require connection and live Windows proof.
 

@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Runtime.InteropServices;
 using System.Security.AccessControl;
@@ -98,6 +99,18 @@ internal static class ProductInstallProgram
                 InstallerPolicy.ValidateCanonicalFilePath(requester, true);
                 if (File.Exists(Path.Combine(requester, "rdp-containment.journal")))
                     throw new InvalidOperationException("Recover exact requester-owned RDP containment before reversing installed code.");
+                if (new[] { "qualification.pending", "qualification.reviewed",
+                    "qualification.reviewed.hash", "qualification.used",
+                    "probe.journal.new", "probe.journal.prior" }.Any(name =>
+                    File.Exists(Path.Combine(requester, name))))
+                    throw new InvalidOperationException("Resolve exact requester setup and qualification journals before reversing installed code.");
+                string probePath = Path.Combine(requester, "probe.journal");
+                if (File.Exists(probePath))
+                {
+                    ProbeJournal past = new FileProbeStore(probePath).Load();
+                    if (past == null || past.Stage != ProbeStage.Restored)
+                        throw new InvalidOperationException("The child-feature journal is not verified restored.");
+                }
             }
         if (WindowsRdpContainmentHost.AnyOwnedPolicyRule())
             throw new InvalidOperationException("ChildStream RDP containment rules still exist; restore them before uninstall.");

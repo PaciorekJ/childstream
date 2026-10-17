@@ -14,7 +14,9 @@ internal enum SetupOperation : byte { PlanConnected = 1, BeginConnected = 2, Pre
     RestoreOriginal = 4, ReadJournal = 5, ReviewedRestore = 6,
     PlanLan = 7, ApplyLan = 8, RecoverLan = 9, ReadLanJournal = 10,
     PlanRdpContainment = 11, ApplyRdpContainment = 12,
-    ReadRdpContainment = 13, RecoverRdpContainment = 14 }
+    ReadRdpContainment = 13, RecoverRdpContainment = 14,
+    ObserveQualification = 15, ReviewQualification = 16, ReadQualification = 17,
+    RetireQualification = 18, VerifyStageA = 19 }
 
 internal sealed class SetupRequest
 {
@@ -27,7 +29,8 @@ internal sealed class SetupRequest
             Operation == SetupOperation.RecoverLan || Operation == SetupOperation.ReadLanJournal;
         bool readOnly = Operation == SetupOperation.PlanConnected || Operation == SetupOperation.ReadJournal ||
             Operation == SetupOperation.PlanLan || Operation == SetupOperation.ReadLanJournal ||
-            Operation == SetupOperation.PlanRdpContainment || Operation == SetupOperation.ReadRdpContainment;
+            Operation == SetupOperation.PlanRdpContainment || Operation == SetupOperation.ReadRdpContainment ||
+            Operation == SetupOperation.ReadQualification;
         if (lan)
         {
             System.Net.IPAddress address;
@@ -141,17 +144,27 @@ internal sealed class SetupTransaction
     private readonly IProbeStore store;
     private readonly LanFirewallTransaction lan;
     private readonly RdpContainmentTransaction containment;
-    private readonly bool requireLiveContainmentQualification;
+    private readonly ConnectedQualificationGate qualification;
+    private readonly bool unqualifiedTestFixture;
     private readonly string lanExecutableHash;
     internal SetupTransaction(FeasibilityProbe probe, IProbeStore store,
-        LanFirewallTransaction lan = null, RdpContainmentTransaction containment = null,
-        bool requireLiveContainmentQualification = false)
-    { this.probe = probe; this.store = store; this.lan = lan; this.containment = containment;
-      this.requireLiveContainmentQualification = requireLiveContainmentQualification;
+        LanFirewallTransaction lan, RdpContainmentTransaction containment,
+        ConnectedQualificationGate qualification)
+    { if (probe == null || containment == null || qualification == null)
+          throw new InvalidOperationException("Shipping setup requires probe, containment, and native qualification.");
+      this.probe = probe; this.store = store; this.lan = lan; this.containment = containment;
+      this.qualification = qualification; this.unqualifiedTestFixture = false;
       lanExecutableHash = SunshineReleasePin.ExecutableSha256; }
 #if TEST_ONLY
+    internal SetupTransaction(FeasibilityProbe probe, IProbeStore store)
+    { this.probe = probe; this.store = store; this.unqualifiedTestFixture = true;
+      lanExecutableHash = SunshineReleasePin.ExecutableSha256; }
+    internal SetupTransaction(FeasibilityProbe probe, IProbeStore store,
+        LanFirewallTransaction lan, RdpContainmentTransaction containment)
+    { this.probe = probe; this.store = store; this.lan = lan; this.containment = containment;
+      this.unqualifiedTestFixture = false; lanExecutableHash = SunshineReleasePin.ExecutableSha256; }
     internal SetupTransaction(LanFirewallTransaction lan, string fixtureExecutableHash)
-    { this.lan = lan; lanExecutableHash = fixtureExecutableHash; }
+    { this.lan = lan; this.unqualifiedTestFixture = true; lanExecutableHash = fixtureExecutableHash; }
 #endif
     internal string Execute(SetupRequest request, bool explicitlyApproved)
     {
@@ -174,6 +187,8 @@ internal sealed class SetupTransaction
                 containment.Apply(request.ApprovedPlanHash);
                 return "RDP containment configured in ActiveStore; live child-loopback qualification remains unrun.";
             }
+            if (qualification != null && qualification.HasActiveEvidence)
+                throw new InvalidOperationException("Retire reviewed packet evidence after verified feature restoration before removing containment.");
             containment.Recover(request.ApprovedPlanHash);
             return "Exact owned RDP containment rules restored.";
         }
@@ -200,9 +215,32 @@ internal sealed class SetupTransaction
         }
         if (request.Operation == SetupOperation.PlanConnected)
         {
-            ProbePlan plan = probe.Plan(ProbeNetworkPosture.ConnectedRdpGuard);
+            ProbePlan plan = !unqualifiedTestFixture && containment != null && containment.Verify()
+                ? probe.PlanQualifiedConnected(containment.JournalHash()) :
+                probe.Plan(ProbeNetworkPosture.ConnectedRdpGuard);
             return "Plan " + plan.Hash + "; feature=" + plan.Original.FeatureEnabled +
                 "; parent=" + plan.Original.ParentSessionId + ":" + plan.Original.ParentLogonTime;
+        }
+        if (request.Operation == SetupOperation.ReadQualification)
+            return qualification == null ? "Qualification unavailable." : qualification.Status();
+        if (request.Operation == SetupOperation.ObserveQualification ||
+            request.Operation == SetupOperation.ReviewQualification ||
+            request.Operation == SetupOperation.RetireQualification)
+        {
+            if (qualification == null || containment == null || !containment.Verify())
+                throw new InvalidOperationException("Verified owned containment is required before packet qualification.");
+            ProbePlan plan = probe.PlanQualifiedConnected(containment.JournalHash());
+            if (!explicitlyApproved) throw new InvalidOperationException("Qualification capture/review was not approved.");
+            if (request.Operation == SetupOperation.RetireQualification)
+                return qualification.Retire(request.ApprovedPlanHash, store == null ? null : store.Load(),
+                    plan, containment);
+            if (request.Operation == SetupOperation.ObserveQualification)
+            {
+                if (plan.Hash != request.ApprovedPlanHash)
+                    throw new InvalidOperationException("The exact connected plan changed before observation.");
+                return qualification.Observe(plan, containment, containment.Observation());
+            }
+            return qualification.Review(request.ApprovedPlanHash, plan, containment);
         }
         if (request.Operation == SetupOperation.ReadJournal)
         {
@@ -210,13 +248,44 @@ internal sealed class SetupTransaction
             return journal == null ? "No ChildStream setup journal for this requester." :
                 "Journal " + journal.Plan.Hash + "; stage=" + journal.Stage;
         }
+        if (request.Operation == SetupOperation.VerifyStageA)
+        {
+            if (!explicitlyApproved || store == null) throw new InvalidOperationException("Separate Stage A review is required.");
+            ProbeJournal stageA = store.Load();
+            if (stageA == null || stageA.Plan.Original.FormatVersion != 7 ||
+                stageA.Plan.Hash != request.ApprovedPlanHash || containment == null ||
+                !containment.VerifyRulesDuringFeature())
+                throw new InvalidOperationException("Exact qualified journal or owned containment changed.");
+            ProbeJournal verified = probe.ResumeAfterFreshLogon();
+            return "Journal " + verified.Plan.Hash + "; stage=" + verified.Stage +
+                "; child loopback still requires separate Stage B approval.";
+        }
         if (!explicitlyApproved) throw new InvalidOperationException("The exact setup transition was not approved.");
-        if (requireLiveContainmentQualification && (request.Operation == SetupOperation.BeginConnected ||
+        if (!unqualifiedTestFixture && (request.Operation == SetupOperation.BeginConnected ||
             request.Operation == SetupOperation.PrepareFeature))
         {
             if (containment == null || !containment.Verify())
                 throw new InvalidOperationException("Effective owned RDP containment is not verified; zero feature writes.");
-            throw new InvalidOperationException("Live child-loopback and remote-path qualification is unrun; zero feature writes.");
+            if (qualification == null)
+                throw new InvalidOperationException("Independent packet qualification is unavailable; zero feature writes.");
+            ProbePlan qualified = probe.PlanQualifiedConnected(containment.JournalHash());
+            if (qualified.Hash != request.ApprovedPlanHash)
+                throw new InvalidOperationException("The approved connected plan is stale; zero feature writes.");
+            if (request.Operation == SetupOperation.BeginConnected)
+            {
+                qualification.Admit(qualified, containment, true);
+                ProbeJournal begun = probe.Begin(qualified, request.ApprovedPlanHash, true);
+                return "Journal " + begun.Plan.Hash + "; stage=" + begun.Stage +
+                    "; feature still disabled; Stage A requires separate approval.";
+            }
+            ProbeJournal prior = store == null ? null : store.Load();
+            if (prior == null || prior.Plan.Hash != qualified.Hash || prior.Stage != ProbeStage.Captured)
+                throw new InvalidOperationException("No exact captured qualified journal exists; zero feature writes.");
+            qualification.Admit(qualified, containment, false);
+            ProbeJournal prepared = probe.PrepareFeature();
+            if (!containment.VerifyRulesDuringFeature())
+                throw new InvalidOperationException("Post-enable owned containment or listener readback is uncertain; retain the feature journal and blocks for reviewed recovery.");
+            return "Journal " + prepared.Plan.Hash + "; stage=" + prepared.Stage;
         }
         if (request.Operation == SetupOperation.BeginConnected)
         {
@@ -369,6 +438,11 @@ internal static class SetupPrivateJournal
             string name = Path.GetFileName(file);
             if (name != "probe.journal" && name != "probe.journal.new" && name != "probe.journal.prior" &&
                 name != "probe.lock" && name != "rdp-containment.journal" &&
+                name != "qualification.pending" && name != "qualification.reviewed" &&
+                name != "qualification.reviewed.hash" &&
+                name != "qualification.used" &&
+                !System.Text.RegularExpressions.Regex.IsMatch(name,
+                    "\\Aqualification\\.(pending|reviewed|reviewed\\.hash|used)\\.retired\\.[0-9a-f]{64}\\z") &&
                 !System.Text.RegularExpressions.Regex.IsMatch(name,
                     "\\Ardp-containment\\.journal\\.restored\\.[0-9a-f]{64}\\z") &&
                 !name.StartsWith("probe.journal.interrupted-", StringComparison.Ordinal))
@@ -433,6 +507,7 @@ internal static class SetupHelperProgram
                     request.Operation == SetupOperation.ReadLanJournal ||
                     request.Operation == SetupOperation.PlanRdpContainment ||
                     request.Operation == SetupOperation.ReadRdpContainment ||
+                    request.Operation == SetupOperation.ReadQualification ||
                     MessageBox.Show("Approve this exact ChildStream operation?\n" + request.Operation +
                         "\nPlan SHA-256: " + request.ApprovedPlanHash + "\nRequesting SID: " + requesterSid +
                         (String.IsNullOrEmpty(request.LanAddress) ? "" : "\nSelected LAN IPv4: " + request.LanAddress) +
@@ -442,6 +517,11 @@ internal static class SetupHelperProgram
                             ? "\nThis changes only two exact ChildStream-owned TermService firewall rules; no feature write or sign-out."
                             : request.Operation == SetupOperation.ApplyLan || request.Operation == SetupOperation.RecoverLan
                             ? "\nThis changes only the two exact ChildStream-owned LAN firewall rules; no RDP or sign-out change."
+                            : request.Operation == SetupOperation.ObserveQualification ||
+                              request.Operation == SetupOperation.ReviewQualification ||
+                              request.Operation == SetupOperation.RetireQualification ||
+                              request.Operation == SetupOperation.VerifyStageA
+                            ? "\nThis records or reviews setup evidence only; no feature write, child creation, or sign-out."
                             : "\nFeature changes, if separately qualified, have their own transaction. No automatic sign-out."),
                         "ChildStream privileged setup", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes;
                 try
@@ -461,7 +541,11 @@ internal static class SetupHelperProgram
                         request.Operation == SetupOperation.ApplyRdpContainment ||
                         request.Operation == SetupOperation.ReadRdpContainment ||
                         request.Operation == SetupOperation.RecoverRdpContainment;
-                    string dir = request.Operation == SetupOperation.PlanConnected || lanOperation || rdpOperation ? null :
+                    bool qualificationOperation = request.Operation == SetupOperation.ObserveQualification ||
+                        request.Operation == SetupOperation.ReviewQualification ||
+                        request.Operation == SetupOperation.ReadQualification;
+                    string dir = request.Operation == SetupOperation.PlanConnected || lanOperation || rdpOperation ||
+                        qualificationOperation ? null :
                         SetupPrivateJournal.PathFor(requesterSid, request.Operation == SetupOperation.BeginConnected);
                     var store = dir == null ? null : new FileProbeStore(Path.Combine(dir, "probe.journal"));
                     var host = new WindowsFeasibilityHost(new ScriptProbeInventory(script), new ProbeNative(),
@@ -481,7 +565,8 @@ internal static class SetupHelperProgram
                         new LanFirewallTransaction(new WindowsLanFirewallHost(), installedRoot,
                             lanExecutable, new SunshinePortFamily(48089)) : null;
                     string rdpDir = SetupPrivateJournal.PathFor(requesterSid,
-                        request.Operation == SetupOperation.ApplyRdpContainment);
+                        request.Operation == SetupOperation.ApplyRdpContainment ||
+                        request.Operation == SetupOperation.ObserveQualification);
                     if (rdpDir == null)
                         rdpDir = Path.Combine(Environment.GetFolderPath(
                             Environment.SpecialFolder.CommonApplicationData), "ChildStream", "setup", requesterSid);
@@ -489,7 +574,9 @@ internal static class SetupHelperProgram
                         new WindowsRdpContainmentHost(SetupInstallTrust.RequireOwnedPath(
                             "rdp-containment-observe.ps1")), rdpDir,
                         SetupInstallTrust.AccountHash(requesterSid));
-                    string result = new SetupTransaction(probe, store, lan, containment, true)
+                    var qualification = new ConnectedQualificationGate(new WindowsConnectedQualificationHost(),
+                        rdpDir, SetupInstallTrust.AccountHash(requesterSid));
+                    string result = new SetupTransaction(probe, store, lan, containment, qualification)
                         .Execute(request, approved);
                     bounded.ResetDeadline(30000);
                     SetupWire.SendResult(bounded, true, result);
