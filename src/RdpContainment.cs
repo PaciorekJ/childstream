@@ -162,6 +162,14 @@ internal sealed class RdpContainmentTransaction
             OriginalTermServiceState = lines[4], OriginalRdpPort = port };
     }
     internal string JournalHash() { return ReadJournal().Hash; }
+    internal long EvidenceAnchorTicks()
+    {
+        ReadJournal();
+        DateTime created = File.GetCreationTimeUtc(journal);
+        if (created.Year < 2020 || created > DateTime.UtcNow.AddMinutes(1))
+            throw new InvalidOperationException("Owned containment journal creation time is unavailable or implausible.");
+        return created.Ticks;
+    }
     internal string BaselineSummary()
     {
         RdpContainmentPlan saved = ReadJournal();

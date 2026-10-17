@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
@@ -57,10 +58,34 @@ internal static class SetupBoundaryTests
     }
     private sealed class PacketHost : IConnectedQualificationHost
     {
-        internal long Now = new DateTime(2026, 10, 16, 12, 0, 0, DateTimeKind.Utc).Ticks;
+        internal long Now = DateTime.UtcNow.AddMinutes(2).Ticks;
         internal QualificationBoundary Boundary = new QualificationBoundary { MachineId = "machine-1" };
         public long UtcNowTicks { get { return Now; } }
-        public QualificationBoundary Observe(long since, int port) { return Boundary; }
+        public QualificationBoundary Observe(long since, int port)
+        {
+            var result = new QualificationBoundary { MachineId = Boundary.MachineId };
+            result.Interfaces.AddRange(Boundary.Interfaces);
+            var events = new Queue<QualificationLogItem>(Boundary.Drops.Select(x =>
+                new QualificationLogItem { Id = 5157, RecordId = x.RecordId,
+                    UtcTicks = x.UtcTicks, Xml = NativeEvent(x) }));
+            result.Drops.AddRange(WindowsConnectedQualificationHost.ReadWindow(
+                () => events.Count == 0 ? null : events.Dequeue(), since, Now,
+                Boundary.Interfaces.SelectMany(x => x.Addresses.Split(',')).ToArray(), port));
+            return result;
+        }
+        internal static string NativeEvent(QualificationDrop drop)
+        {
+            return "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'>" +
+                "<System><Provider Name='Microsoft-Windows-Security-Auditing'/><EventID>5157</EventID>" +
+                "<Channel>Security</Channel></System><EventData>" +
+                "<Data Name='Direction'>%%14592</Data><Data Name='SourceAddress'>" +
+                drop.RemoteAddress + "</Data><Data Name='SourcePort'>49152</Data>" +
+                "<Data Name='DestAddress'>" + drop.LocalAddress + "</Data>" +
+                "<Data Name='DestPort'>" + drop.LocalPort + "</Data>" +
+                "<Data Name='Protocol'>" + drop.Protocol + "</Data>" +
+                "<Data Name='InterfaceIndex'>" + drop.InterfaceIndex + "</Data>" +
+                "<Data Name='FilterOrigin'>" + drop.FilterOrigin + "</Data></EventData></Event>";
+        }
         internal void AddPath(int index, string path, int port)
         {
             Boundary.Interfaces.Add(new QualificationInterface { Index = index, Path = path,
@@ -207,12 +232,96 @@ internal static class SetupBoundaryTests
         Check(WindowsConnectedQualificationHost.ParseSecurityEvent(
             eventXml.Replace("%%14592", "Outbound"), 92, 100, new[] { "192.0.2.5" }, 3391) == null,
             "outbound event is not inbound denial proof");
-        Check(WindowsConnectedQualificationHost.ParseSecurityEvent(
+        Reject(() => WindowsConnectedQualificationHost.ParseSecurityEvent(
             eventXml.Replace("<Data Name='FilterOrigin'>", "<Data Name='Other'>"),
-            92, 100, new[] { "192.0.2.5" }, 3391) == null,
-            "missing filter origin cannot become packet proof");
+            92, 100, new[] { "192.0.2.5" }, 3391),
+            "malformed relevant filter origin rejects native acquisition");
         Check(WindowsConnectedQualificationHost.ParseSecurityEvent(eventXml, 92, 100,
             new[] { "192.0.2.5" }, 3389) == null, "wrong RDP port cannot become packet proof");
+        Check(ConnectedQualificationGate.Address("FE80::1%51") == "fe80::1%51",
+            "scoped IPv6 link-local identity canonicalizes without losing interface scope");
+        Reject(() => ConnectedQualificationGate.Address("fe80::1"),
+            "unscoped IPv6 link-local identity rejects");
+        Reject(() => ConnectedQualificationGate.Address("::ffff:192.0.2.5"),
+            "mapped IPv6 alias rejects instead of being counted as dual-stack coverage");
+        long logNow = DateTime.UtcNow.Ticks, logSince = logNow - TimeSpan.TicksPerMinute;
+        string nativeQuery = WindowsConnectedQualificationHost.QueryForWindow(logSince, logNow);
+        Check(nativeQuery.Contains("TimeCreated[timediff(@SystemTime) <=") &&
+            nativeQuery.Contains("EventID=1102"),
+            "native Security query bounds time and includes log-clear detection");
+        var recentAndHistory = new Queue<QualificationLogItem>();
+        recentAndHistory.Enqueue(new QualificationLogItem { Id = 5157, RecordId = 92,
+            UtcTicks = logNow - TimeSpan.TicksPerSecond, Xml = eventXml });
+        for (int i = 0; i < 4200; i++)
+            recentAndHistory.Enqueue(new QualificationLogItem { Id = 5157, RecordId = 91 - i,
+                UtcTicks = logSince - TimeSpan.TicksPerSecond, Xml = eventXml });
+        var recent = WindowsConnectedQualificationHost.ReadWindow(
+            () => recentAndHistory.Count == 0 ? null : recentAndHistory.Dequeue(),
+            logSince, logNow, new[] { "192.0.2.5" }, 3391);
+        Check(recent.Count == 1 && recent[0].RecordId == 92,
+            "old Security history beyond 4096 events cannot exhaust the native recent-window limit");
+        var overloaded = new Queue<QualificationLogItem>();
+        for (int i = 0; i < 4097; i++) overloaded.Enqueue(new QualificationLogItem {
+            Id = 5157, RecordId = i + 1, UtcTicks = logNow - 1, Xml = eventXml });
+        Reject(() => WindowsConnectedQualificationHost.ReadWindow(
+            () => overloaded.Count == 0 ? null : overloaded.Dequeue(), logSince, logNow,
+            new[] { "192.0.2.5" }, 3391),
+            "overloaded current Security window rejects without truncated acceptance");
+        foreach (var abnormal in new[] {
+            new QualificationLogItem { Id = 5157, RecordId = 1, UtcTicks = null, Xml = eventXml },
+            new QualificationLogItem { Id = 5157, RecordId = 2, UtcTicks = logNow + 1, Xml = eventXml },
+            new QualificationLogItem { Id = 1102, RecordId = 3, UtcTicks = logNow - 1 },
+            new QualificationLogItem { Id = 5157, RecordId = 4, UtcTicks = logNow - 1,
+                Xml = eventXml.Replace("<Data Name='FilterOrigin'>", "<Data Name='Other'>") } })
+        {
+            var nextAbnormal = abnormal;
+            Reject(() => WindowsConnectedQualificationHost.ReadWindow(
+                () => { var value = nextAbnormal; nextAbnormal = null; return value; },
+                logSince, logNow, new[] { "192.0.2.5" }, 3391),
+                "missing time, future time, cleared log, and malformed current evidence reject");
+        }
+        Guid switchId = Guid.NewGuid(), hostPortId = Guid.NewGuid();
+        string switchName = "WSL (Hyper-V firewall)";
+        string encodedSwitchName = Convert.ToBase64String(
+            System.Text.Encoding.UTF8.GetBytes(switchName));
+        string hostGraph = "S|" + switchId + "|Internal|" + encodedSwitchName + "\n" +
+            "P|" + hostPortId + "|00155D010203|" + switchId + "|" + encodedSwitchName;
+        var topology = WindowsConnectedQualificationHost.ParseHostTopology(hostGraph);
+        var testAdapters = new List<QualificationAdapter> {
+            new QualificationAdapter { Index = 7, Relevant = true, Physical = true,
+                Id = "physical-guid", Name = "Wi-Fi", Description = "Physical Wi-Fi",
+                Mac = "AABBCCDDEEFF", Type = "Wireless80211", Addresses = "192.0.2.5" },
+            new QualificationAdapter { Index = 51, Relevant = true, Physical = false,
+                Id = "host-guid", Name = "vEthernet (" + switchName + ")",
+                Description = "Hyper-V Virtual Ethernet Adapter #2", Mac = "00155D010203",
+                Type = "Ethernet", Addresses = "172.28.1.1" },
+            new QualificationAdapter { Index = 8, Relevant = true, Physical = false,
+                Id = "tunnel-guid", Name = "Tailscale", Description = "Tailscale Tunnel",
+                Mac = "000000000000", Type = "Tunnel", Addresses = "100.64.0.1" } };
+        var classified = WindowsConnectedQualificationHost.ClassifyAdapters(testAdapters, topology);
+        Check(classified.Single(x => x.Index == 7).Path == "External" &&
+            classified.Single(x => x.Index == 51).Path == "Guest" &&
+            classified.Single(x => x.Index == 51).Identity.Contains(hostPortId.ToString("D")) &&
+            classified.Single(x => x.Index == 51).Identity.Contains(switchId.ToString("D")) &&
+            classified.Single(x => x.Index == 8).Path == "Unknown",
+            "unique internal Hyper-V #2 host port is guest-facing; unmatched tunnel remains unknown");
+        testAdapters.Add(new QualificationAdapter { Index = 52, Relevant = false, Physical = false,
+            Mac = "00155D010203" });
+        Check(WindowsConnectedQualificationHost.ClassifyAdapters(testAdapters, topology)
+            .Single(x => x.Index == 51).Path == "Unknown",
+            "duplicate MAC even on inactive adapter defeats host-port attribution");
+        testAdapters.RemoveAt(testAdapters.Count - 1);
+        testAdapters[1].Name = "vEthernet (other switch)";
+        Check(WindowsConnectedQualificationHost.ClassifyAdapters(testAdapters, topology)
+            .Single(x => x.Index == 51).Path == "Unknown",
+            "mismatched switch name defeats host-port attribution");
+        testAdapters[1].Name = "vEthernet (" + switchName + ")";
+        topology.Switches[0].Type = "External";
+        Check(WindowsConnectedQualificationHost.ClassifyAdapters(testAdapters, topology)
+            .Single(x => x.Index == 51).Path == "Unknown",
+            "external switch cannot become guest-only attribution");
+        Reject(() => WindowsConnectedQualificationHost.ParseHostTopology(hostGraph + "\n" +
+            hostGraph.Split('\n')[1]), "duplicate native host-port identity is rejected");
         string versionedDir = Path.Combine(Directory.GetCurrentDirectory(), "tests", ".artifacts",
             "ChildStream-v7-journal-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(versionedDir);
@@ -309,6 +418,47 @@ internal static class SetupBoundaryTests
                 "no packet record never admits a feature journal");
             Check(native.Writes == 0 && qualifiedStore.Journal == null,
                 "missing evidence produces zero feature writes");
+            long originalPacketTime = packets.Boundary.Drops[0].UtcTicks;
+            packets.Boundary.Drops[0].UtcTicks = DateTime.UtcNow.AddMinutes(-1).Ticks;
+            Reject(() => connected.Execute(Request(SetupOperation.ObserveQualification, connectedHash), true),
+                "owned-rule packet evidence predating the containment journal rejects");
+            packets.Boundary.Drops[0].UtcTicks = originalPacketTime;
+            packets.Boundary.Interfaces[0].Addresses = "192.0.2.5,2001:db8::5";
+            Reject(() => connected.Execute(Request(SetupOperation.ObserveQualification, connectedHash), true),
+                "IPv4-only TCP and UDP cannot qualify a dual-stack external path");
+            Check(native.Writes == 0, "dual-stack coverage failure has zero feature writes");
+            var v6Tcp = new QualificationDrop { RecordId = 7001, UtcTicks = packets.Now - TimeSpan.TicksPerMinute,
+                InterfaceIndex = 7, Protocol = 6, LocalPort = 3391,
+                LocalAddress = "2001:db8::5", RemoteAddress = "2001:db8::4",
+                FilterOrigin = RdpContainmentTransaction.Expected(6).Name };
+            var v6Udp = new QualificationDrop { RecordId = 7002, UtcTicks = packets.Now - TimeSpan.TicksPerMinute,
+                InterfaceIndex = 7, Protocol = 17, LocalPort = 3391,
+                LocalAddress = "2001:db8::5", RemoteAddress = "2001:db8::4",
+                FilterOrigin = RdpContainmentTransaction.Expected(17).Name };
+            packets.Boundary.Drops.Add(v6Tcp);
+            Reject(() => connected.Execute(Request(SetupOperation.ObserveQualification, connectedHash), true),
+                "missing IPv6 UDP rejects dual-stack qualification");
+            packets.Boundary.Drops.Add(v6Udp);
+            var v4Drops = packets.Boundary.Drops.Where(x => x.InterfaceIndex == 7 &&
+                x.LocalAddress == "192.0.2.5").ToArray();
+            foreach (var drop in v4Drops) packets.Boundary.Drops.Remove(drop);
+            Reject(() => connected.Execute(Request(SetupOperation.ObserveQualification, connectedHash), true),
+                "IPv6-only evidence cannot qualify the IPv4 address");
+            packets.Boundary.Drops.AddRange(v4Drops);
+            v6Tcp.RemoteAddress = "192.0.2.4";
+            Reject(() => connected.Execute(Request(SetupOperation.ObserveQualification, connectedHash), true),
+                "wrong-family source cannot satisfy IPv6 packet coverage");
+            v6Tcp.RemoteAddress = "2001:db8::4";
+            packets.Boundary.Interfaces[0].Addresses += ",fe80::1";
+            Reject(() => connected.Execute(Request(SetupOperation.ObserveQualification, connectedHash), true),
+                "unscoped link-local interface address is ambiguous");
+            packets.Boundary.Interfaces[0].Addresses = "192.0.2.5,2001:db8::5,fe80::1%51";
+            Reject(() => connected.Execute(Request(SetupOperation.ObserveQualification, connectedHash), true),
+                "link-local scope for a different interface is ambiguous");
+            packets.Boundary.Interfaces[0].Addresses = "192.0.2.5,2001:db8::5,::ffff:192.0.2.5";
+            Reject(() => connected.Execute(Request(SetupOperation.ObserveQualification, connectedHash), true),
+                "IPv4-mapped IPv6 alias cannot silently supply another family");
+            packets.Boundary.Interfaces[0].Addresses = "192.0.2.5,2001:db8::5";
             packets.Boundary.Interfaces[1].Path = "Unknown";
             Reject(() => connected.Execute(Request(SetupOperation.ObserveQualification, connectedHash), true),
                 "unattributed virtual path fails closed");
@@ -381,6 +531,10 @@ internal static class SetupBoundaryTests
             Reject(() => connected.Execute(Request(SetupOperation.BeginConnected, connectedHash), true),
                 "requester drift blocks admission");
             native.State.AccountBinding = new string('a',64);
+            packets.Boundary.Interfaces[0].Addresses = "192.0.2.5,2001:db8::6";
+            Reject(() => connected.Execute(Request(SetupOperation.BeginConnected, connectedHash), true),
+                "changed IPv6 address identity blocks reviewed admission");
+            packets.Boundary.Interfaces[0].Addresses = "192.0.2.5,2001:db8::5";
             packets.Now += TimeSpan.TicksPerMinute;
             native.State.NetworkFingerprint = "drift";
             Reject(() => connected.Execute(Request(SetupOperation.BeginConnected, connectedHash), true),

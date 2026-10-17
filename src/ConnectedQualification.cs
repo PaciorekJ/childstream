@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -36,9 +38,10 @@ internal interface IConnectedQualificationHost
 }
 internal sealed class QualificationRecord
 {
+    internal int Version = 2;
     internal string MachineId, AccountHash, PlanHash, ContainmentHash, NetworkFingerprint,
         FirewallFingerprint, InterfaceFingerprint;
-    internal int WindowsBuild, RdpPort, ExternalPaths, GuestPaths;
+    internal int WindowsBuild, RdpPort, ExternalPaths, GuestPaths, AddressCount;
     internal long CapturedUtcTicks, ExpiresUtcTicks;
     internal readonly List<QualificationDrop> Drops = new List<QualificationDrop>();
     internal string Hash;
@@ -47,12 +50,13 @@ internal sealed class QualificationRecord
         using (var stream = new MemoryStream())
         using (var writer = new BinaryWriter(stream, Encoding.UTF8))
         {
-            writer.Write("ChildStream.ConnectedQualification.v1");
+            writer.Write("ChildStream.ConnectedQualification.v" + Version);
             writer.Write(MachineId); writer.Write(AccountHash); writer.Write(PlanHash);
             writer.Write(ContainmentHash); writer.Write(NetworkFingerprint);
             writer.Write(FirewallFingerprint); writer.Write(InterfaceFingerprint);
             writer.Write(WindowsBuild); writer.Write(RdpPort);
             writer.Write(ExternalPaths); writer.Write(GuestPaths);
+            if (Version >= 2) writer.Write(AddressCount);
             writer.Write(CapturedUtcTicks); writer.Write(ExpiresUtcTicks);
             writer.Write(Drops.Count);
             foreach (var drop in Drops.OrderBy(x => x.InterfaceIndex).ThenBy(x => x.Protocol))
@@ -66,17 +70,21 @@ internal sealed class QualificationRecord
         using (var stream = new MemoryStream(bytes))
         using (var reader = new BinaryReader(stream, Encoding.UTF8))
         {
-            if (reader.ReadString() != "ChildStream.ConnectedQualification.v1")
+            string marker = reader.ReadString();
+            if (marker != "ChildStream.ConnectedQualification.v1" &&
+                marker != "ChildStream.ConnectedQualification.v2")
                 throw new InvalidDataException("Unknown qualification version.");
-            var r = new QualificationRecord { MachineId = reader.ReadString(), AccountHash = reader.ReadString(),
+            var r = new QualificationRecord { Version = marker.EndsWith("v2") ? 2 : 1,
+                MachineId = reader.ReadString(), AccountHash = reader.ReadString(),
                 PlanHash = reader.ReadString(), ContainmentHash = reader.ReadString(),
                 NetworkFingerprint = reader.ReadString(), FirewallFingerprint = reader.ReadString(),
                 InterfaceFingerprint = reader.ReadString(), WindowsBuild = reader.ReadInt32(),
                 RdpPort = reader.ReadInt32(), ExternalPaths = reader.ReadInt32(),
-                GuestPaths = reader.ReadInt32(), CapturedUtcTicks = reader.ReadInt64(),
-                ExpiresUtcTicks = reader.ReadInt64() };
+                GuestPaths = reader.ReadInt32() };
+            if (r.Version >= 2) r.AddressCount = reader.ReadInt32();
+            r.CapturedUtcTicks = reader.ReadInt64(); r.ExpiresUtcTicks = reader.ReadInt64();
             int count = reader.ReadInt32();
-            if (count < 0 || count > 32) throw new InvalidDataException("Qualification coverage is unbounded.");
+            if (count < 0 || count > 64) throw new InvalidDataException("Qualification coverage is unbounded.");
             for (int i = 0; i < count; i++)
             {
                 string[] parts = reader.ReadString().Split('|');
@@ -110,7 +118,24 @@ internal sealed class ConnectedQualificationGate
     private string Used { get { return Path.Combine(root, "qualification.used"); } }
     internal bool HasActiveEvidence
     { get { return File.Exists(Pending) || File.Exists(Reviewed) || File.Exists(ReviewHash) || File.Exists(Used); } }
-    private static string Interfaces(QualificationBoundary boundary)
+    // Each distinct assigned address is a separate obligation. A mapped IPv6
+    // address is not evidence for either family, and a link-local IPv6 address
+    // without an interface scope cannot be attributed unambiguously.
+    internal static string Address(string value)
+    {
+        IPAddress parsed;
+        if (String.IsNullOrWhiteSpace(value) || !IPAddress.TryParse(value, out parsed) ||
+            IPAddress.IsLoopback(parsed) || parsed.Equals(IPAddress.Any) ||
+            parsed.Equals(IPAddress.IPv6Any) || parsed.IsIPv4MappedToIPv6 ||
+            parsed.AddressFamily == AddressFamily.InterNetwork &&
+                parsed.GetAddressBytes()[0] >= 224 ||
+            parsed.AddressFamily == AddressFamily.InterNetworkV6 &&
+                (parsed.IsIPv6Multicast || parsed.IsIPv6LinkLocal && parsed.ScopeId == 0 ||
+                 !parsed.IsIPv6LinkLocal && parsed.ScopeId != 0))
+            throw new InvalidOperationException("An interface or packet address is ambiguous or unsupported.");
+        return parsed.ToString().ToLowerInvariant();
+    }
+    private static Dictionary<int, string[]> Obligations(QualificationBoundary boundary)
     {
         if (boundary == null || String.IsNullOrWhiteSpace(boundary.MachineId) ||
             boundary.Interfaces.Count == 0 || boundary.Interfaces.Count > 16 ||
@@ -120,24 +145,47 @@ internal sealed class ConnectedQualificationGate
             boundary.Interfaces.Select(x => x.Index).Distinct().Count() != boundary.Interfaces.Count ||
             !boundary.Interfaces.Any(x => x.Path == "External"))
             throw new InvalidOperationException("Relevant physical/virtual paths are unknown or incomplete.");
+        var result = new Dictionary<int, string[]>();
+        foreach (var path in boundary.Interfaces)
+        {
+            string[] addresses = path.Addresses.Split(',').Select(Address)
+                .OrderBy(x => x, StringComparer.Ordinal).ToArray();
+            if (addresses.Length == 0 || addresses.Distinct().Count() != addresses.Length)
+                throw new InvalidOperationException("Interface address identity is empty or duplicated.");
+            if (addresses.Any(x => { IPAddress ip = IPAddress.Parse(x);
+                return ip.AddressFamily == AddressFamily.InterNetworkV6 && ip.IsIPv6LinkLocal &&
+                    ip.ScopeId != path.Index; }))
+                throw new InvalidOperationException("Link-local scope does not identify its interface.");
+            result.Add(path.Index, addresses);
+        }
+        if (result.Values.Sum(x => x.Length) > 32)
+            throw new InvalidOperationException("Qualification has more than 32 relevant addresses.");
+        return result;
+    }
+    private static string Interfaces(QualificationBoundary boundary)
+    {
+        var addresses = Obligations(boundary);
         return ProbeCodec.Hash(Encoding.UTF8.GetBytes(String.Join("\n", boundary.Interfaces
-            .OrderBy(x => x.Index).Select(x => x.Index + "|" + x.Path + "|" + x.Identity + "|" + x.Addresses))));
+            .OrderBy(x => x.Index).Select(x => x.Index + "|" + x.Path + "|" + x.Identity + "|" +
+                String.Join(",", addresses[x.Index])))));
     }
     private static List<QualificationDrop> Covered(QualificationBoundary boundary, int port, long now)
     {
+        var addresses = Obligations(boundary);
         var selected = new List<QualificationDrop>();
         foreach (var path in boundary.Interfaces)
+          foreach (string local in addresses[path.Index])
             foreach (int protocol in new[] { 6, 17 })
             {
                 string origin = RdpContainmentTransaction.Expected(protocol).Name;
                 QualificationDrop drop = boundary.Drops.Where(x => x.InterfaceIndex == path.Index &&
                     x.Protocol == protocol && x.FilterOrigin == origin && x.LocalPort == port &&
                     x.RecordId > 0 && x.UtcTicks >= now - Window && x.UtcTicks <= now &&
-                    ValidNonLoopback(x.RemoteAddress) && ValidNonLoopback(x.LocalAddress) &&
-                    path.Addresses.Split(',').Contains(x.LocalAddress))
+                    MatchingAddress(x.LocalAddress, local) && SameFamily(x.RemoteAddress, local))
                     .OrderByDescending(x => x.UtcTicks).FirstOrDefault();
                 if (drop == null) throw new InvalidOperationException("An exact owned-rule WFP drop is missing for " +
-                    path.Path + " interface " + path.Index + " protocol " + protocol + ".");
+                    path.Path + " interface " + path.Index + " address " + local +
+                    " protocol " + protocol + ".");
                 selected.Add(drop);
             }
         if (selected.Select(x => x.RecordId).Distinct().Count() != selected.Count)
@@ -146,29 +194,38 @@ internal sealed class ConnectedQualificationGate
     }
     private static void RequireStoredCoverage(QualificationBoundary boundary, QualificationRecord r)
     {
-        if (r.Drops.Count != boundary.Interfaces.Count * 2 ||
+        var addresses = Obligations(boundary);
+        if (r.AddressCount != addresses.Values.Sum(x => x.Length) ||
+            r.Drops.Count != r.AddressCount * 2 ||
             r.Drops.Select(x => x.RecordId).Distinct().Count() != r.Drops.Count)
             throw new InvalidOperationException("Qualification packet coverage is incomplete or reused.");
         foreach (var path in boundary.Interfaces)
+          foreach (string local in addresses[path.Index])
             foreach (int protocol in new[] { 6, 17 })
             {
-                var recorded = r.Drops.Where(x => x.InterfaceIndex == path.Index && x.Protocol == protocol).ToArray();
+                var recorded = r.Drops.Where(x => x.InterfaceIndex == path.Index &&
+                    x.Protocol == protocol && MatchingAddress(x.LocalAddress, local)).ToArray();
                 if (recorded.Length != 1 || recorded[0].FilterOrigin != RdpContainmentTransaction.Expected(protocol).Name ||
                     recorded[0].LocalPort != r.RdpPort ||
                     recorded[0].UtcTicks < r.CapturedUtcTicks - Window ||
                     recorded[0].UtcTicks > r.CapturedUtcTicks ||
-                    !ValidNonLoopback(recorded[0].RemoteAddress) ||
-                    !ValidNonLoopback(recorded[0].LocalAddress) ||
-                    !path.Addresses.Split(',').Contains(recorded[0].LocalAddress))
+                    !SameFamily(recorded[0].RemoteAddress, local))
                     throw new InvalidOperationException("Qualification packet coverage has a wrong origin or path.");
             }
     }
-    private static bool ValidNonLoopback(string text)
+    private static bool MatchingAddress(string candidate, string expected)
     {
-        System.Net.IPAddress ip;
-        return System.Net.IPAddress.TryParse(text, out ip) &&
-            !System.Net.IPAddress.IsLoopback(ip) && !ip.Equals(System.Net.IPAddress.Any) &&
-            !ip.Equals(System.Net.IPAddress.IPv6Any);
+        try { return Address(candidate) == expected; }
+        catch { return false; }
+    }
+    private static bool SameFamily(string remote, string local)
+    {
+        try
+        {
+            IPAddress a = IPAddress.Parse(Address(remote)), b = IPAddress.Parse(local);
+            return a.AddressFamily == b.AddressFamily;
+        }
+        catch { return false; }
     }
     private static void WriteOnce(string path, byte[] data)
     {
@@ -186,14 +243,14 @@ internal sealed class ConnectedQualificationGate
             "; network=" + shortId(r.NetworkFingerprint) +
             "; firewall=" + shortId(r.FirewallFingerprint) +
             "; paths=" + r.ExternalPaths + " external/" + r.GuestPaths + " guest" +
-            "; WFP records=" + r.Drops.Count + "/" + (2 * (r.ExternalPaths + r.GuestPaths)) +
+            "; WFP records=" + r.Drops.Count + "/" + (2 * r.AddressCount) +
             "; expires=" + new DateTime(r.ExpiresUtcTicks, DateTimeKind.Utc).ToString("u") +
             "; child loopback=unrun";
     }
     private QualificationRecord Validate(ProbePlan plan, RdpContainmentTransaction containment,
         QualificationRecord r, bool reobserve)
     {
-        if (plan == null || plan.Original.FormatVersion != 7 || !containment.Verify() ||
+        if (plan == null || plan.Original.FormatVersion != 7 || r.Version != 2 || !containment.Verify() ||
             containment.JournalHash() != plan.Original.QualifiedContainmentHash ||
             !String.Equals(r.AccountHash, accountHash, StringComparison.Ordinal) ||
             r.AccountHash != plan.Original.AccountBinding ||
@@ -202,14 +259,17 @@ internal sealed class ConnectedQualificationGate
             r.FirewallFingerprint != plan.Original.FirewallFingerprint ||
             r.WindowsBuild != plan.Original.WindowsBuild || r.RdpPort < 1 || r.RdpPort > 65535 ||
             r.ExternalPaths < 1 || r.GuestPaths < 0 || r.ExternalPaths + r.GuestPaths > 16 ||
+            r.AddressCount < r.ExternalPaths + r.GuestPaths || r.AddressCount > 32 ||
             r.RdpPort != containment.Observation().ConfiguredRdpPort ||
             host.UtcNowTicks < r.CapturedUtcTicks || host.UtcNowTicks >= r.ExpiresUtcTicks ||
             r.ExpiresUtcTicks - r.CapturedUtcTicks > Window ||
+            r.Drops.Any(x => x.UtcTicks < containment.EvidenceAnchorTicks()) ||
             r.Hash != ProbeCodec.Hash(r.Bytes()))
             throw new InvalidOperationException("Qualified evidence is stale, altered, incomplete, or belongs to another plan.");
         if (reobserve)
         {
-            QualificationBoundary fresh = host.Observe(r.CapturedUtcTicks - Window, r.RdpPort);
+            QualificationBoundary fresh = host.Observe(
+                Math.Max(r.CapturedUtcTicks - Window, containment.EvidenceAnchorTicks()), r.RdpPort);
             if (fresh.MachineId != r.MachineId || Interfaces(fresh) != r.InterfaceFingerprint)
                 throw new InvalidOperationException("Machine or network path identity changed.");
             if (fresh.Interfaces.Count(x => x.Path == "External") != r.ExternalPaths ||
@@ -232,9 +292,13 @@ internal sealed class ConnectedQualificationGate
             plan.Original.QualifiedContainmentHash != containment.JournalHash())
             throw new InvalidOperationException("The exact owned containment is not effective.");
         long now = host.UtcNowTicks;
-        QualificationBoundary boundary = host.Observe(now - Window, policy.ConfiguredRdpPort);
+        long since = Math.Max(now - Window, containment.EvidenceAnchorTicks());
+        if (since > now) throw new InvalidOperationException("Containment evidence anchor is in the future.");
+        QualificationBoundary boundary = host.Observe(since, policy.ConfiguredRdpPort);
         string interfaceHash = Interfaces(boundary);
         List<QualificationDrop> covered = Covered(boundary, policy.ConfiguredRdpPort, now);
+        if (covered.Any(x => x.UtcTicks < since))
+            throw new InvalidOperationException("Packet evidence predates the owned containment journal.");
         var r = new QualificationRecord { MachineId = boundary.MachineId, AccountHash = accountHash,
             PlanHash = plan.Hash, ContainmentHash = containment.JournalHash(),
             NetworkFingerprint = plan.Original.NetworkFingerprint,
@@ -243,6 +307,7 @@ internal sealed class ConnectedQualificationGate
             RdpPort = policy.ConfiguredRdpPort,
             ExternalPaths = boundary.Interfaces.Count(x => x.Path == "External"),
             GuestPaths = boundary.Interfaces.Count(x => x.Path == "Guest"),
+            AddressCount = Obligations(boundary).Values.Sum(x => x.Length),
             CapturedUtcTicks = now, ExpiresUtcTicks = now + Window };
         r.Drops.AddRange(covered); r.Hash = ProbeCodec.Hash(r.Bytes());
         WriteOnce(Pending, r.Bytes());
