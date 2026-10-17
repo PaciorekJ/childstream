@@ -349,7 +349,9 @@ internal static class SetupBoundaryTests
                     form.Controls.OfType<Button>().Single(x => x.Text == "Read proof status").PerformClick();
                     TextBox entry = form.Controls.OfType<TextBox>().Single(x =>
                         x.AccessibleName == "Exact reviewed setup plan hash");
-                    WaitUi(() => entry.Text == proofHash, "proof readback");
+                    WaitUi(() => entry.Text == proofHash &&
+                        form.Controls.OfType<Button>().Single(x => x.Text == "Review proof hash").Enabled,
+                        "proof readback");
                     form.Controls.OfType<Button>().Single(x => x.Text == "Review proof hash").PerformClick();
                     WaitUi(() => File.Exists(Path.Combine(qualificationDir, "qualification.reviewed.hash")) &&
                         form.Controls.OfType<Button>().Single(x => x.Text == "Review proof hash").Enabled,
@@ -397,7 +399,9 @@ internal static class SetupBoundaryTests
                     form.Controls.OfType<Button>().Single(x => x.Text == "Read-only plan").PerformClick();
                     TextBox entry = form.Controls.OfType<TextBox>().Single(x =>
                         x.AccessibleName == "Exact reviewed setup plan hash");
-                    WaitUi(() => entry.Text == connectedHash, "plan");
+                    WaitUi(() => entry.Text == connectedHash &&
+                        form.Controls.OfType<Button>().Single(x => x.Text == "Begin approved plan").Enabled,
+                        "plan");
                     form.Controls.OfType<Button>().Single(x => x.Text == "Begin approved plan").PerformClick();
                     WaitUi(() => qualifiedStore.Journal != null &&
                         qualifiedStore.Journal.Stage == ProbeStage.Captured &&
@@ -422,7 +426,9 @@ internal static class SetupBoundaryTests
                     form.Controls.OfType<Button>().Single(x => x.Text == "Read journal").PerformClick();
                     TextBox entry = form.Controls.OfType<TextBox>().Single(x =>
                         x.AccessibleName == "Exact reviewed setup plan hash");
-                    WaitUi(() => entry.Text == connectedHash, "read journal");
+                    WaitUi(() => entry.Text == connectedHash &&
+                        form.Controls.OfType<Button>().Single(x => x.Text == "Enable feature").Enabled,
+                        "read journal");
                     form.Controls.OfType<Button>().Single(x => x.Text == "Enable feature").PerformClick();
                     WaitUi(() => native.Writes == 1 && qualifiedStore.Journal.Stage == ProbeStage.AwaitFreshParent &&
                         form.Controls.OfType<Button>().Single(x => x.Text == "Enable feature").Enabled,
