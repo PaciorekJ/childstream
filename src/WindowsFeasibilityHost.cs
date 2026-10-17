@@ -73,10 +73,15 @@ internal sealed class ScriptProbeInventory : IProbeInventory, IProbeBoundaryInve
 {
     private readonly string script;
     internal ScriptProbeInventory(string scriptPath) { script = Path.GetFullPath(scriptPath); }
-    private static string Run(string path, string arguments, string description)
+    internal static string Run(string path, string arguments, string description)
     {
         if (!File.Exists(path)) throw new FileNotFoundException("Reviewed read-only script is missing.", path);
-        var start = new ProcessStartInfo("pwsh.exe", "-NoProfile -NonInteractive -File \"" + path + "\"" + arguments)
+        string pwsh = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+            "PowerShell", "7", "pwsh.exe");
+        InstallerPolicy.ValidateCanonicalFilePath(pwsh);
+        if (!File.Exists(pwsh) || (File.GetAttributes(pwsh) & FileAttributes.ReparsePoint) != 0)
+            throw new FileNotFoundException("Protected PowerShell 7 interpreter is unavailable.", pwsh);
+        var start = new ProcessStartInfo(pwsh, "-NoProfile -NonInteractive -File \"" + path + "\"" + arguments)
         { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
         using (Process process = Process.Start(start))
         {
@@ -108,8 +113,11 @@ internal sealed class WindowsFeasibilityHost : IFeasibilityHost
     private readonly IProbeInventory inventory;
     private readonly IProbeNative native;
     private readonly Func<bool> isAdministrator;
-    internal WindowsFeasibilityHost(IProbeInventory inventory, IProbeNative native, Func<bool> isAdministrator = null)
+    private readonly string requestingAccountBinding;
+    internal WindowsFeasibilityHost(IProbeInventory inventory, IProbeNative native,
+        Func<bool> isAdministrator = null, string requestingAccountBinding = null)
     { this.inventory = inventory; this.native = native;
+      this.requestingAccountBinding = requestingAccountBinding;
       this.isAdministrator = isAdministrator ?? (() => new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator)); }
     public bool HasAdministratorPrivilege
     {
@@ -403,12 +411,19 @@ internal sealed class WindowsFeasibilityHost : IFeasibilityHost
             default: return ResourceAccess.Unknown;
         }
     }
-    public ProbeSnapshot Capture() { return ParseInventory(inventory.ReadJson()); }
+    public ProbeSnapshot Capture()
+    {
+        ProbeSnapshot snapshot = ParseInventory(inventory.ReadJson());
+        if (requestingAccountBinding != null) snapshot.AccountBinding = requestingAccountBinding;
+        return snapshot;
+    }
     public ProbeSnapshot CaptureBoundary(bool operatorConfirmedPhysicalSeverance)
     {
         var boundary = inventory as IProbeBoundaryInventory;
         if (boundary == null) throw new InvalidOperationException("Read-only boundary inventory is unavailable.");
-        return ParseBoundaryCapture(boundary.ReadBoundaryJson(operatorConfirmedPhysicalSeverance));
+        ProbeSnapshot snapshot = ParseBoundaryCapture(boundary.ReadBoundaryJson(operatorConfirmedPhysicalSeverance));
+        if (requestingAccountBinding != null) snapshot.AccountBinding = requestingAccountBinding;
+        return snapshot;
     }
     public bool CompareExchangeChildFeature(bool expected, bool desired)
     {

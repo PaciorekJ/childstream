@@ -71,13 +71,13 @@ internal static class FeasibilityProbeProgram
     { return args.Length == index + 1 && args[index] == IsolationConfirmation; }
     private static void Usage()
     {
-        Console.WriteLine("Connected posture: plan | begin HASH | prepare-a | verify-a | restore | restore-reviewed");
+        Console.WriteLine("Connected posture: plan (read only). New connected setup uses the protected ChildStream application helper; legacy restore remains available.");
         Console.WriteLine("Isolated Stage A: plan-isolated CONFIRM | begin-isolated HASH CONFIRM | prepare-isolated CONFIRM | verify-isolated CONFIRM | restore-isolated CONFIRM | restore-isolated-reviewed CONFIRM | reconnect-check CONFIRM");
         Console.WriteLine("External-boundary Stage A: plan-boundary CONFIRM | begin-boundary HASH CONFIRM | prepare-boundary CONFIRM | verify-boundary CONFIRM | restore-boundary CONFIRM | restore-boundary-reviewed CONFIRM | reconnect-boundary-check CONFIRM");
         Console.WriteLine("Strict-isolation Stage B (separate approval): approve-b-isolated HASH CONFIRM | connect-once-isolated CONFIRM | confirm-interaction-isolated ID:LOGON CONFIRM " + InteractionConfirmation + " | end-child-isolated ID:LOGON CONFIRM");
         Console.WriteLine("External-boundary Stage B (separate approval): approve-b-boundary HASH CONFIRM | connect-once-boundary CONFIRM | confirm-interaction-boundary ID:LOGON CONFIRM " + InteractionConfirmation + " | end-child-boundary ID:LOGON CONFIRM");
         Console.WriteLine("Isolated recovery: reconcile-connection-isolated CONFIRM | end-child-isolated-reviewed ID:LOGON CONFIRM | reconcile-connection-boundary CONFIRM | end-child-boundary-reviewed ID:LOGON CONFIRM (separate review required)");
-        Console.WriteLine("CONFIRM is the literal " + IsolationConfirmation + ". Other commands: status | approve-b HASH | connect-once | confirm-console | end-child ID:LOGON | repair-journal");
+        Console.WriteLine("CONFIRM is the literal " + IsolationConfirmation + ". Other commands: status | restore | restore-reviewed | repair-journal");
         Console.WriteLine("All commands must run at the physical console. No automatic elevation or sign-out is performed.");
     }
     private static void Print(ProbeJournal journal)
@@ -114,6 +114,13 @@ internal static class FeasibilityProbeProgram
             if (args.Length == 0) { Usage(); return 2; }
             string command = args[0].ToLowerInvariant();
             if (command == "help") { Usage(); return 0; }
+            // The legacy connected CLI has no authenticated helper, owned-rule
+            // packet qualification, or protected requester journal. Preserve
+            // read-only planning and recovery, but never admit a new connected
+            // feature or child operation through that path.
+            if (Array.IndexOf(new[] { "begin", "prepare-a", "verify-a", "approve-b", "connect-once",
+                "confirm-console", "end-child" }, command) >= 0)
+                throw new InvalidOperationException("Connected mutations require the reviewed ChildStream setup helper.");
             string script = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
                 "..", "..", "scripts", "feasibility-inventory.ps1"));
             var host = new WindowsFeasibilityHost(new ScriptProbeInventory(script), new ProbeNative());

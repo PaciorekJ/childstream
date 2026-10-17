@@ -4,6 +4,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using Microsoft.Win32.SafeHandles;
+using System.Security.Principal;
 
 // Candidate adapter for small, newly created ChildStream files only. Runtime
 // Sunshine binaries exceed the journal's byte limit and use a separate verified
@@ -26,7 +27,12 @@ internal sealed class WindowsOwnedInstallerHost : IInstallerHost
     }
 
     public bool HasPrivilege(InstallPrivilege privilege)
-    { return privilege == InstallPrivilege.CurrentUser; }
+    {
+        if (privilege == InstallPrivilege.CurrentUser) return true;
+        if (privilege != InstallPrivilege.Administrator) return false;
+        var identity = WindowsIdentity.GetCurrent();
+        return identity != null && new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
+    }
 
     public ResourceState Read(ResourceTarget target)
     {

@@ -2,7 +2,7 @@ name: Windows offline checks
 
 on:
   pull_request:
-    branches: [master, codex/hardened-foundation, codex/transactional-installer]
+    branches: [master, codex/hardened-foundation, codex/transactional-installer, codex/child-session-feasibility]
 
 permissions:
   contents: read
@@ -10,7 +10,7 @@ permissions:
 jobs:
   launcher:
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
@@ -22,9 +22,24 @@ jobs:
       - name: Build unsigned candidate package
         shell: pwsh
         run: .\scripts\build-candidate.ps1
+      - name: Build bundled unsigned Windows user distribution
+        shell: pwsh
+        run: .\scripts\build-user-package.ps1
+      - name: Retain installable user distribution for review
+        uses: actions/upload-artifact@v4
+        with:
+          name: childstream-windows-x64-unsigned-audio-candidate
+          path: tests/.artifacts/distribution/ChildStream-Windows-x64-*.zip
+          if-no-files-found: error
       - name: Retain candidate package for review
         uses: actions/upload-artifact@v4
         with:
           name: childstream-unsigned-candidate
           path: tests/.artifacts/candidate/ChildStream-candidate-*.zip
+          if-no-files-found: error
+      - name: Retain simulated rendered UI evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: childstream-rendered-ui-simulated
+          path: tests/.artifacts/screenshots/*.png
           if-no-files-found: error

@@ -4,6 +4,10 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Diagnostics;
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Security.Principal;
+using System.Threading.Tasks;
+using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
 [ComImport, Guid("302D8188-0052-4807-806A-362B628F9AC5"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -20,9 +24,132 @@ public class RdpBox : AxHost
     public object Ocx { get { return GetOcx(); } }
 }
 
+internal static class ChildRdpAudioPolicy
+{
+    // Microsoft RDP ActiveX: 1 leaves playback on the remote child computer.
+    // This is necessary for the selected render endpoint to receive game sound.
+    // It does not establish that the endpoint is private to that session.
+    // Never fall back to mode 0 (parent viewer) or 2 (no server playback).
+    internal static void Configure(object control)
+    {
+        if (control == null) throw new InvalidOperationException("RDP audio control is unavailable.");
+        dynamic rdp = control;
+        rdp.SecuredSettings2.AudioRedirectionMode = 1;
+        rdp.AdvancedSettings7.AudioCaptureRedirectionMode = false;
+        if ((int)rdp.SecuredSettings2.AudioRedirectionMode != 1 ||
+            (bool)rdp.AdvancedSettings7.AudioCaptureRedirectionMode)
+            throw new InvalidOperationException("RDP child audio redirection settings were not retained.");
+    }
+}
+
+internal static class StreamingActionBar
+{
+    internal static ToolStrip Create(params ToolStripMenuItem[] actions)
+    {
+        var bar = new ToolStrip { Dock = DockStyle.Top, GripStyle = ToolStripGripStyle.Hidden,
+            AccessibleName = "ChildStream guided streaming actions" };
+        foreach (ToolStripMenuItem action in actions)
+        {
+            ToolStripMenuItem selected = action;
+            var button = new ToolStripButton(action.Text) { Enabled = action.Enabled,
+                ToolTipText = action.Text, DisplayStyle = ToolStripItemDisplayStyle.Text };
+            selected.EnabledChanged += (s, e) => button.Enabled = selected.Enabled;
+            button.Click += (s, e) => selected.PerformClick();
+            bar.Items.Add(button);
+        }
+        return bar;
+    }
+}
+
+internal sealed class ChildStreamingUiState
+{
+    internal bool StartLocal, StartLan, Stop, Recover, Pair, EnableAudio;
+    internal static ChildStreamingUiState From(System.Collections.Generic.IDictionary<string, object> status,
+        bool pairingAvailable)
+    {
+        if (status == null || !status.ContainsKey("stage") || !status.ContainsKey("lanPosture"))
+            throw new InvalidDataException("Owned runtime status is incomplete.");
+        string stage = Convert.ToString(status["stage"]);
+        string posture = Convert.ToString(status["lanPosture"]);
+        bool ready = stage == "SunshineReady";
+        bool available = stage == "NoSunshine" || stage == "SunshineWithdrawn" ||
+            stage == "SunshineAudioWithdrawn";
+        bool lost = stage == "Uncertain" || stage == "SunshineLost" ||
+            stage == "SunshineBoundaryLost" || stage == "SunshineAudioLost";
+        if (!ready && !available && !lost)
+            throw new InvalidDataException("Unrecognized owned runtime stage.");
+        return new ChildStreamingUiState { StartLocal = available,
+            StartLan = available || ready && posture == "LocalOnly",
+            Stop = ready, Recover = lost, Pair = ready && pairingAvailable,
+            EnableAudio = ready && Convert.ToString(status["audioMode"]) != "CaptureEnabled" &&
+                Convert.ToString(status["gameAudio"]) == "GameRenderObserved" };
+    }
+}
+
+internal sealed class ChildStreamGuideForm : Form
+{
+    private readonly Func<string> currentStatus;
+    private readonly Label status;
+    private readonly ToolStripMenuItem[] actions;
+    private readonly Button[] buttons;
+    private readonly Timer refresh;
+    internal ChildStreamGuideForm(Func<string> currentStatus, ToolStripMenuItem[] actions,
+        bool simulated = false)
+    {
+        if (currentStatus == null || actions == null || actions.Length != 10)
+            throw new ArgumentException("Ten guided ChildStream actions are required.");
+        this.currentStatus = currentStatus; this.actions = actions;
+        Text = simulated ? "ChildStream guided play — simulated" : "ChildStream guided play";
+        Width = 670; Height = 700; MinimumSize = new Size(620, 620);
+        AutoScroll = true; StartPosition = FormStartPosition.CenterParent;
+        var title = new Label { Left = 20, Top = 18, Width = 610, Height = 32,
+            Font = new Font(SystemFonts.MessageBoxFont, FontStyle.Bold),
+            Text = "Set up, stream, and recover the child desktop" };
+        status = new Label { Left = 20, Top = 56, Width = 610, Height = 54,
+            BorderStyle = BorderStyle.FixedSingle };
+        var instructions = new [] {
+            "1. Review the separate Windows setup plan. Feature changes need approval.",
+            "2. Start ChildStream Sunshine in the verified child session.",
+            "3. Approve a scoped LAN plan, then switch to the phone/TV address.",
+            "4. Open Moonlight on the phone or Fire TV and approve its PIN here.",
+            "5. Start Steam Big Picture only after the child stream is verified.",
+            "6. Request Minecraft Dungeons and observe it in the child session.",
+            "7. In child Volume Mixer, select its output. ChildStream checks the exact game render session.",
+            "8. Recheck the route and restart only owned Sunshine with capture-only audio.",
+            "Stop only ChildStream-owned streaming. The child desktop stays open.",
+            "If startup failed, reconcile the exact owned process before retrying." };
+        var shortNames = new [] { "Review setup", "Start local", "Switch to LAN",
+            "Pair Moonlight", "Start Steam", "Launch game", "Set game audio", "Enable game audio", "Stop streaming", "Recover start" };
+        buttons = new Button[10];
+        for (int i = 0; i < actions.Length; i++)
+        {
+            int row = i;
+            int top = 122 + i * 51;
+            var label = new Label { Left = 20, Top = top, Width = 408, Height = 40,
+                Text = instructions[i] };
+            var button = new Button { Left = 444, Top = top + 2, Width = 185,
+                Height = 34, Text = shortNames[i], Enabled = actions[i].Enabled };
+            button.Click += (s, e) => this.actions[row].PerformClick();
+            buttons[i] = button;
+            Controls.Add(label); Controls.Add(button);
+        }
+        Controls.Add(title); Controls.Add(status);
+        RefreshState();
+        refresh = new Timer { Interval = 1000 };
+        refresh.Tick += (s, e) => RefreshState();
+        Shown += (s, e) => refresh.Start();
+        FormClosed += (s, e) => { refresh.Stop(); refresh.Dispose(); };
+    }
+    internal void RefreshState()
+    {
+        status.Text = currentStatus();
+        for (int i = 0; i < actions.Length; i++) buttons[i].Enabled = actions[i].Enabled;
+    }
+}
+
 static class Program
 {
-    [DllImport("wtsapi32.dll")]
+    [DllImport("wtsapi32.dll", SetLastError = true)]
     static extern bool WTSIsChildSessionsEnabled(out bool enabled);
     [DllImport("wtsapi32.dll", SetLastError = true)]
     static extern bool WTSGetChildSessionId(out uint sessionId);
@@ -88,8 +215,30 @@ static class Program
     }
 
     static string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-    static string logPath = Path.Combine(baseDir, "launcher.log");
+    static string logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "ChildStream", "launcher.log");
     static string intentDir = GetIntentDirectory();
+
+    private static string PromptLanAddress(Form owner)
+    {
+        using (var dialog = new Form { Text = "ChildStream LAN streaming", Width = 480, Height = 225,
+            StartPosition = FormStartPosition.CenterParent, FormBorderStyle = FormBorderStyle.FixedDialog,
+            MinimizeBox = false, MaximizeBox = false })
+        {
+            var description = new Label { Left = 18, Top = 16, Width = 430, Height = 55,
+                Text = "Enter the exact private IPv4 address from the separately approved ChildStream LAN plan. " +
+                    "The child runtime will reverify the scoped firewall and network boundary before launch." };
+            var input = new TextBox { Left = 18, Top = 80, Width = 425, MaxLength = 45,
+                AccessibleName = "Approved ChildStream LAN IPv4 address" };
+            var confirm = new Button { Left = 260, Top = 119, Width = 85, Text = "Continue",
+                DialogResult = DialogResult.OK };
+            var cancel = new Button { Left = 355, Top = 119, Width = 85, Text = "Cancel",
+                DialogResult = DialogResult.Cancel };
+            dialog.Controls.AddRange(new Control[] { description, input, confirm, cancel });
+            dialog.AcceptButton = confirm; dialog.CancelButton = cancel;
+            return dialog.ShowDialog(owner) == DialogResult.OK ? input.Text.Trim() : null;
+        }
+    }
 
     static string GetIntentDirectory()
     {
@@ -98,9 +247,30 @@ static class Program
         return Path.Combine(local, "ChildStream", "session-intents");
     }
 
+    static string RandomHex(int bytes)
+    {
+        byte[] value = new byte[bytes];
+        using (var rng = RandomNumberGenerator.Create()) rng.GetBytes(value);
+        return BitConverter.ToString(value).Replace("-", "").ToLowerInvariant();
+    }
+
+    static ChildAgentRequest CreateAgentRequest(uint parent, ChildSessionIdentity child)
+    {
+        int pid = Process.GetCurrentProcess().Id;
+        ProductProcessIdentity image = new WindowsProductProcessHost().Read(pid);
+        if (image == null || image.SessionId != (int)parent ||
+            new WindowsRuntimeTokenReader().Read() != RuntimeTokenStatus.Limited)
+            throw new InvalidOperationException("Limited parent process identity cannot be verified.");
+        return new ChildAgentRequest { ParentSessionId = parent, Child = child,
+            ParentPid = pid, ParentExecutableSha256 = image.ExecutableSha256,
+            RequesterSid = WindowsIdentity.GetCurrent().User.Value,
+            PipeName = "ChildStream-" + RandomHex(16), Nonce = RandomHex(32) };
+    }
+
     static void Log(string msg)
     {
-        try { File.AppendAllText(logPath, DateTime.Now.ToString("HH:mm:ss.fff") + " " + msg + Environment.NewLine); } catch { }
+        try { Directory.CreateDirectory(Path.GetDirectoryName(logPath));
+            File.AppendAllText(logPath, DateTime.Now.ToString("HH:mm:ss.fff") + " " + msg + Environment.NewLine); } catch { }
     }
 
     static int[] ParseDisplayConfig(string value)
@@ -143,6 +313,8 @@ static class Program
     [STAThread]
     static int Main(string[] args)
     {
+        if (args.Length == 2 && args[0] == "-child-agent")
+            return WindowsChildAgentEntry.Run(args[1]);
         if (args.Length > 0 && args[0] == "-enable")
         {
             MessageBox.Show("Child-session enablement requires the future transactional installer. No change was made.", "ChildStream");
@@ -166,20 +338,20 @@ static class Program
             catch (Exception ex) { Log("session reconciliation failed: " + ex.Message); return 4; }
         }
 
-        bool en;
-        if (!WTSIsChildSessionsEnabled(out en))
-        {
-            MessageBox.Show("Cannot query child-session support. Check Windows edition and system logs.", "ChildStream");
-            return 2;
-        }
-        Log("startup: child sessions enabled = " + en);
-        if (!en)
-        {
-            MessageBox.Show("Child sessions are not enabled. Installation is blocked until the transactional installer is validated.", "ChildStream");
-            return 1;
-        }
-
         Application.EnableVisualStyles();
+        var firstRun = new FirstRunController(new WindowsChildFeatureReader(),
+            new WindowsRuntimeTokenReader(), new WindowsUnknownFeatureAttemptPolicy());
+        using (var shell = new FirstRunForm(firstRun))
+            if (shell.ShowDialog() != DialogResult.OK || !shell.StartSelected) return 0;
+        if (!firstRun.CanStart) return 1;
+        return RunViewer();
+    }
+
+    private static int RunViewer()
+    {
+        // A protected installed user with an exact approved limited task may
+        // explicitly attempt connection when the feature query is inaccessible.
+        // The live WTS association and ActiveX outcome remain authoritative.
 
         // Microsoft documents automatic child-session logon from an existing parent
         // session. Do not set UserName or ClearTextPassword on the RDP control.
@@ -197,8 +369,20 @@ static class Program
         f.Icon = appIcon;
         var tray = new NotifyIcon { Icon = appIcon, Visible = true, Text = "Child Session" };
         dynamic ocx = null;
+        WindowsChildTaskBootstrapHost agentHost = null;
+        ChildAgentController agent = null;
+        MoonlightPairingCoordinator pairingCoordinator = null;
+        bool agentStartPending = false;
+        bool runtimeActionPending = false;
+        var statusBar = new StatusStrip();
+        var statusText = new ToolStripStatusLabel("Waiting for a verified child desktop.");
+        statusBar.Items.Add(statusText);
         var menu = new ContextMenuStrip();
         menu.Items.Add("Show", null, (s, e) => { f.Show(); f.WindowState = FormWindowState.Normal; f.Activate(); });
+        var setupItem = new ToolStripMenuItem("Review Windows setup…");
+        menu.Items.Add(setupItem);
+        setupItem.Click += (s, e) =>
+        { using (var dialog = new SetupDialog(new WindowsSetupWorkflow())) dialog.ShowDialog(f); };
         ToolStripMenuItem reconnectItem = new ToolStripMenuItem("Reconnect now");
         menu.Items.Add(reconnectItem);
         menu.Items.Add("Streaming readiness", null, (s, e) =>
@@ -211,14 +395,82 @@ static class Program
             string conflict = SunshineStartupGate.Check(collision);
             MessageBox.Show(session + "\n" +
                 (conflict ?? "No Sunshine service, process or default-family port collision was observed.") +
-                "\nPortable streaming remains disabled until child process launch, capture, input, audio, " +
-                "network and rollback acceptance pass on an independent Windows target.",
+                "\nThe child runtime may start its own loopback Sunshine after exact session verification. " +
+                "LAN streaming, independent capture, controllers and hardware rollback still require acceptance.",
                 "ChildStream readiness", MessageBoxButtons.OK, MessageBoxIcon.Information);
         });
         menu.Items.Add("Inspect/remove legacy saved password", null, (s, e) => { RemoveLegacyPasswordExplicitly(); });
+        var sunshineItem = new ToolStripMenuItem("Start ChildStream Sunshine") { Enabled = false };
+        menu.Items.Add(sunshineItem);
+        var lanSunshineItem = new ToolStripMenuItem("Start Sunshine on approved LAN…") { Enabled = false };
+        menu.Items.Add(lanSunshineItem);
+        var stopSunshineItem = new ToolStripMenuItem("Stop ChildStream streaming") { Enabled = false };
+        var recoverSunshineItem = new ToolStripMenuItem("Recover failed ChildStream start") { Enabled = false };
+        menu.Items.Add(stopSunshineItem); menu.Items.Add(recoverSunshineItem);
+        var steamItem = new ToolStripMenuItem("Start Steam Big Picture in child") { Enabled = false };
+        var gameItem = new ToolStripMenuItem("Request Minecraft Dungeons in child") { Enabled = false };
+        var gameAudioItem = new ToolStripMenuItem("Set game audio in child Volume Mixer…") { Enabled = false };
+        var enableGameAudioItem = new ToolStripMenuItem("Enable verified game audio…") { Enabled = false };
+        var stopSteamItem = new ToolStripMenuItem("Stop exact owned child Steam/game") { Enabled = false };
+        menu.Items.Add(steamItem); menu.Items.Add(gameItem); menu.Items.Add(gameAudioItem);
+        menu.Items.Add(enableGameAudioItem); menu.Items.Add(stopSteamItem);
+        var pairItem = new ToolStripMenuItem("Pair Moonlight…") { Enabled = false };
+        menu.Items.Add(pairItem);
+        pairItem.Click += async (s, e) =>
+        {
+            if (pairingCoordinator == null) return;
+            try
+            {
+                string[] verified = await Task.Run(() => new [] { pairingCoordinator.HostName,
+                    pairingCoordinator.ManualAddress });
+                using (var dialog = new MoonlightPairingDialog(pairingCoordinator, verified[0], verified[1]))
+                    dialog.ShowDialog(f);
+            }
+            catch (Exception ex)
+            { statusText.Text = "Pairing ownership changed: " + ex.Message; pairItem.Enabled = false; pairingCoordinator = null; }
+        };
+        Func<Task<bool>> stopAgent = async () =>
+        {
+            if (agent == null) return true;
+            try
+            {
+                var selected = agent;
+                string state = await Task.Run(() => selected.Execute(ChildAgentOperation.Status, ""));
+                var observed = new JavaScriptSerializer().DeserializeObject(state) as System.Collections.Generic.Dictionary<string, object>;
+                if (observed == null || !observed.ContainsKey("steamStage") || !observed.ContainsKey("stage"))
+                    throw new InvalidDataException("Child runtime status is incomplete.");
+                string steamState = Convert.ToString(observed["steamStage"]);
+                if (steamState != "NotStarted" && steamState != "Ended")
+                    await Task.Run(() => selected.Execute(ChildAgentOperation.StopSteam, ""));
+                if (Convert.ToString(observed["stage"]) == "SunshineReady" ||
+                    Convert.ToString(observed["stage"]) == "SunshineBoundaryLost" ||
+                    Convert.ToString(observed["stage"]) == "SunshineLost" ||
+                    Convert.ToString(observed["stage"]) == "SunshineAudioLost")
+                    await Task.Run(() => selected.Execute(ChildAgentOperation.StopSunshine, ""));
+                if (Convert.ToString(observed["stage"]) == "Uncertain")
+                    throw new InvalidOperationException("Resolve exact owned runtime uncertainty before closing the agent.");
+                await Task.Run(() => selected.Stop());
+                if (agentHost != null) agentHost.Dispose();
+                agentHost = null; agent = null; pairingCoordinator = null;
+                pairItem.Enabled = false; sunshineItem.Enabled = false; lanSunshineItem.Enabled = false;
+                stopSunshineItem.Enabled = false; recoverSunshineItem.Enabled = false;
+                steamItem.Enabled = false; gameItem.Enabled = false; stopSteamItem.Enabled = false;
+                gameAudioItem.Enabled = false; enableGameAudioItem.Enabled = false;
+                statusText.Text = "Child agent and owned Sunshine stopped. Child desktop remains available.";
+                return true;
+            }
+            catch (Exception ex)
+            {
+                statusText.Text = "Child runtime stop is uncertain: " + ex.Message;
+                Log(statusText.Text);
+                MessageBox.Show(f, statusText.Text + "\nNo unrelated process was stopped.",
+                    "ChildStream", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return false;
+            }
+        };
         ToolStripMenuItem signOutItem = new ToolStripMenuItem("End session (sign out, closes games)");
         menu.Items.Add(signOutItem);
-        signOutItem.Click += (s, e) =>
+        signOutItem.Click += async (s, e) =>
         {
             int viewerState;
             try { viewerState = (int)ocx.Connected; }
@@ -235,6 +487,7 @@ static class Program
                 return;
             }
             if (MessageBox.Show("Sign out the child session? All apps running in it will close.", "Child Session", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            if (!await stopAgent()) return;
             SignOutResult result = lifecycle.SignOut();
             Log("signout result: " + result + "; lifecycle: " + lifecycle.State + "; reason: " + lifecycle.FailureReason);
             if (result != SignOutResult.Complete)
@@ -252,7 +505,8 @@ static class Program
             tray.Visible = false;
             Application.Exit();
         };
-        menu.Items.Add("Exit", null, (s, e) => { tray.Visible = false; Application.Exit(); });
+        menu.Items.Add("Exit", null, async (s, e) =>
+        { if (!await stopAgent()) return; tray.Visible = false; Application.Exit(); });
         tray.ContextMenuStrip = menu;
         tray.DoubleClick += (s, e) => { f.Show(); f.WindowState = FormWindowState.Normal; f.Activate(); };
 
@@ -261,8 +515,269 @@ static class Program
 
         var rdp = new RdpBox { Dock = DockStyle.Fill };
         f.Controls.Add(rdp);
+        f.Controls.Add(statusBar);
+        f.Controls.Add(StreamingActionBar.Create(setupItem, sunshineItem, lanSunshineItem,
+            pairItem, steamItem, gameItem, gameAudioItem, enableGameAudioItem,
+            stopSunshineItem, recoverSunshineItem));
         rdp.CreateControl();
         ocx = rdp.Ocx;
+
+        Action bootstrapAgent = () =>
+        {
+            if (agent != null || agentStartPending || lifecycle.State != ChildLifecycleState.Connected ||
+                !lifecycle.ObservedChild.HasValue) return;
+            ChildSessionIdentity exactChild = lifecycle.ObservedChild.Value;
+            agentStartPending = true;
+            statusText.Text = "Starting the limited child runtime…";
+            Task.Run(() =>
+            {
+                var host = new WindowsChildTaskBootstrapHost(new WindowsChildSessionApi(),
+                    Application.ExecutablePath, CreateAgentRequest(parentSessionId, exactChild).ParentExecutableSha256);
+                try
+                {
+                    ChildAgentRequest request = CreateAgentRequest(parentSessionId, exactChild);
+                    var controller = new ChildAgentController(host, parentSessionId, exactChild,
+                        Application.ExecutablePath, request.ParentExecutableSha256);
+                    controller.Start(request);
+                    return Tuple.Create(host, controller);
+                }
+                catch { host.Dispose(); throw; }
+            }).ContinueWith(task =>
+            {
+                if (f.IsDisposed) { if (task.Status == TaskStatus.RanToCompletion) task.Result.Item1.Dispose(); return; }
+                f.BeginInvoke((Action)(() =>
+                {
+                    agentStartPending = false;
+                    if (task.IsFaulted || task.IsCanceled)
+                    {
+                        statusText.Text = "Child runtime unavailable: " +
+                            (task.Exception == null ? "launch cancelled" : task.Exception.GetBaseException().Message);
+                        Log(statusText.Text); return;
+                    }
+                    if (lifecycle.State != ChildLifecycleState.Connected || !lifecycle.ObservedChild.HasValue ||
+                        !lifecycle.ObservedChild.Value.Equals(exactChild) || !lifecycle.CheckConnectedIdentity())
+                    { task.Result.Item1.Dispose(); statusText.Text = "Child identity changed during runtime launch."; return; }
+                    agentHost = task.Result.Item1; agent = task.Result.Item2;
+                    sunshineItem.Enabled = true;
+                    lanSunshineItem.Enabled = true;
+                    recoverSunshineItem.Enabled = false;
+                    statusText.Text = "Limited child agent verified. Start ChildStream Sunshine when ready.";
+                }));
+            });
+        };
+        Action<System.Collections.Generic.IDictionary<string, object>> applyStreamingState = observed =>
+        {
+            string stage = Convert.ToString(observed["stage"]);
+            if (stage != "SunshineReady") pairingCoordinator = null;
+            ChildStreamingUiState state = ChildStreamingUiState.From(observed,
+                pairingCoordinator != null);
+            sunshineItem.Enabled = !runtimeActionPending && state.StartLocal;
+            lanSunshineItem.Enabled = !runtimeActionPending && state.StartLan;
+            stopSunshineItem.Enabled = !runtimeActionPending && state.Stop;
+            recoverSunshineItem.Enabled = !runtimeActionPending && state.Recover;
+            pairItem.Enabled = !runtimeActionPending && state.Pair;
+            gameAudioItem.Enabled = !runtimeActionPending &&
+                Convert.ToString(observed.ContainsKey("steamStage") ? observed["steamStage"] : "") == "GameObserved" &&
+                stage == "SunshineReady";
+            enableGameAudioItem.Enabled = !runtimeActionPending && state.EnableAudio;
+            if (stage == "SunshineWithdrawn")
+                statusText.Text = "LAN boundary changed; exact owned Sunshine was withdrawn. Review LAN setup.";
+            else if (stage == "SunshineAudioLost")
+                statusText.Text = "Selected child audio endpoint disappeared. Recover only the exact ChildStream stream, then choose an active endpoint.";
+            else if (stage == "SunshineAudioWithdrawn")
+                statusText.Text = "Game audio evidence was lost. Exact owned Sunshine stopped; game and pairing remain. Choose an active endpoint and restart silently.";
+            else if (stage == "SunshineLost" || stage == "SunshineBoundaryLost")
+                statusText.Text = "Owned Sunshine was lost; reconcile its exact process before retrying.";
+            else if (Convert.ToString(observed.ContainsKey("steamStage") ? observed["steamStage"] : "") == "GameObserved")
+            {
+                string route = Convert.ToString(observed.ContainsKey("gameAudio") ? observed["gameAudio"] : "ObservationIncomplete");
+                string sink = Convert.ToString(observed.ContainsKey("captureEndpointName") ?
+                    observed["captureEndpointName"] : observed.ContainsKey("captureEndpoint") ? observed["captureEndpoint"] : "");
+                string kind = Convert.ToString(observed.ContainsKey("routeKind") ? observed["routeKind"] : "Unknown");
+                string audioMode = Convert.ToString(observed.ContainsKey("audioMode") ? observed["audioMode"] : "");
+                statusText.Text = route == "GameRenderIdle" && audioMode == "CaptureEnabled" ?
+                    "The admitted game audio session is currently inactive on " + sink + "; owned capture-only Sunshine remains audio enabled. Physical isolation and playback remain unverified." :
+                    route == "GameRenderObserved" ?
+                    audioMode == "CaptureEnabled" ?
+                    "Exact game render observed on " + sink + "; owned capture-only Sunshine is audio enabled. Physical isolation and playback remain unverified." :
+                    "Exact game render observed on " + sink + " (" + kind + "). Select Enable verified game audio to restart only owned Sunshine." :
+                    "Game audio: " + route + ". Sunshine is silent. Request child Volume Mixer, confirm the game's output as " + sink + ", then recheck.";
+            }
+        };
+        Func<Task> refreshStreamingState = async () =>
+        {
+            if (agent == null || agent.Stage != ChildAgentStage.Ready) return;
+            try
+            {
+                var selected = agent;
+                var observed = await Task.Run(() => new ChildStreamingPresenter(selected,
+                    lifecycle.ObservedChild.Value).Observe());
+                if (agent == selected) applyStreamingState(observed);
+            }
+            catch
+            {
+                sunshineItem.Enabled = lanSunshineItem.Enabled = stopSunshineItem.Enabled = pairItem.Enabled = false;
+                enableGameAudioItem.Enabled = false;
+                pairingCoordinator = null; recoverSunshineItem.Enabled = !runtimeActionPending;
+            }
+        };
+        Func<string, Task> startOwnedSunshine = async address =>
+        {
+            if (agent == null || lifecycle.State != ChildLifecycleState.Connected ||
+                !lifecycle.CheckConnectedIdentity() || runtimeActionPending) return;
+            runtimeActionPending = true;
+            sunshineItem.Enabled = false; lanSunshineItem.Enabled = false;
+            stopSunshineItem.Enabled = false; recoverSunshineItem.Enabled = false;
+            pairItem.Enabled = false;
+            statusText.Text = "Reading child display and audio choices…";
+            try
+            {
+                var selectedAgent = agent;
+                var presenter = new ChildStreamingPresenter(selectedAgent, lifecycle.ObservedChild.Value);
+                ChildStreamingPreparation prepared = await Task.Run(() => presenter.Prepare(address));
+                string selectedDisplay, selectedAudio;
+                using (var chooser = new CapabilitySelectionDialog(prepared.Catalog))
+                {
+                    if (chooser.ShowDialog(f) != DialogResult.OK)
+                    { statusText.Text = "Child device selection cancelled. No Sunshine start requested."; return; }
+                    selectedDisplay = chooser.SelectedDisplay; selectedAudio = chooser.SelectedAudio;
+                }
+                bool interruption = prepared.Stage == "SunshineReady";
+                if (interruption && MessageBox.Show(f,
+                    "Changing ChildStream streaming will interrupt the current Moonlight stream. " +
+                    "The child desktop, game and pairing identity stay in place. Stop only the exact owned " +
+                    "Sunshine process and revalidate the selected devices?",
+                    "Approve stream reconfiguration", MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning) != DialogResult.Yes)
+                { statusText.Text = "Streaming change cancelled; the current owned stream remains available."; return; }
+                statusText.Text = "Verifying selected child devices and starting owned Sunshine…";
+                var runtime = await Task.Run(() => presenter.Commit(prepared,
+                    selectedDisplay, selectedAudio, interruption));
+                pairingCoordinator = new MoonlightPairingCoordinator(runtime,
+                    new AgentSunshinePairingApi(selectedAgent));
+                steamItem.Enabled = true;
+                statusText.Text = address == null
+                    ? "ChildStream Sunshine verified locally. Select approved LAN streaming for phone or Fire TV."
+                    : "ChildStream LAN rules and local pairing API verified. Moonlight streaming remains untested.";
+            }
+            catch (Exception ex)
+            { statusText.Text = "ChildStream Sunshine unavailable: " + ex.Message; Log(statusText.Text); }
+            finally { runtimeActionPending = false; Task refreshed = refreshStreamingState(); }
+        };
+        sunshineItem.Click += async (s, e) => await startOwnedSunshine(null);
+        lanSunshineItem.Click += async (s, e) =>
+        {
+            string address = PromptLanAddress(f);
+            if (address != null) await startOwnedSunshine(address);
+        };
+        stopSunshineItem.Click += async (s, e) =>
+        {
+            if (agent == null || !lifecycle.CheckConnectedIdentity() || runtimeActionPending) return;
+            runtimeActionPending = true; stopSunshineItem.Enabled = false;
+            try
+            {
+                var presenter = new ChildStreamingPresenter(agent, lifecycle.ObservedChild.Value);
+                await Task.Run(() => presenter.Stop());
+                statusText.Text = "Exact owned Sunshine stopped; child desktop remains connected.";
+            }
+            catch (Exception ex)
+            { statusText.Text = "Streaming stop needs recovery: " + ex.Message; }
+            finally { runtimeActionPending = false; Task refreshed = refreshStreamingState(); }
+        };
+        recoverSunshineItem.Click += async (s, e) =>
+        {
+            if (agent == null || !lifecycle.CheckConnectedIdentity() || runtimeActionPending) return;
+            runtimeActionPending = true; recoverSunshineItem.Enabled = false;
+            try
+            {
+                var presenter = new ChildStreamingPresenter(agent, lifecycle.ObservedChild.Value);
+                await Task.Run(() => presenter.Recover());
+                statusText.Text = "Exact failed start reconciled; choose streaming posture again.";
+            }
+            catch (Exception ex)
+            { statusText.Text = "Recovery requires review: " + ex.Message; }
+            finally { runtimeActionPending = false; Task refreshed = refreshStreamingState(); }
+        };
+        steamItem.Click += async (s, e) =>
+        {
+            if (agent == null || !lifecycle.CheckConnectedIdentity()) return;
+            steamItem.Enabled = false;
+            try
+            {
+                await Task.Run(() => agent.Execute(ChildAgentOperation.StartSteam, ""));
+                gameItem.Enabled = true; stopSteamItem.Enabled = true;
+                statusText.Text = "Exact child Steam Big Picture process verified. Game is not yet observed.";
+            }
+            catch (Exception ex) { statusText.Text = "Child Steam unavailable: " + ex.Message; Log(statusText.Text); }
+        };
+        gameItem.Click += async (s, e) =>
+        {
+            if (agent == null || !lifecycle.CheckConnectedIdentity()) return;
+            gameItem.Enabled = false;
+            try
+            {
+                string status = await Task.Run(() => agent.Execute(ChildAgentOperation.RequestGame, ""));
+                statusText.Text = status.Contains("GameObserved") ?
+                    "Exact Minecraft Dungeons child process observed." :
+                    "Game request sent; process outcome is not yet verified. Review before shutdown.";
+            }
+            catch (Exception ex) { statusText.Text = "Game request failed or uncertain: " + ex.Message; Log(statusText.Text); }
+        };
+        gameAudioItem.Click += async (s, e) =>
+        {
+            if (agent == null || !lifecycle.CheckConnectedIdentity() || runtimeActionPending) return;
+            gameAudioItem.Enabled = false;
+            try
+            {
+                var presenter = new ChildStreamingPresenter(agent, lifecycle.ObservedChild.Value);
+                await Task.Run(() => presenter.OpenGameAudioRoute());
+                statusText.Text = "Windows Volume Mixer requested in the child desktop. Confirm it appeared there, choose the selected endpoint, then enable audio after route observation.";
+            }
+            catch (Exception ex) { statusText.Text = "Child game audio route unavailable: " + ex.Message; }
+            finally { Task refreshed = refreshStreamingState(); }
+        };
+        enableGameAudioItem.Click += async (s, e) =>
+        {
+            if (agent == null || !lifecycle.CheckConnectedIdentity() || runtimeActionPending) return;
+            if (MessageBox.Show(f,
+                "This briefly disconnects Moonlight while ChildStream stops and restarts only its exact owned Sunshine process with capture-only audio. The game, child desktop and pairing identity stay in place. Continue?",
+                "Enable game audio", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            runtimeActionPending = true; enableGameAudioItem.Enabled = false;
+            try
+            {
+                var presenter = new ChildStreamingPresenter(agent, lifecycle.ObservedChild.Value);
+                await Task.Run(() => presenter.EnableGameAudio());
+                statusText.Text = "Exact game render rechecked; owned Sunshine restarted with capture-only audio. Reconnect Moonlight. Physical playback remains unverified.";
+            }
+            catch (Exception ex) { statusText.Text = "Game audio enable stopped or needs recovery: " + ex.Message; }
+            finally { runtimeActionPending = false; Task refreshed = refreshStreamingState(); }
+        };
+        stopSteamItem.Click += async (s, e) =>
+        {
+            if (agent == null || !lifecycle.CheckConnectedIdentity()) return;
+            stopSteamItem.Enabled = false;
+            try
+            {
+                await Task.Run(() => agent.Execute(ChildAgentOperation.StopSteam, ""));
+                gameItem.Enabled = false; statusText.Text = "Exact child game and Steam stop verified.";
+            }
+            catch (Exception ex)
+            { statusText.Text = "Child Steam stop uncertain: " + ex.Message; Log(statusText.Text); stopSteamItem.Enabled = true; }
+        };
+
+        ChildStreamGuideForm guide = null;
+        var guideItem = new ToolStripMenuItem("Guided steps…");
+        guideItem.Click += (s, e) =>
+        {
+            if (guide == null || guide.IsDisposed)
+                guide = new ChildStreamGuideForm(() => statusText.Text,
+                    new[] { setupItem, sunshineItem, lanSunshineItem, pairItem,
+                        steamItem, gameItem, gameAudioItem, enableGameAudioItem,
+                        stopSunshineItem, recoverSunshineItem });
+            guide.Show(f); guide.BringToFront();
+        };
+        menu.Items.Insert(1, guideItem);
+        f.BeginInvoke((Action)(() => guideItem.PerformClick()));
 
         int last = -1;
         DateTime lastAttempt = DateTime.MinValue;
@@ -309,6 +824,7 @@ static class Program
                 }
                 try { ocx.ColorDepth = 32; } catch { }
                 try { ocx.AdvancedSettings7.EnableCredSspSupport = true; } catch { }
+                ChildRdpAudioPolicy.Configure(rdp.Ocx);
                 object v = true;
                 var ext = (IMsRdpExtendedSettings)rdp.Ocx;
                 ext.put_Property("ConnectToChildSession", ref v);
@@ -340,6 +856,7 @@ static class Program
             catch (Exception ex) { lifecycle.UnrecoverableError(); Log("reconnect: " + ex.Message); MessageBox.Show(ex.Message, "ChildStream"); }
         };
 
+        bool runtimePollPending = false;
         var timer = new Timer { Interval = 2000 };
         timer.Tick += delegate
         {
@@ -359,7 +876,7 @@ static class Program
                         Log("connected child rejected: " + lifecycle.FailureReason);
                         ocx.Disconnect();
                     }
-                    else Log("verified child session " + lifecycle.ObservedChild.Value.SessionId);
+                    else { Log("verified child session " + lifecycle.ObservedChild.Value.SessionId); bootstrapAgent(); }
                 }
                 else if (state == 0) lifecycle.ObserveViewerDisconnected();
                 if (state == 1 && lifecycle.State == ChildLifecycleState.Connected &&
@@ -387,6 +904,34 @@ static class Program
                     reconnectItem.Enabled = false;
                     signOutItem.Enabled = false;
                 }
+                if (state == 1 && lifecycle.State == ChildLifecycleState.Connected &&
+                    agent != null && !runtimePollPending && !runtimeActionPending)
+                {
+                    runtimePollPending = true;
+                    ChildAgentController selectedAgent = agent;
+                    Task.Run(() => selectedAgent.Execute(ChildAgentOperation.Status, ""))
+                        .ContinueWith(task =>
+                    {
+                        if (f.IsDisposed) return;
+                        f.BeginInvoke((Action)(() =>
+                        {
+                            runtimePollPending = false;
+                            if (agent != selectedAgent || lifecycle.State != ChildLifecycleState.Connected) return;
+                            if (task.IsFaulted || task.IsCanceled)
+                            {
+                                pairItem.Enabled = false; pairingCoordinator = null;
+                                stopSunshineItem.Enabled = false; recoverSunshineItem.Enabled = true;
+                                statusText.Text = "Child runtime status uncertain; review exact owned recovery.";
+                                return;
+                            }
+                            var observed = new JavaScriptSerializer().DeserializeObject(task.Result) as
+                                System.Collections.Generic.Dictionary<string, object>;
+                            if (observed == null || !observed.ContainsKey("stage") ||
+                                !observed.ContainsKey("lanPosture")) return;
+                            applyStreamingState(observed);
+                        }));
+                    });
+                }
             }
             catch (Exception ex)
             {
@@ -398,7 +943,18 @@ static class Program
         };
         timer.Start();
 
-        f.FormClosing += (s, e) => { timer.Stop(); tray.Visible = false; };
+        bool closeAuthorized = false;
+        f.FormClosing += async (s, e) =>
+        {
+            if (agent != null && !closeAuthorized)
+            {
+                e.Cancel = true;
+                if (await stopAgent()) { closeAuthorized = true; f.Close(); }
+                return;
+            }
+            timer.Stop(); tray.Visible = false;
+            if (agentHost != null) agentHost.Dispose();
+        };
         connect();
         Application.Run(f);
         instanceMutex.ReleaseMutex();
