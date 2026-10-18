@@ -19,11 +19,11 @@ release or evidence of a live installation.
 
 ## Qualified dependency
 
-- [Official Sunshine prerelease `v2026.1015.174736`](https://github.com/LizardByte/Sunshine/releases/tag/v2026.1015.174736), source commit `178a0467da1dde750b182be4ae10ff8f8245ad01`.
-- [Capture-only merge `fd45d2dd853d4f9310616112d78168226df6099c`](https://github.com/LizardByte/Sunshine/commit/fd45d2dd853d4f9310616112d78168226df6099c) is an ancestor of the release source commit by 49 commits.
-- Official `Sunshine-Windows-AMD64-lite.zip` SHA-256: `35fa21069c314896e9b476e16e42fe4d60986dc3926b54e80d1c693e40d314cc`; embedded `Sunshine/sunshine.exe` SHA-256: `424cb1bbfe994c7676ff03957f1b3e1e79d218264677ec0b8959b5c809523c8c`.
+- [Official Sunshine prerelease `v2026.1018.5342`](https://github.com/LizardByte/Sunshine/releases/tag/v2026.1018.5342), source commit `3d6e1d6008bd4a24906283ab25fcd0becc0a1c07`. The previous `v2026.1015.174736` prerelease disappeared from the upstream release API and its asset URL returned 404 during exact-source CI.
+- [Capture-only merge `fd45d2dd853d4f9310616112d78168226df6099c`](https://github.com/LizardByte/Sunshine/commit/fd45d2dd853d4f9310616112d78168226df6099c) is an ancestor of the release source commit by 61 commits.
+- Official `Sunshine-Windows-AMD64-lite.zip` SHA-256: `5637d74c6f0d80bb133c0d6d4df7c49c663c0f860b4e96efcb9d1d9c207ea649` (60,876,058 bytes); embedded `Sunshine/sunshine.exe` SHA-256: `7200207666836abb1646831809ef7b4744d0b40c7cc5aed09ba7ebc0edc05081` (106,963,476 bytes).
 - Read-only binary inspection found `external_audio`, `audio_sink`, and `stream_audio` in that executable. The release source parses the key and its Windows backend has the capture-only policy branch. This is stronger than adding an unknown key to an old binary, though actual child-session audio remains untested.
-- [Official exact-source Windows CI run 38780282332](https://github.com/LizardByte/Sunshine/actions/runs/38780282332) passed its Windows-AMD64 test job: 12 `ExternalAudioTest` and 15 `WindowsAudioTest` cases. Those production-code tests substitute COM policy/device APIs and cover no default setter/reset or format mutation, no driver auto-install, explicit sink selection, missing/unplugged sink without default fallback, endpoint reactivation, and pinned capture across default changes. ChildStream did not rebuild or execute those C++ tests locally.
+- [Official exact-source Windows CI run 39084454365](https://github.com/LizardByte/Sunshine/actions/runs/39084454365) passed its Windows-AMD64 test job: 12 `ExternalAudioTest` and 15 `WindowsAudioTest` cases. Those production-code tests substitute COM policy/device APIs and cover no default setter/reset or format mutation, no driver auto-install, explicit sink selection, missing/unplugged sink without default fallback, endpoint reactivation, and pinned capture across default changes. ChildStream did not rebuild or execute those C++ tests locally.
 
 ## Connected source path
 

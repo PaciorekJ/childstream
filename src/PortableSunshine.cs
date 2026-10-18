@@ -8,13 +8,13 @@ using System.Security.Cryptography;
 // The selected lite executable is unsigned; its executable hash is mandatory.
 internal static class SunshineReleasePin
 {
-    // Official prerelease built from 178a0467da1dde750b182be4ae10ff8f8245ad01.
-    // That commit is 49 commits after external-audio merge fd45d2dd853d4f9310616112d78168226df6099c.
-    internal const string Version = "v2026.1015.174736";
+    // Official prerelease built from 3d6e1d6008bd4a24906283ab25fcd0becc0a1c07.
+    // That commit is 61 commits after external-audio merge fd45d2dd853d4f9310616112d78168226df6099c.
+    internal const string Version = "v2026.1018.5342";
     internal const string AssetName = "Sunshine-Windows-AMD64-lite.zip";
     internal const string AssetUrl = "https://github.com/LizardByte/Sunshine/releases/download/" + Version + "/" + AssetName;
-    internal const string ArchiveSha256 = "35fa21069c314896e9b476e16e42fe4d60986dc3926b54e80d1c693e40d314cc";
-    internal const string ExecutableSha256 = "424cb1bbfe994c7676ff03957f1b3e1e79d218264677ec0b8959b5c809523c8c";
+    internal const string ArchiveSha256 = "5637d74c6f0d80bb133c0d6d4df7c49c663c0f860b4e96efcb9d1d9c207ea649";
+    internal const string ExecutableSha256 = "7200207666836abb1646831809ef7b4744d0b40c7cc5aed09ba7ebc0edc05081";
 
     internal static PortableSunshinePackage Create(string portableRoot, string configRoot)
     {

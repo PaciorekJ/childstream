@@ -13,15 +13,15 @@ if ((git -C $root status --porcelain).Count -ne 0) { throw 'User package require
 $candidate = Join-Path $root "tests\.artifacts\candidate\ChildStream-candidate-$sha.zip"
 if (-not (Test-Path -LiteralPath $candidate)) { throw 'Build and verify the exact-source candidate first.' }
 if (-not $SunshineArchive) {
-    $SunshineArchive = Join-Path $root 'tests\.artifacts\upstream-audio\Sunshine-Windows-AMD64-lite.zip'
+    $SunshineArchive = Join-Path $root 'tests\.artifacts\upstream-audio\v2026.1018.5342\Sunshine-Windows-AMD64-lite.zip'
 }
-$expectedSunshine = '35fa21069c314896e9b476e16e42fe4d60986dc3926b54e80d1c693e40d314cc'
+$expectedSunshine = '5637d74c6f0d80bb133c0d6d4df7c49c663c0f860b4e96efcb9d1d9c207ea649'
 if (-not (Test-Path -LiteralPath $SunshineArchive)) {
     New-Item -ItemType Directory -Force (Split-Path $SunshineArchive -Parent) | Out-Null
     $partial = "$SunshineArchive.partial"
     if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial -Force }
     try {
-        Invoke-WebRequest -Uri 'https://github.com/LizardByte/Sunshine/releases/download/v2026.1015.174736/Sunshine-Windows-AMD64-lite.zip' -OutFile $partial
+        Invoke-WebRequest -Uri 'https://github.com/LizardByte/Sunshine/releases/download/v2026.1018.5342/Sunshine-Windows-AMD64-lite.zip' -OutFile $partial
         if ((Get-FileHash -LiteralPath $partial -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expectedSunshine) {
             throw 'Downloaded Sunshine archive digest differs from the independently pinned official asset.'
         }
@@ -44,11 +44,13 @@ try {
     $stream = $sunshineExe.Open()
     try { $exeDigest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream)).ToLowerInvariant() }
     finally { $stream.Dispose() }
-    if ($exeDigest -ne '424cb1bbfe994c7676ff03957f1b3e1e79d218264677ec0b8959b5c809523c8c') {
+    if ($exeDigest -ne '7200207666836abb1646831809ef7b4744d0b40c7cc5aed09ba7ebc0edc05081') {
         throw 'Sunshine executable differs from the qualified capture-only binary.'
     }
 }
 finally { $sunshineZip.Dispose() }
+& (Join-Path $root 'tests\.artifacts\ProductIntegrationTests.exe') $SunshineArchive
+if ($LASTEXITCODE -ne 0) { throw 'Pinned Sunshine archive failed production package admission.' }
 $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $candidate))
 try {
     $metadata = $zip.GetEntry('candidate.json')
@@ -94,7 +96,7 @@ try {
         sunshineSha256 = Digest $entries['payload/Sunshine-Windows-AMD64-lite.zip']
         launcherSha256 = Digest $entries['ChildStream.exe']
         bootstrapSha256 = Digest $entries['ChildStreamBootstrap.exe']
-        sunshinePrerelease = $true; sunshineSourceCommit = '178a0467da1dde750b182be4ae10ff8f8245ad01'
+        sunshinePrerelease = $true; sunshineSourceCommit = '3d6e1d6008bd4a24906283ab25fcd0becc0a1c07'
     }
     $entries['bundle.json'] = [Text.Encoding]::UTF8.GetBytes(($descriptor | ConvertTo-Json -Compress) + "`n")
     $file = [IO.File]::Open($out,[IO.FileMode]::CreateNew)
