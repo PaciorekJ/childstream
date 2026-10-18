@@ -29,6 +29,13 @@ jobs:
           $command = 'call "' + $vcvars + '" >nul && cl /nologo /EHsc /W4 /std:c++17 /Fotests\.artifacts\ChildStreamExclusionShape.obj /Fetests\.artifacts\ChildStreamExclusionShape.exe scripts\exclusion-variant-shape.cpp ole32.lib oleaut32.lib && tests\.artifacts\ChildStreamExclusionShape.exe --synthetic'
           & cmd.exe /d /c $command
           if ($LASTEXITCODE -ne 0) { throw 'Native exclusion-shape synthetic checks failed.' }
+          Write-Output "Exclusion helper SHA256: $((Get-FileHash -LiteralPath 'tests\.artifacts\ChildStreamExclusionShape.exe' -Algorithm SHA256).Hash.ToLowerInvariant())"
+      - name: Retain exclusion helper for separate read-only review
+        uses: actions/upload-artifact@v4
+        with:
+          name: childstream-exclusion-helper-review-only
+          path: tests/.artifacts/ChildStreamExclusionShape.exe
+          if-no-files-found: error
       - name: Build unsigned candidate package
         shell: pwsh
         run: .\scripts\build-candidate.ps1
