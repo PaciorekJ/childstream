@@ -373,34 +373,6 @@ internal static class X360QualificationProgram
         }
         return 0;
     }
-    private static int Recover(string[] args)
-    {
-        if (args.Length != 2) return 2;
-        Guid runId;
-        if (!Guid.TryParseExact(args[1], "N", out runId)) return 2;
-        X360RunRecord r = Load(runId);
-        if (!(new WindowsPrincipal(WindowsIdentity.GetCurrent())).IsInRole(WindowsBuiltInRole.Administrator))
-            throw new InvalidOperationException("Separately approved elevated recovery is required; no automatic UAC.");
-        if (r.Prior == null || r.Prior.Count == 0 || r.Prior.Count > 8 ||
-            r.Prior.Any(p => p == null || String.IsNullOrWhiteSpace(p.Node) ||
-                (p.Kind != "Absent" && p.Kind != "UInt32")) ||
-            r.Prior.Select(p => p.Node).Distinct(StringComparer.OrdinalIgnoreCase).Count() != r.Prior.Count)
-            throw new InvalidOperationException("Original-property record is incomplete or ambiguous.");
-        // A live feeder might recreate or still submit a report. Wait for its
-        // exact process to exit; never clear an assignment on a present target.
-        if (new WindowsKitWorld().ProcessMatches(r.FeederPid, r.FeederStartTicks))
-            throw new InvalidOperationException("Exact feeder remains live; recovery cannot clear a restriction.");
-        var world = new WindowsKitWorld();
-        foreach (var prior in r.Prior)
-        {
-            world.RestoreAbsentTargetProperty(prior.Node, (uint)r.ChildSession,
-                new DeviceProperty { Kind = (PropertyKind)Enum.Parse(typeof(PropertyKind), prior.Kind), Value = prior.Value });
-            r.State = "RecoveryInProgress"; Save(r);
-        }
-        r.State = "RemovedAndPropertyRestored"; Save(r);
-        Console.WriteLine("Recorded non-present target properties reconciled; no device-session enforcement claim.");
-        return 0;
-    }
     private static int FocusObserve(string[] args)
     {
         if (args.Length != 3) return 2;
@@ -442,7 +414,7 @@ internal static class X360QualificationProgram
             Console.WriteLine("Future modes: --feeder PARENT_ID PARENT_LOGON CHILD_ID CHILD_LOGON; --assign RUN_ID;");
             Console.WriteLine("--observe parent-pre|parent-fresh|child RUN_ID SECONDS (only owned X360 index)");
             Console.WriteLine("--focus RUN_ID SECONDS (bounded kit-owned parent window only)");
-            Console.WriteLine("--recover RUN_ID requires separately approved elevated recovery after exact feeder exit.");
+            Console.WriteLine("Interrupted property residue requires separately reviewed recovery; no standalone clear command is enabled.");
             return 0;
         }
         try
@@ -450,7 +422,6 @@ internal static class X360QualificationProgram
             if (args[0] == "--feeder") return Feeder(args);
             if (args[0] == "--assign") return Assign(args);
             if (args[0] == "--observe") return Observe(args);
-            if (args[0] == "--recover") return Recover(args);
             if (args[0] == "--focus") return FocusObserve(args);
             return 2;
         }

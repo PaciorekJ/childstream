@@ -41,8 +41,10 @@ driver or use another application as an observer.
    Windows input paths.
 7. Stop feeder submissions, remove only its target, verify absence, then use
    recorded exact-node state to reconcile any non-present property residue.
-   If a node stays present, feeder identity is uncertain, removal fails, or
-   readback disagrees, retain the restriction and stop for reviewed recovery.
+   If a node stays present, feeder identity is uncertain, removal fails,
+   readback disagrees, or the helper was interrupted before its in-memory
+   original state could be used, retain the restriction and stop for separately
+   reviewed recovery. The same-user run file alone cannot authorize a write.
 
 Same-target reconnect may be tested without recreation. A new target, new
 child logon generation, or second controller requires a separate qualification

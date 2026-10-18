@@ -31,8 +31,12 @@ one-shot, separately elevated helper: it verifies the live feeder PID, start
 time, image hash, parent/child logon generations, parent-child WTS relationship,
 and new target PnP graph; persists prior typed property values before each
 SetupAPI write; reads back each exact node. It never writes the bus root.
-`--recover` is restricted to recorded nodes after the exact feeder exits and
-the target is non-present; unresolved residue is a stop condition.
+Normal one-shot cleanup restores non-present properties from the helper's
+in-memory originals after exact target removal. Interrupted recovery is **not
+automated**: the same-user run file is diagnostic evidence, not authorization
+to write an arbitrary device property. A protected original-state record and
+independent non-present PnP ancestry check are required before a standalone
+recovery operation can be qualified. Unresolved residue is a stop condition.
 
 `--observe` polls only the pinned client's reported X360 user index for at most
 600 seconds and labels each record `NATIVE-ORIGIN-UNQUALIFIED`. `--focus` opens
