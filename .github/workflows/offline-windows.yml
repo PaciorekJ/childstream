@@ -36,6 +36,15 @@ jobs:
           name: childstream-exclusion-helper-review-only
           path: tests/.artifacts/ChildStreamExclusionShape.exe
           if-no-files-found: error
+      - name: Build separate review-only X360 qualification kit and run substituted tests
+        shell: pwsh
+        run: .\scripts\build-x360-qualification-kit.ps1 -BuildNative
+      - name: Retain review-only X360 qualification kit
+        uses: actions/upload-artifact@v4
+        with:
+          name: childstream-x360-qualification-review-only
+          path: tests/.artifacts/x360-qualification/ChildStream-X360-qualification-review-only-*.zip
+          if-no-files-found: error
       - name: Build unsigned candidate package
         shell: pwsh
         run: .\scripts\build-candidate.ps1
