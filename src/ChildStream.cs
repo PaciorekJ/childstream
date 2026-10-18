@@ -61,6 +61,21 @@ internal static class StreamingActionBar
     }
 }
 
+internal static class ViewerWindowLifetime
+{
+    // The ActiveX viewer is the child-session host. Closing its management
+    // window by accident must not dispose the viewer or its owned runtime.
+    internal static bool MinimizeOnUserClose(Form window, FormClosingEventArgs closing,
+        bool explicitExit)
+    {
+        if (explicitExit || closing.CloseReason != CloseReason.UserClosing) return false;
+        closing.Cancel = true;
+        window.WindowState = FormWindowState.Minimized;
+        window.Hide();
+        return true;
+    }
+}
+
 internal sealed class ChildStreamingUiState
 {
     internal bool StartLocal, StartLan, Stop, Recover, Pair, EnableAudio;
@@ -374,6 +389,7 @@ static class Program
         MoonlightPairingCoordinator pairingCoordinator = null;
         bool agentStartPending = false;
         bool runtimeActionPending = false;
+        bool closeAuthorized = false;
         var statusBar = new StatusStrip();
         var statusText = new ToolStripStatusLabel("Waiting for a verified child desktop.");
         statusBar.Items.Add(statusText);
@@ -502,11 +518,17 @@ static class Program
                     "ChildStream", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
+            closeAuthorized = true;
             tray.Visible = false;
             Application.Exit();
         };
-        menu.Items.Add("Exit", null, async (s, e) =>
-        { if (!await stopAgent()) return; tray.Visible = false; Application.Exit(); });
+        menu.Items.Add("Exit ChildStream (stop owned runtime)", null, async (s, e) =>
+        {
+            if (!await stopAgent()) return;
+            closeAuthorized = true;
+            tray.Visible = false;
+            Application.Exit();
+        });
         tray.ContextMenuStrip = menu;
         tray.DoubleClick += (s, e) => { f.Show(); f.WindowState = FormWindowState.Normal; f.Activate(); };
 
@@ -943,15 +965,15 @@ static class Program
         };
         timer.Start();
 
-        bool closeAuthorized = false;
-        f.FormClosing += async (s, e) =>
+        f.FormClosing += (s, e) =>
         {
-            if (agent != null && !closeAuthorized)
+            if (ViewerWindowLifetime.MinimizeOnUserClose(f, e, closeAuthorized))
             {
-                e.Cancel = true;
-                if (await stopAgent()) { closeAuthorized = true; f.Close(); }
+                tray.ShowBalloonTip(1500, "ChildStream", "Child desktop remains hosted. Use the tray menu to stop it explicitly.", ToolTipIcon.Info);
                 return;
             }
+            if (!closeAuthorized && agent != null && e.CloseReason != CloseReason.WindowsShutDown)
+            { e.Cancel = true; statusText.Text = "Use the tray Exit command to stop the exact owned child runtime."; return; }
             timer.Stop(); tray.Visible = false;
             if (agentHost != null) agentHost.Dispose();
         };

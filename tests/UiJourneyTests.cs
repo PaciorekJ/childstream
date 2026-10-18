@@ -89,6 +89,27 @@ internal static class UiJourneyTests
         Application.EnableVisualStyles();
         string folder = args.Length == 1 ? args[0] : Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "screenshots");
         Directory.CreateDirectory(folder);
+        using (var viewer = new Form { Text = "ChildStream viewer lifetime — simulated",
+            Width = 500, Height = 180, StartPosition = FormStartPosition.Manual,
+            Location = new Point(-2000, -2000) })
+        {
+            bool explicitExit = false;
+            int closeAttempts = 0;
+            viewer.FormClosing += (s, e) =>
+            {
+                closeAttempts++;
+                ViewerWindowLifetime.MinimizeOnUserClose(viewer, e, explicitExit);
+            };
+            viewer.Show(); Application.DoEvents();
+            viewer.Close(); Application.DoEvents();
+            Check(closeAttempts == 1 && !viewer.IsDisposed && !viewer.Visible &&
+                viewer.WindowState == FormWindowState.Minimized,
+                "ordinary window close retains the viewer host instead of terminating it");
+            explicitExit = true;
+            viewer.Close(); Application.DoEvents();
+            Check(closeAttempts == 2 && viewer.IsDisposed,
+                "explicit exit can dispose the viewer after owned runtime stop");
+        }
         var installer = new Installer();
         using (var form = new ProductInstallDialog(installer, true))
         {

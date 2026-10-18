@@ -155,3 +155,5 @@ if (Test-Path -LiteralPath (Join-Path $root 'scripts\workload-inventory.ps1')) {
     throw 'Retired cross-project workload inventory must not be present.'
 }
 Write-Output 'Read-only network, source-shape and HNS syntax/mutation-command audit passed.'
+& pwsh -NoProfile -File (Join-Path $PSScriptRoot 'ProfileExclusionShapeTests.ps1')
+if ($LASTEXITCODE -ne 0) { throw 'Exclusion representation synthetic tests failed.' }
