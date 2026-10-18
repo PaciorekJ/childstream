@@ -12,14 +12,15 @@ driver or use another application as an observer.
    process. Record parent and child session IDs and WTS logon times. Confirm
    installed ViGEmBus version and that the pinned client can create one X360
    target. If the PnP graph or child relationship is ambiguous, stop.
-2. Start the bounded parent XInput observer **before** target creation; keep it
-   polling across assignment. Run `--focus` for a kit-owned parent window for
-   translated keyboard/navigation observations. Actions outside that window
-   remain outside the kit's coverage.
-3. Start the feeder within the exact child session. It creates one neutral
-   target, records a private run ID, and holds explicit reports. Creation may
-   already expose neutral state. Identify all present target nodes under the
-   unique ViGEmBus interface. A reused serial or identity is a stop.
+2. Start the feeder within the exact child session. It creates one neutral
+   target, records a private run ID and pinned XInput user index, and holds
+   explicit reports. Creation may already expose neutral state. Identify all
+   present target nodes under the unique ViGEmBus interface. A reused serial
+   or identity is a stop.
+3. Start the bounded parent XInput observer for that run **before assignment**;
+   keep it polling across the assignment. Run `--focus` for a kit-owned parent
+   window for translated keyboard/navigation observations. Actions outside that
+   window remain outside the kit's coverage.
 4. Under a **separate** one-shot elevation approval, run assignment by exact
    run ID from the parent session. It reads original `DEVPKEY_Device_SessionId`
    type and value, persists them, assigns the exact target nodes to the child
