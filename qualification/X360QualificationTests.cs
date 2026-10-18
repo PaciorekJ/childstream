@@ -1,6 +1,12 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.IO.Pipes;
 using System.Linq;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
 
 internal static class X360QualificationTests
 {
@@ -10,12 +16,54 @@ internal static class X360QualificationTests
         internal readonly List<ushort> Reports = new List<ushort>();
         internal int Creates, Removes;
         internal bool ThrowRemove;
+        internal ushort Current;
         public bool Attached { get; private set; }
         public uint CreateNeutral() { Creates++; Attached = true; return Serial; }
-        public void Submit(ushort buttons) { if (!Attached) throw new Exception("removed target"); Reports.Add(buttons); }
+        public void Submit(ushort buttons) { if (!Attached) throw new Exception("removed target"); Current = buttons; Reports.Add(buttons); }
         public void Remove() { if (!Attached) throw new Exception("unrelated removal");
             if (ThrowRemove) throw new InvalidOperationException("native removal failed");
             Attached = false; Removes++; }
+    }
+    private sealed class Clock : IKitClock
+    {
+        internal long Now = 1000;
+        internal Target Target;
+        internal KitSequenceSampler Sampler;
+        internal long StartSamplingAt = 0;
+        internal int SampleEvery = 1, Steps;
+        public long Ticks { get { return Now; } }
+        public long Frequency { get { return 1000; } }
+        public void WaitUntil(long end, CancellationToken cancel)
+        {
+            while (Now < end)
+            {
+                cancel.ThrowIfCancellationRequested();
+                Now = Math.Min(Now + 50, end);
+                Steps++;
+                if (Sampler != null && Now >= StartSamplingAt && Steps % SampleEvery == 0)
+                    Sampler.Sample(Now, Target.Current, 0, Frequency);
+            }
+        }
+    }
+    private static Clock SampleClock(Target t)
+    { return new Clock { Target = t, Sampler = new KitSequenceSampler() }; }
+    private static byte[] NativeBytes(params string[] strings)
+    { return Encoding.Unicode.GetBytes(String.Join("\0", strings) + (strings.Length == 1 ? "\0" : "\0\0")); }
+    private static KitNode NativeBus()
+    {
+        byte[] service = NativeBytes("ViGEmBus");
+        byte[] ids = NativeBytes("Nefarius\\ViGEmBus\\Gen1", "Nefarius\\ViGEmBus\\Gen1Alt");
+        return new KitNode { Id = Bus, Parent = "HTREE\\ROOT\\0", Present = true,
+            Service = WindowsKitWorld.DecodeRegistryStrings(4, true, 0, 1, service, (uint)service.Length)[0],
+            HardwareIds = WindowsKitWorld.DecodeRegistryStrings(1, true, 0, 7, ids, (uint)ids.Length) };
+    }
+    private static KitNode NativePad()
+    {
+        byte[] service = NativeBytes("xusb22");
+        byte[] ids = NativeBytes("USB\\VID_045E&PID_028E", "USB\\Class_FF");
+        return new KitNode { Id = Node, Parent = Bus, Present = true,
+            Service = WindowsKitWorld.DecodeRegistryStrings(4, true, 0, 1, service, (uint)service.Length)[0],
+            HardwareIds = WindowsKitWorld.DecodeRegistryStrings(1, true, 0, 7, ids, (uint)ids.Length) };
     }
     private sealed class World : IKitWorld
     {
@@ -69,17 +117,20 @@ internal static class X360QualificationTests
         // capture must be independently controlled by the fake in this test.
         w.After = w.Before; q.Create();
         Check(t.Creates == 1 && t.Reports.Count == 0, "creation must hold reports");
-        Reject(() => q.Pulse(), "no assignment must mean zero reports");
+        Reject(() => q.Pulse(SampleClock(t), CancellationToken.None), "no assignment must mean zero reports");
         w.After = new[] { Root(), BusNode(), Pad(Node, Bus) };
         var nodes = q.Assign();
         Check(nodes.Length == 1 && nodes[0] == Node && w.Writes == 1, "exact node assigned");
-        Reject(() => q.Pulse(), "no explicit arm must mean zero reports");
+        Reject(() => q.Pulse(SampleClock(t), CancellationToken.None), "no explicit arm must mean zero reports");
         Reject(() => q.Arm(Guid.NewGuid()), "wrong run arm rejected");
-        q.Arm(q.Identity.Run); q.Pulse();
+        var clock = SampleClock(t);
+        q.Arm(q.Identity.Run); q.Pulse(clock, CancellationToken.None);
         Check(t.Reports.SequenceEqual(new ushort[] { 0x1000, 0x2000, 0x1000, 0 }), "bounded reports only");
+        Check(clock.Sampler.SequenceSeen && q.Phases.Count == 4 &&
+            q.Phases.All(p => p.EndTick - p.StartTick == 400), "sampled timed challenge including neutral dwell");
         q.ReconnectSameTarget();
         Check(t.Creates == 1 && t.Reports.Count == 4, "same target reconnect does not duplicate or pulse");
-        Reject(() => q.Pulse(), "cannot replay the same challenge");
+        Reject(() => q.Pulse(SampleClock(t), CancellationToken.None), "cannot replay the same challenge");
         var yes = new KitObservation { Complete = true, TargetAttributed = true, SequenceSeen = true };
         var no = new KitObservation { Complete = true, TargetAttributed = true };
         Check(q.Evaluate(yes, no, no).Verdict == KitVerdict.SyntheticPass, "modeled positive path remains synthetic");
@@ -92,6 +143,17 @@ internal static class X360QualificationTests
             "observer error inconclusive");
         q.Stop(); Check(t.Removes == 1 && !t.Attached, "only own target removed after gate closed");
         Check(w.Properties[Node].Value == 2, "teardown retains restriction pending verified recovery");
+
+        q = New(out t, out w); w.After = w.Before; q.Create(); w.After = new[] { Root(), BusNode(), Pad(Node, Bus) };
+        q.Assign(); q.Arm(q.Identity.Run);
+        clock = SampleClock(t); clock.StartSamplingAt = 1500; q.Pulse(clock, CancellationToken.None);
+        Check(!clock.Sampler.SequenceSeen, "late observer misses first challenge phase"); q.Stop();
+
+        q = New(out t, out w); w.After = w.Before; q.Create(); w.After = new[] { Root(), BusNode(), Pad(Node, Bus) };
+        q.Assign(); q.Arm(q.Identity.Run);
+        clock = SampleClock(t); clock.SampleEvery = 4; q.Pulse(clock, CancellationToken.None);
+        Check(!clock.Sampler.Complete && !clock.Sampler.SequenceSeen,
+            "200 ms skipped sampling is inconclusive even if values recur"); q.Stop();
 
         q = New(out t, out w); w.After = w.Before; q.Create(); w.After = new[] { Root(), BusNode(), Pad(Node, Bus) };
         w.ProcessOkay = false; Reject(() => q.Assign(), "wrong feeder rejected"); Check(w.Writes == 0 && t.Reports.Count == 0, "wrong feeder zero writes/reports");
@@ -143,18 +205,77 @@ internal static class X360QualificationTests
         Check(WindowsKitWorld.DecodePropertyResult(true, 0, 7, 4, BitConverter.GetBytes((uint)2)).Value == 2,
             "native UINT32 is preserved exactly");
 
+        var import = (DllImportAttribute)typeof(WindowsKitWorld).GetMethod("SetupDiGetDeviceRegistryProperty",
+            BindingFlags.Static | BindingFlags.NonPublic).GetCustomAttributes(typeof(DllImportAttribute), false)[0];
+        Check(import.EntryPoint == "SetupDiGetDeviceRegistryPropertyW" && import.CharSet == CharSet.Unicode &&
+            import.ExactSpelling && import.SetLastError, "declared registry import is exact Unicode W ABI");
+        byte[] sz = NativeBytes("ViGEmBus"), multi = NativeBytes("USB\\VID_045E&PID_028E", "USB\\Class_FF");
+        Check(WindowsKitWorld.DecodeRegistryStrings(4, true, 0, 1, sz, (uint)sz.Length).Single() == "ViGEmBus",
+            "native REG_SZ service decoded");
+        Check(WindowsKitWorld.DecodeRegistryStrings(1, true, 0, 7, multi, (uint)multi.Length).Length == 2,
+            "native REG_MULTI_SZ hardware IDs decoded");
+        Check(KitAttribution.Resolve(new[] { Root(), NativeBus() },
+            new[] { Root(), NativeBus(), NativePad() }, 1).Single() == Node,
+            "native-shaped Unicode registry bytes reach exact target attribution");
+        Reject(() => WindowsKitWorld.DecodeRegistryStrings(4, true, 0, 7, sz, (uint)sz.Length), "wrong REG type rejected");
+        Reject(() => WindowsKitWorld.DecodeRegistryStrings(4, true, 0, 1, sz, (uint)sz.Length - 1), "odd length rejected");
+        Reject(() => WindowsKitWorld.DecodeRegistryStrings(4, true, 0, 1, sz, 2), "insufficient data rejected");
+        Reject(() => WindowsKitWorld.DecodeRegistryStrings(4, true, 0, 1, sz, (uint)sz.Length + 2), "oversize rejected");
+        Reject(() => WindowsKitWorld.DecodeRegistryStrings(1, true, 0, 7, multi, (uint)multi.Length - 2), "missing double terminator rejected");
+        Check(RejectAny(() => WindowsKitWorld.DecodeRegistryStrings(4, false, 13, 1, sz, (uint)sz.Length)),
+            "failed native registry read rejected, not absent");
+
+        q = New(out t, out w); w.After = w.Before; q.Create(); w.After = new[] { Root(), BusNode(), Pad(Node, Bus) };
+        var run = new X360RunRecord { Run = q.Identity.Run.ToString("N"), OwnerSid = "owner", FeederPid = 42,
+            FeederStartTicks = 1000, ParentSession = 1, ChildSession = 2, FeederImageSha256 = "attacker" };
+        var peer = new KitPeerSnapshot { Pid = 42, StartTicks = 1000, ProcessSession = 2, TokenSession = 2,
+            Sid = "owner", ImageSha256 = "attacker", Elevated = false };
+        Reject(() => KitPeerAdmission.Require(peer, run, "independent-kit", KitPeerRole.Feeder),
+            "record and peer agreement on wrong image cannot admit writes");
+        Check(w.Writes == 0 && t.Reports.Count == 0, "forged record has zero writes/reports");
+        run.FeederImageSha256 = "independent-kit"; peer.ImageSha256 = "independent-kit";
+        peer.Elevated = true;
+        Reject(() => KitPeerAdmission.Require(peer, run, "independent-kit", KitPeerRole.Feeder), "wrong feeder role rejected");
+        peer.Elevated = false; peer.TokenSession = 1;
+        Reject(() => KitPeerAdmission.Require(peer, run, "independent-kit", KitPeerRole.Feeder), "wrong token session rejected");
+        peer.TokenSession = 2; peer.StartTicks++;
+        Reject(() => KitPeerAdmission.Require(peer, run, "independent-kit", KitPeerRole.Feeder), "stale feeder process rejected");
+        Check(w.Writes == 0 && t.Reports.Count == 0, "all peer denials precede effects"); q.Stop();
+
+        using (var server = new AnonymousPipeServerStream(PipeDirection.Out, HandleInheritability.None))
+        using (var client = new AnonymousPipeClientStream(PipeDirection.In, server.ClientSafePipeHandle))
+        {
+            using (var writer = new BinaryWriter(server, Encoding.UTF8, true))
+            using (var reader = new BinaryReader(client, Encoding.UTF8, true))
+            {
+                X360QualificationProgram.Send(writer, "READY run parent-pre"); writer.Write(1000L); writer.Flush();
+                KitObserverAdmission.RequireReady(X360QualificationProgram.Receive(reader), "run", "parent-pre",
+                    reader.ReadInt64(), 1100, 1000);
+                Check(true, "real harmless named pipe carried bounded observer readiness");
+            }
+        }
+        Reject(() => KitObserverAdmission.RequireReady("READY other parent-pre", "run", "parent-pre", 1000, 1100, 1000),
+            "wrong run readiness rejected");
+        Reject(() => KitObserverAdmission.RequireReady("READY run child", "run", "parent-pre", 1000, 1100, 1000),
+            "wrong role readiness rejected");
+        Reject(() => KitObserverAdmission.RequireReady("READY run parent-pre", "run", "parent-pre", 1000, 2500, 1000),
+            "late observer readiness rejected");
+
         q = New(out t, out w); w.After = w.Before; q.Create(); w.After = new[] { Root(), BusNode(), Pad(Node, Bus) };
         q.AcceptExternalAssignment(new[] { Node }, q.Identity.Run);
-        Reject(() => q.PulseAfterExternalArm(q.Identity.Run), "feeder rejects missing property readback");
+        Reject(() => q.PulseAfterExternalArm(q.Identity.Run, true, SampleClock(t), CancellationToken.None), "feeder rejects missing property readback");
         Check(t.Reports.Count == 0, "missing external assignment gives zero reports");
         w.Properties[Node] = new DeviceProperty { Kind = PropertyKind.UInt32, Value = 2 };
-        q.PulseAfterExternalArm(q.Identity.Run);
+        Reject(() => q.PulseAfterExternalArm(q.Identity.Run, false, SampleClock(t), CancellationToken.None), "unready observers hold reports");
+        q.PulseAfterExternalArm(q.Identity.Run, true, SampleClock(t), CancellationToken.None);
         Check(t.Reports.SequenceEqual(new ushort[] { 0x1000, 0x2000, 0x1000, 0 }),
             "exact external assignment releases only bounded pulse");
         q.Stop();
         Console.WriteLine("REVIEW-ONLY SYNTHETIC X360 qualification assertions passed: " + checks);
         return checks;
     }
+    private static bool RejectAny(Action action)
+    { try { action(); return false; } catch (System.ComponentModel.Win32Exception) { return true; } }
     public static int Main(string[] args)
     {
         if (args.Length == 1 && args[0] == "--self-test") { Run(); return 0; }

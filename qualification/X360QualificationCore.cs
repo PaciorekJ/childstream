@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Threading;
 
 // Review-only qualification logic. No production assembly references this file.
 internal enum KitVerdict { SyntheticPass, Fail, Inconclusive }
@@ -54,6 +55,49 @@ internal interface IKitWorld
     void SetProperty(string instance, uint value);
     bool ProcessMatches(int pid, long startTicks);
     bool GenerationMatches(int session, long logon);
+}
+
+internal interface IKitClock
+{
+    long Ticks { get; }
+    long Frequency { get; }
+    void WaitUntil(long tick, CancellationToken cancellation);
+}
+internal sealed class MonotonicKitClock : IKitClock
+{
+    public long Ticks { get { return Stopwatch.GetTimestamp(); } }
+    public long Frequency { get { return Stopwatch.Frequency; } }
+    public void WaitUntil(long tick, CancellationToken cancellation)
+    {
+        while (Ticks < tick)
+        {
+            cancellation.ThrowIfCancellationRequested();
+            Thread.Sleep(5);
+        }
+    }
+}
+internal sealed class KitChallengePhase
+{
+    internal ushort Buttons;
+    internal long StartTick, EndTick;
+}
+internal sealed class KitSequenceSampler
+{
+    private static readonly ushort[] Expected = { 0x1000, 0x2000, 0x1000, 0 };
+    private int next;
+    private long previous = -1;
+    internal bool Complete { get; private set; }
+    internal KitSequenceSampler() { Complete = true; }
+    internal bool SequenceSeen { get { return Complete && next == Expected.Length; } }
+    internal void Sample(long tick, ushort buttons, uint error, long frequency)
+    {
+        if (frequency <= 0 || tick < 0 || (previous >= 0 &&
+            (tick <= previous || tick - previous > frequency * 150 / 1000))) Complete = false;
+        previous = tick;
+        if (error != 0) { Complete = false; return; }
+        if (next < Expected.Length && buttons == Expected[next]) next++;
+        else if (next > 0 && buttons != Expected[next - 1]) Complete = false;
+    }
 }
 
 internal static class KitAttribution
@@ -120,6 +164,7 @@ internal sealed class X360Qualification
     internal readonly KitIdentity Identity;
     internal readonly Dictionary<string, DeviceProperty> Prior = new Dictionary<string, DeviceProperty>(StringComparer.OrdinalIgnoreCase);
     internal int SubmittedCount { get; private set; }
+    internal readonly List<KitChallengePhase> Phases = new List<KitChallengePhase>();
     internal KitNode[] BeforeSnapshot { get { return before; } }
     internal X360Qualification(IKitTarget target, IKitWorld world, KitIdentity identity)
     { this.target = target; this.world = world; Identity = identity; }
@@ -195,9 +240,9 @@ internal sealed class X360Qualification
             throw new InvalidOperationException("Assignment node graph disagrees with feeder.");
         nodes = graph; Identity.TargetInstance = graph[0]; assigned = true;
     }
-    internal void PulseAfterExternalArm(Guid exactRun)
+    internal void PulseAfterExternalArm(Guid exactRun, bool observersReady, IKitClock clock, CancellationToken cancellation)
     {
-        if (!assigned || stopped || armed || exactRun != Identity.Run)
+        if (!assigned || stopped || armed || exactRun != Identity.Run || !observersReady)
             throw new InvalidOperationException("One-shot arm invalid.");
         CheckIdentity();
         var graph = KitAttribution.Resolve(before, world.Nodes(), Identity.Serial);
@@ -209,15 +254,35 @@ internal sealed class X360Qualification
             if (p == null || p.Kind != PropertyKind.UInt32 || p.Value != Identity.ChildSession)
                 throw new InvalidOperationException("Assignment changed before feeder report release.");
         }
-        armed = true; Pulse();
+        armed = true; Pulse(clock, cancellation);
     }
-    internal void Pulse()
+    internal void Pulse(IKitClock clock, CancellationToken cancellation)
     {
-        if (!armed || stopped || SubmittedCount != 0) throw new InvalidOperationException("Reports are held.");
+        if (!armed || stopped || SubmittedCount != 0 || clock == null || clock.Frequency <= 0)
+            throw new InvalidOperationException("Reports are held.");
         CheckIdentity();
-        // A/B/A/neutral is a bounded, identifiable sequence; no background repeat.
+        // Eight 50 ms observer opportunities per state, including final neutral.
+        // A late wakeup fails the experiment; it never substitutes success.
+        long start = clock.Ticks;
+        long dwell = checked(clock.Frequency * 400 / 1000);
+        long tolerance = checked(clock.Frequency * 150 / 1000);
+        if (dwell <= 0) throw new InvalidOperationException("Clock resolution is insufficient.");
         foreach (ushort buttons in new ushort[] { 0x1000, 0x2000, 0x1000, 0 })
-        { target.Submit(buttons); SubmittedCount++; }
+        {
+            cancellation.ThrowIfCancellationRequested();
+            CheckIdentity();
+            long phaseStart = clock.Ticks;
+            long priorEnd = SubmittedCount == 0 ? start : Phases[Phases.Count - 1].EndTick;
+            if (phaseStart > checked(priorEnd + tolerance))
+                throw new TimeoutException("Challenge phase began too late for complete observation.");
+            target.Submit(buttons); SubmittedCount++;
+            long end = checked(phaseStart + dwell);
+            var phase = new KitChallengePhase { Buttons = buttons, StartTick = phaseStart, EndTick = end };
+            Phases.Add(phase);
+            clock.WaitUntil(end, cancellation);
+            if (clock.Ticks > end + tolerance)
+                throw new TimeoutException("Challenge sampling window exceeded deadline.");
+        }
     }
     internal void ReconnectSameTarget()
     {

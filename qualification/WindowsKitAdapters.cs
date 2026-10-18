@@ -105,7 +105,8 @@ internal sealed class WindowsKitWorld : IKitWorld
     private static extern bool SetupDiGetDeviceInstanceId(IntPtr set, ref DeviceInfo data, StringBuilder id, uint chars, out uint required);
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool SetupDiOpenDeviceInfo(IntPtr set, string id, IntPtr window, uint flags, ref DeviceInfo data);
-    [DllImport("setupapi.dll", SetLastError = true)]
+    [DllImport("setupapi.dll", EntryPoint = "SetupDiGetDeviceRegistryPropertyW", CharSet = CharSet.Unicode,
+        ExactSpelling = true, SetLastError = true)]
     private static extern bool SetupDiGetDeviceRegistryProperty(IntPtr set, ref DeviceInfo data, uint property,
         out uint type, byte[] buffer, uint bytes, out uint required);
     [DllImport("setupapi.dll", EntryPoint = "SetupDiGetDevicePropertyW", SetLastError = true)]
@@ -161,15 +162,31 @@ internal sealed class WindowsKitWorld : IKitWorld
     {
         uint type, required;
         var bytes = new byte[4096];
-        if (!SetupDiGetDeviceRegistryProperty(set, ref data, property, out type, bytes, (uint)bytes.Length, out required))
+        bool success = SetupDiGetDeviceRegistryProperty(set, ref data, property, out type, bytes, (uint)bytes.Length, out required);
+        int error = success ? 0 : Marshal.GetLastWin32Error();
+        return DecodeRegistryStrings(property, success, error, type, bytes, required);
+    }
+    internal static string[] DecodeRegistryStrings(uint property, bool success, int error, uint type, byte[] bytes, uint required)
+    {
+        // SetupDiGetDeviceRegistryPropertyW can report ERROR_INVALID_DATA for
+        // either an absent or malformed value. Neither is safe attribution.
+        if (!success) throw new Win32Exception(error, "PnP registry property unavailable or invalid");
+        uint expected = property == SpdrpService ? 1U : property == SpdrpHardwareId ? 7U : 0U;
+        if (expected == 0 || type != expected || bytes == null || required > bytes.Length ||
+            required < (expected == 1 ? 4U : 6U) || (required & 1) != 0)
+            throw new InvalidOperationException("PnP registry property has unexpected type or size.");
+        string value = new UnicodeEncoding(false, true, true).GetString(bytes, 0, checked((int)required));
+        if (expected == 1)
         {
-            int error = Marshal.GetLastWin32Error();
-            if (error == ErrorNotFound) return new string[0];
-            throw new Win32Exception(error, "PnP property unavailable");
+            if (value[value.Length - 1] != '\0' || value.IndexOf('\0') != value.Length - 1)
+                throw new InvalidOperationException("REG_SZ is empty, unterminated, or contains an embedded terminator.");
+            return new[] { value.Substring(0, value.Length - 1) };
         }
-        if (required > bytes.Length || (required & 1) != 0 || (type != 1 && type != 7))
-            throw new InvalidOperationException("PnP property has unexpected type or size.");
-        return Encoding.Unicode.GetString(bytes, 0, (int)required).TrimEnd('\0').Split(new char[] { '\0' }, StringSplitOptions.RemoveEmptyEntries);
+        if (!value.EndsWith("\0\0", StringComparison.Ordinal) || value[0] == '\0')
+            throw new InvalidOperationException("REG_MULTI_SZ is empty or unterminated.");
+        string[] values = value.Substring(0, value.Length - 2).Split('\0');
+        if (values.Any(String.IsNullOrEmpty)) throw new InvalidOperationException("REG_MULTI_SZ has an empty element.");
+        return values;
     }
     public KitNode[] Nodes()
     {
