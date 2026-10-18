@@ -28,6 +28,7 @@ internal sealed class X360RunRecord
     public string State = "CreatedHeld";
     public string TargetCleanup = "Present"; // feeder-owned
     public string PropertyCleanup = "NotStarted"; // helper-owned
+    public List<X360ObserverTeardownRecord> ObserverTeardown = new List<X360ObserverTeardownRecord>(); // helper-owned
     public string[] Nodes;
     public List<X360PhaseRecord> Phases = new List<X360PhaseRecord>();
     public List<X360ObservationRecord> Observations = new List<X360ObservationRecord>();
@@ -53,6 +54,10 @@ internal sealed class X360ObservationRecord
     public int ChallengeSamples, NotConnected, OtherErrors;
     public bool Complete, SequenceSeen, ConnectedDuringChallenge;
     public string Attribution = "PinnedClientSlotOnly";
+}
+internal sealed class X360ObserverTeardownRecord
+{
+    public string Role, Status, Error;
 }
 internal sealed class X360ObserverReadyRecord
 {
@@ -110,6 +115,29 @@ internal static class KitPeerAdmission
             (role == KitPeerRole.Feeder && (peer.Pid != run.FeederPid || peer.StartTicks != run.FeederStartTicks)) ||
             peer.Pid <= 0 || peer.StartTicks <= 0)
             throw new InvalidOperationException("Peer role, process, or session generation differs.");
+    }
+    internal static void RequireCurrent(IKitWorld world, X360RunRecord run, bool requireFeederLive)
+    {
+        if (world == null || run == null ||
+            (requireFeederLive && !world.ProcessMatches(run.FeederPid, run.FeederStartTicks)) ||
+            !world.GenerationMatches(run.ParentSession, run.ParentLogon) ||
+            !world.GenerationMatches(run.ChildSession, run.ChildLogon))
+            throw new InvalidOperationException("Peer WTS generation or required feeder identity changed.");
+    }
+}
+internal static class KitObserverProtocol
+{
+    internal static string Command(BinaryReader input, BinaryWriter output,
+        X360RunRecord run, string role, string command, int timeoutMs, Action abort)
+    {
+        if (input == null || output == null || run == null || abort == null ||
+            timeoutMs < 1 || timeoutMs > 3000)
+            throw new InvalidOperationException("Bounded observer command context invalid.");
+        X360QualificationProgram.Send(output, command + " " + run.Run + " " + role);
+        var response = Task.Factory.StartNew(() => X360QualificationProgram.Receive(input));
+        if (!response.Wait(TimeSpan.FromMilliseconds(timeoutMs)))
+        { abort(); throw new TimeoutException(role + " did not acknowledge " + command + "."); }
+        return response.Result;
     }
 }
 internal static class KitObserverAdmission
@@ -228,6 +256,66 @@ internal static class KitObservationFinalization
     }
 }
 
+internal static class KitPostChallengeCleanup
+{
+    private static readonly string[] Roles = { "parent-pre", "parent-fresh", "child" };
+    private static string Issue(Exception error)
+    {
+        string value = error.GetType().Name + ": " + error.Message;
+        return value.Length <= 240 ? value : value.Substring(0, 240);
+    }
+    // This is the Assign coordinator's post-finalization sequence. The target
+    // must be confirmed absent before property restoration. Observer completion
+    // is attempted for every role even when another cleanup step fails.
+    internal static bool Run(X360RunRecord run, Action removeTarget,
+        Action<string> completeObserver, Action restoreProperties, Action persist,
+        string observationIssue)
+    {
+        if (run == null || removeTarget == null || completeObserver == null ||
+            restoreProperties == null || persist == null ||
+            run.ObserverTeardown == null || run.ObserverTeardown.Count != 0)
+            throw new InvalidOperationException("Post-challenge cleanup context invalid.");
+        var issues = new List<string>();
+        if (observationIssue != null) issues.Add("observation: " + observationIssue);
+        bool recordFailure = false;
+        Action save = () => { try { persist(); }
+            catch (Exception error) {
+                if (!recordFailure) { issues.Add("record: " + Issue(error)); recordFailure = true; }
+                run.Error = String.Join("; ", issues);
+            } };
+        try { removeTarget(); run.TargetCleanup = "Removed"; }
+        catch (Exception error)
+        { run.TargetCleanup = "RemovalFailed"; issues.Add("target: " + Issue(error)); }
+        run.State = run.TargetCleanup == "Removed" ? "RemovedPendingObserverAndPropertyRecovery" :
+            "TargetRemovalUnconfirmed";
+        save();
+        foreach (string role in Roles)
+        {
+            var completion = new X360ObserverTeardownRecord { Role = role };
+            try { completeObserver(role); completion.Status = "Exited"; }
+            catch (Exception error)
+            { completion.Status = "Incomplete"; completion.Error = Issue(error);
+              issues.Add("observer " + role + ": " + completion.Error); }
+            run.ObserverTeardown.Add(completion);
+            save();
+        }
+        if (run.TargetCleanup == "Removed")
+        {
+            try { restoreProperties(); run.PropertyCleanup = "Restored"; }
+            catch (Exception error)
+            { run.PropertyCleanup = "RecoveryFailed"; issues.Add("properties: " + Issue(error)); }
+        }
+        run.State = run.TargetCleanup != "Removed" ? "TargetRemovalUnconfirmed" :
+            run.PropertyCleanup != "Restored" ? "PropertyRecoveryFailed" :
+            issues.Count == 0 ? "RemovedAndPropertyRestored" : "RemovedAndRestoredWithLimitations";
+        run.Error = issues.Count == 0 ? null : String.Join("; ", issues);
+        save();
+        return issues.Count == 0 && run.TargetCleanup == "Removed" &&
+            run.PropertyCleanup == "Restored" &&
+            run.ObserverTeardown.All(status => status.Status == "Exited");
+    }
+}
+
 internal static class X360QualificationProgram
 {
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -324,6 +412,12 @@ internal static class X360QualificationProgram
                 o.Attribution != "PinnedClientSlotOnly" ||
                 (o.Role != "parent-pre" && o.Role != "parent-fresh" && o.Role != "child"))))
             throw new InvalidOperationException("Wrong-run or duplicate observer evidence.");
+        string[] roles = { "parent-pre", "parent-fresh", "child" };
+        if (r.ObserverTeardown != null && (r.ObserverTeardown.Count > 3 ||
+            r.ObserverTeardown.Where((entry, i) => entry == null || entry.Role != roles[i] ||
+                (entry.Status != "Exited" && entry.Status != "Incomplete") ||
+                (entry.Status == "Exited" && entry.Error != null)).Any()))
+            throw new InvalidOperationException("Malformed or duplicate observer teardown status.");
         if (!(r.TargetCleanup == "Present" || r.TargetCleanup == "Removed" || r.TargetCleanup == "RemovalFailed") ||
             !(r.PropertyCleanup == "NotStarted" || r.PropertyCleanup == "Restored" || r.PropertyCleanup == "RecoveryFailed"))
             throw new InvalidOperationException("Unknown cleanup state.");
@@ -350,6 +444,14 @@ internal static class X360QualificationProgram
         else if (previous.Observations != null && previous.Observations.Count > 0 &&
             !ObservationsExtend(previous.Observations, incoming.Observations))
             throw new InvalidOperationException("Conflicting observation evidence.");
+        if (incoming.ObserverTeardown == null || incoming.ObserverTeardown.Count == 0)
+            incoming.ObserverTeardown = previous.ObserverTeardown;
+        else if (previous.ObserverTeardown != null && previous.ObserverTeardown.Count > 0 &&
+            (incoming.ObserverTeardown.Count < previous.ObserverTeardown.Count ||
+             previous.ObserverTeardown.Where((entry, i) => entry.Role != incoming.ObserverTeardown[i].Role ||
+                 entry.Status != incoming.ObserverTeardown[i].Status ||
+                 entry.Error != incoming.ObserverTeardown[i].Error).Any()))
+            throw new InvalidOperationException("Conflicting observer teardown status.");
         if (incoming.TargetCleanup == "Present") incoming.TargetCleanup = previous.TargetCleanup;
         else if (previous.TargetCleanup != "Present" && previous.TargetCleanup != incoming.TargetCleanup)
             throw new InvalidOperationException("Conflicting feeder cleanup status.");
@@ -431,14 +533,11 @@ internal static class X360QualificationProgram
             finally { CloseHandle(handle); }
         }
     }
-    private static void CheckPeer(uint peerPid, X360RunRecord r, KitPeerRole role)
+    private static void CheckPeer(uint peerPid, X360RunRecord r, KitPeerRole role,
+        bool requireFeederLive = true)
     {
         KitPeerAdmission.Require(SnapshotPeer(peerPid), r, ImageHash(OwnImage()), role);
-        var world = new WindowsKitWorld();
-        if (!world.ProcessMatches(r.FeederPid, r.FeederStartTicks) ||
-            !world.GenerationMatches(r.ParentSession, r.ParentLogon) ||
-            !world.GenerationMatches(r.ChildSession, r.ChildLogon))
-            throw new InvalidOperationException("Peer WTS generation changed.");
+        KitPeerAdmission.RequireCurrent(new WindowsKitWorld(), r, requireFeederLive);
     }
     private static void CheckContext(X360RunRecord r, bool feeder)
     {
@@ -455,9 +554,10 @@ internal static class X360QualificationProgram
     private sealed class ObserverLease : IDisposable
     {
         internal NamedPipeServerStream Pipe;
+        internal Process Observer;
         internal KitPeerSnapshot Peer;
         internal long ReadyTick;
-        public void Dispose() { if (Pipe != null) Pipe.Dispose(); }
+        public void Dispose() { if (Pipe != null) Pipe.Dispose(); if (Observer != null) Observer.Dispose(); }
     }
     private static ObserverLease AwaitObserver(X360RunRecord r, string role)
     {
@@ -477,6 +577,10 @@ internal static class X360QualificationProgram
                 throw new InvalidOperationException("Observer process identity unavailable.");
             CheckPeer(pid, r, role == "child" ? KitPeerRole.ChildObserver : KitPeerRole.ParentObserver);
             lease.Peer = SnapshotPeer(pid);
+            lease.Observer = Process.GetProcessById((int)pid);
+            if (lease.Observer.StartTime.ToUniversalTime().Ticks != lease.Peer.StartTicks)
+                throw new InvalidOperationException("Observer process changed after identity check.");
+            var observerHandle = lease.Observer.Handle; // Retain exact process through teardown/exit-code read.
             // READY contains two bounded samples, not merely a live process.
             using (var watchdog = new System.Threading.Timer(_ => { try { lease.Pipe.Dispose(); } catch { } },
                 null, TimeSpan.FromSeconds(30), Timeout.InfiniteTimeSpan))
@@ -491,31 +595,39 @@ internal static class X360QualificationProgram
         }
         catch { lease.Dispose(); throw; }
     }
-    private static void RequireObserverStillRunning(ObserverLease lease, X360RunRecord r, string role)
+    private static void RequireObserverStillRunning(ObserverLease lease, X360RunRecord r, string role,
+        bool requireFeederLive = true)
     {
         KitObserverAdmission.RequireLive(lease != null && lease.Pipe.IsConnected,
             lease != null && new WindowsKitWorld().ProcessMatches(lease.Peer.Pid, lease.Peer.StartTicks),
             lease != null && new WindowsKitWorld().GenerationMatches(r.ParentSession, r.ParentLogon) &&
                 new WindowsKitWorld().GenerationMatches(r.ChildSession, r.ChildLogon));
-        CheckPeer((uint)lease.Peer.Pid, r, role == "child" ? KitPeerRole.ChildObserver : KitPeerRole.ParentObserver);
+        CheckPeer((uint)lease.Peer.Pid, r, role == "child" ? KitPeerRole.ChildObserver : KitPeerRole.ParentObserver,
+            requireFeederLive);
     }
-    private static string ObserverCommand(ObserverLease lease, X360RunRecord r, string role, string command)
+    private static string ObserverCommand(ObserverLease lease, X360RunRecord r, string role, string command,
+        bool requireFeederLive = true)
     {
-        RequireObserverStillRunning(lease, r, role);
+        RequireObserverStillRunning(lease, r, role, requireFeederLive);
         using (var output = new BinaryWriter(lease.Pipe, Encoding.UTF8, true))
-            Send(output, command + " " + r.Run + " " + role);
-        var response = Task.Factory.StartNew(() =>
-        {
-            using (var input = new BinaryReader(lease.Pipe, Encoding.UTF8, true)) return Receive(input);
-        });
-        if (!response.Wait(TimeSpan.FromSeconds(3)))
-        { lease.Dispose(); throw new TimeoutException(role + " did not acknowledge " + command + "."); }
-        return response.Result;
+        using (var input = new BinaryReader(lease.Pipe, Encoding.UTF8, true))
+            return KitObserverProtocol.Command(input, output, r, role, command, 3000, lease.Dispose);
     }
     private static void RequireObserverAck(string value, X360RunRecord r, string role, string command)
     {
         if (value != "ACK " + command + " " + r.Run + " " + role)
             throw new InvalidOperationException("Observer acknowledged a different phase or run.");
+    }
+    private static void CompleteObserverTeardown(ObserverLease lease, X360RunRecord r, string role)
+    {
+        // Only this post-challenge completion path allows the feeder's expected
+        // exit. Exact observer image/token/PID and both WTS generations still bind.
+        RequireObserverAck(ObserverCommand(lease, r, role, "TEARDOWN", false),
+            r, role, "TEARDOWN");
+        if (lease.Observer == null || !lease.Observer.WaitForExit(3000))
+            throw new TimeoutException(role + " acknowledged teardown but did not exit.");
+        if (lease.Observer.ExitCode != 0)
+            throw new InvalidOperationException(role + " exited unsuccessfully after teardown ACK.");
     }
     private static int Feeder(string[] args)
     {
@@ -760,35 +872,29 @@ internal static class X360QualificationProgram
                 }
                 catch (Exception observationFailure)
                 { observationIssue = observationFailure.GetType().Name + ": " + observationFailure.Message; }
-                try
-                {
-                    Send(output, "TEARDOWN " + r.Run);
-                    if (Receive(input) != "REMOVED") throw new InvalidOperationException("Exact target removal unconfirmed.");
-                    r.TargetCleanup = "Removed"; r.State = "RemovedPendingPropertyRecovery"; Save(r);
-                    foreach (string node in nodes)
-                    {
-                        DeviceProperty prior;
-                        if (!assignment.Prior.TryGetValue(node, out prior))
-                            throw new InvalidOperationException("Original property record unavailable.");
-                        world.RestoreAbsentTargetProperty(node, (uint)r.ChildSession, prior);
-                    }
-                    r.PropertyCleanup = "Restored";
-                    r.State = observationIssue == null ? "RemovedAndPropertyRestored" :
-                        "RemovedAndRestoredObservationIncomplete";
-                    if (observationIssue != null) r.Error = observationIssue;
-                    Save(r);
-                }
-                catch (Exception recovery)
-                {
-                    r.PropertyCleanup = "RecoveryFailed"; r.Error = "Target/property recovery incomplete: " + recovery.Message;
-                    try { Save(r); } catch { }
-                    throw;
-                }
+                bool cleanupComplete = KitPostChallengeCleanup.Run(r,
+                    () => {
+                        Send(output, "TEARDOWN " + r.Run);
+                        if (Receive(input) != "REMOVED")
+                            throw new InvalidOperationException("Exact target removal unconfirmed.");
+                    },
+                    role => CompleteObserverTeardown(role == "parent-pre" ? parentPre :
+                        role == "parent-fresh" ? parentFresh : childObserver, r, role),
+                    () => {
+                        foreach (string node in nodes)
+                        {
+                            DeviceProperty prior;
+                            if (!assignment.Prior.TryGetValue(node, out prior))
+                                throw new InvalidOperationException("Original property record unavailable.");
+                            world.RestoreAbsentTargetProperty(node, (uint)r.ChildSession, prior);
+                        }
+                    }, () => Save(r), observationIssue);
                 var disposition = KitObservationFinalization.Classify(r, false);
-                Console.WriteLine(observationIssue == null ?
-                    "Challenge finalized; target and property states restored. " + disposition.Verdict + ": " + disposition.Reason :
-                    "Challenge observation INCONCLUSIVE; target and property states restored: " + observationIssue);
-                return observationIssue == null ? 0 : 4;
+                Console.WriteLine(cleanupComplete ?
+                    "Challenge finalized; exact target, observers, and properties restored. " +
+                        disposition.Verdict + ": " + disposition.Reason :
+                    "Qualification/cleanup incomplete; review distinct target, observer, and property statuses: " + r.Error);
+                return cleanupComplete ? 0 : 4;
                 }
                 }
                 catch (Exception original)

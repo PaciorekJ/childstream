@@ -38,8 +38,13 @@ driver or use another application as an observer.
    acknowledgments from all three observers. After a **separate explicit arm**, submit
    A/B/A/neutral once at 400 ms per state and retain neutral for its full
    observation window before removal. The feeder pauses with the target present
-   while the helper sends FINALIZE to all observers, saves their frozen challenge
-   summaries, and then sends TEARDOWN. Save monotonic planned/actual phase
+   while the helper sends FINALIZE to all observers and saves their frozen challenge
+   summaries. The helper then releases exact-target removal to the feeder,
+   requires its REMOVED acknowledgment, sends role-bound TEARDOWN to all three
+   observers, and requires each bounded acknowledgment and process exit before
+   property restoration. A feeder may already have exited at this point; the
+   teardown identity check still binds the exact observer and both WTS generations.
+   Save monotonic planned/actual phase
    boundaries, including partial phases, separately from target-removal and
    property-restoration statuses. Errors after finalization are raw teardown
    evidence and do not alter the challenge score. Compare positive attributable child reception
@@ -54,12 +59,14 @@ driver or use another application as an observer.
    coverage, or changed session/device identity is INCONCLUSIVE. Property
    readback alone proves only configuration. No XInput-only result proves all
    Windows input paths.
-7. Stop feeder submissions, remove only its target, verify absence, then use
-   recorded exact-node state to reconcile any non-present property residue.
-   If a node stays present, feeder identity is uncertain, removal fails,
-   readback disagrees, or the helper was interrupted before its in-memory
-   original state could be used, retain the restriction and stop for separately
-   reviewed recovery. The same-user run file alone cannot authorize a write.
+7. Review target-removal, per-observer exit, and property-restoration statuses
+   independently. If target removal is unconfirmed, defer all property writes;
+   a failed observer completion must not erase its frozen challenge record or
+   skip the other observers. If a node stays present, feeder identity is
+   uncertain, removal fails, readback disagrees, or the helper was interrupted
+   before its in-memory original state could be used, retain the restriction
+   and stop for separately reviewed recovery. The same-user run file alone
+   cannot authorize a write.
 
 Same-target reconnect currently has a synthetic method only and **is not an
 executable physical test in this kit**. A new target, new

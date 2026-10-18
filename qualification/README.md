@@ -55,10 +55,15 @@ before the operator's arm releases any feeder report. The feeder emits
 A/B/A/neutral once, dwelling 400 ms on each state (eight nominal 50 ms polls),
 including neutral. It then **holds the exact target** while the helper collects
 bounded final observations. Only after those challenge windows are frozen does
-the helper release target teardown. Observers log subsequent raw disappearance
-and errors under a separate teardown phase; they cannot retroactively invalidate
-or improve challenge coverage. Missing, late, or gapped challenge sampling is
-inconclusive, never success.
+the helper release target teardown. After the feeder confirms exact-target
+removal, the helper sends run-and-role-bound TEARDOWN to each observer, requires
+each bounded acknowledgment and process exit, and only then restores recorded
+non-present properties. An observer failure does not skip the other observers or
+safe property recovery. If feeder removal is unconfirmed, property writes remain
+deferred. Target, each observer, and property outcomes are recorded separately.
+Observers log subsequent raw disappearance and errors under a separate teardown
+phase; they cannot retroactively invalidate or improve challenge coverage.
+Missing, late, or gapped challenge sampling is inconclusive, never success.
 `--focus` opens
 a bounded kit-owned parent window and records only navigation key codes delivered
 to that window. It does not use a global hook. XInput exposes no held device handle through

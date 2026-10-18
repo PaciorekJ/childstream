@@ -71,8 +71,7 @@ internal static class X360QualificationTests
         }
         internal string Command(X360RunRecord run, string role, string command)
         {
-            X360QualificationProgram.Send(writer, command + " " + run.Run + " " + role);
-            return Read();
+            return KitObserverProtocol.Command(reader, writer, run, role, command, 3000, Dispose);
         }
         public void Dispose()
         {
@@ -253,27 +252,42 @@ internal static class X360QualificationTests
                         KitObservationFinalization.Classify(helper, false).Verdict == KitVerdict.Inconclusive,
                         "attributed synthetic route is scoped; executable slot alone is never isolation pass");
                     X360QualificationProgram.SaveAt(helper, temporary, false);
-                    qualification.Stop(); run.TargetCleanup = "Removed";
-                    X360QualificationProgram.SaveAt(run, temporary, false);
-                    helper.PropertyCleanup = "Restored";
-                    X360QualificationProgram.SaveAt(helper, temporary, false);
-                    Check(parentPre.Command(run, "parent-pre", "TEARDOWN") ==
-                        "ACK TEARDOWN " + run.Run + " parent-pre" &&
-                        parentFresh.Command(run, "parent-fresh", "TEARDOWN") ==
-                        "ACK TEARDOWN " + run.Run + " parent-fresh" &&
-                        child.Command(run, "child", "TEARDOWN") ==
-                        "ACK TEARDOWN " + run.Run + " child", "teardown is acknowledged after finalization");
+                    var frozen = helper.Observations.Select(o => o.ChallengeSamples + ":" +
+                        o.SequenceSeen + ":" + o.Complete).ToArray();
+                    int completedObservers = 0;
+                    bool restored = false;
+                    bool clean = KitPostChallengeCleanup.Run(helper,
+                        () => { qualification.Stop(); run.TargetCleanup = "Removed";
+                            X360QualificationProgram.SaveAt(run, temporary, false); },
+                        role => {
+                            var fixture = role == "parent-pre" ? parentPre :
+                                role == "parent-fresh" ? parentFresh : child;
+                            if (fixture.Command(run, role, "TEARDOWN") !=
+                                "ACK TEARDOWN " + run.Run + " " + role ||
+                                !fixture.Result.Wait(TimeSpan.FromSeconds(3)))
+                                throw new TimeoutException("Observer did not complete teardown.");
+                            completedObservers++;
+                        },
+                        () => { if (target.Attached) throw new InvalidOperationException("Target still present.");
+                            restored = true; },
+                        () => X360QualificationProgram.SaveAt(helper, temporary, false), null);
+                    Check(clean && restored && completedObservers == 3 &&
+                        target.Creates == 1 && target.Removes == 1 &&
+                        target.Reports.SequenceEqual(new ushort[] { 0x1000, 0x2000, 0x1000, 0 }) &&
+                        helper.ObserverTeardown.All(status => status.Status == "Exited"),
+                        "production coordinator adds no target or report and completes all three observer teardowns and recovery");
                     Check(child.Result.Wait(TimeSpan.FromSeconds(3)) &&
                         child.Result.Result.TeardownNotConnected > 0 &&
                         child.Result.Result.Challenge.Complete,
                         "expected post-removal disappearance does not invalidate child challenge coverage");
-                    Check(parentPre.Result.Wait(TimeSpan.FromSeconds(3)) &&
-                        parentFresh.Result.Wait(TimeSpan.FromSeconds(3)), "both parent observers finalized and exited");
                     var final = X360QualificationProgram.ReadAt(qualification.Identity.Run, temporary);
                     Check(final.Phases.Count == 4 && final.Phases.All(p => p.Completed) &&
                         final.Observations.Count == 3 && final.TargetCleanup == "Removed" &&
-                        final.PropertyCleanup == "Restored",
-                        "feeder phase evidence survives stale helper and removal/restoration saves");
+                        final.PropertyCleanup == "Restored" &&
+                        final.ObserverTeardown.Count == 3 &&
+                        final.Observations.Select(o => o.ChallengeSamples + ":" +
+                            o.SequenceSeen + ":" + o.Complete).SequenceEqual(frozen),
+                        "feeder phases and frozen challenge evidence survive coordinated removal, observer exit, and restoration");
                 }
             }
         }
@@ -297,6 +311,98 @@ internal static class X360QualificationTests
         var result = KitObserverAdmission.Finalize(run, role, slot, window);
         window.Teardown(); window.Sample(result.ChallengeEnd + 50, 0, 1167, 1000);
         return result;
+    }
+    private static void WithholdObserverAck(X360RunRecord run, string role)
+    {
+        using (var commandOut = new AnonymousPipeServerStream(PipeDirection.Out, HandleInheritability.None))
+        using (var commandIn = new AnonymousPipeClientStream(PipeDirection.In, commandOut.ClientSafePipeHandle))
+        using (var responseOut = new AnonymousPipeServerStream(PipeDirection.Out, HandleInheritability.None))
+        using (var responseIn = new AnonymousPipeClientStream(PipeDirection.In, responseOut.ClientSafePipeHandle))
+        using (var input = new BinaryReader(responseIn, Encoding.UTF8, true))
+        using (var output = new BinaryWriter(commandOut, Encoding.UTF8, true))
+            KitObserverProtocol.Command(input, output, run, role, "TEARDOWN", 200,
+                responseOut.Dispose);
+    }
+    private static void PostChallengeCleanupRegressions()
+    {
+        var run = new X360RunRecord { Run = Guid.NewGuid().ToString("N"),
+            OwnerSid = "synthetic-owner", FeederImageSha256 = "synthetic-executable",
+            FeederPid = 42, FeederStartTicks = 1000, ParentSession = 1, ParentLogon = 10,
+            ChildSession = 2, ChildLogon = 20, Serial = 1, Slot = 1 };
+        run.Pipe = "ChildStream-X360-" + run.Run;
+        run.Observations.Add(WindowRecord(run.Run, "child", 1,
+            new long[] { 1000, 1050, 1100, 1150 },
+            new ushort[] { 0x1000, 0x2000, 0x1000, 0 }, new uint[4], false));
+        string root = Path.Combine(Environment.CurrentDirectory, "tests", ".artifacts",
+            "x360-qualification", "selftest-cleanup-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            X360QualificationProgram.SaveAt(run, root, false);
+            var order = new List<string>();
+            bool complete = KitPostChallengeCleanup.Run(run,
+                () => order.Add("target"),
+                role => { order.Add(role); if (role == "parent-fresh")
+                    WithholdObserverAck(run, role); },
+                () => order.Add("properties"),
+                () => X360QualificationProgram.SaveAt(run, root, false), null);
+            var saved = X360QualificationProgram.ReadAt(Guid.ParseExact(run.Run, "N"), root);
+            Check(!complete && order.SequenceEqual(new[] { "target", "parent-pre",
+                "parent-fresh", "child", "properties" }) &&
+                saved.ObserverTeardown.Select(x => x.Status).SequenceEqual(new[] {
+                    "Exited", "Incomplete", "Exited" }) &&
+                saved.TargetCleanup == "Removed" && saved.PropertyCleanup == "Restored" &&
+                saved.Observations.Count == 1 && saved.Observations[0].SequenceSeen &&
+                saved.Error.Contains("observer parent-fresh") && !saved.Error.Contains("properties:"),
+                "withheld observer ACK is bounded/incomplete while other observers and exact recovery finish");
+            Reject(() => X360QualificationProgram.SaveAt(new X360RunRecord {
+                Run = run.Run, Pipe = run.Pipe, OwnerSid = run.OwnerSid,
+                FeederImageSha256 = run.FeederImageSha256, FeederPid = run.FeederPid,
+                FeederStartTicks = run.FeederStartTicks, ParentSession = run.ParentSession,
+                ParentLogon = run.ParentLogon, ChildSession = run.ChildSession,
+                ChildLogon = run.ChildLogon, Serial = run.Serial, Slot = run.Slot,
+                ObserverTeardown = new List<X360ObserverTeardownRecord> {
+                    new X360ObserverTeardownRecord { Role = "child", Status = "Exited" } }
+            }, root, false), "wrong-order observer teardown cannot replace exact record");
+
+            run = new X360RunRecord { Run = Guid.NewGuid().ToString("N"),
+                OwnerSid = "synthetic-owner", FeederImageSha256 = "synthetic-executable",
+                FeederPid = 42, FeederStartTicks = 1000, ParentSession = 1, ParentLogon = 10,
+                ChildSession = 2, ChildLogon = 20, Serial = 1, Slot = 1 };
+            run.Pipe = "ChildStream-X360-" + run.Run;
+            bool propertiesInvoked = false; int observerCalls = 0;
+            complete = KitPostChallengeCleanup.Run(run,
+                () => { throw new EndOfStreamException("feeder exited before REMOVED"); },
+                role => observerCalls++,
+                () => propertiesInvoked = true,
+                () => X360QualificationProgram.SaveAt(run, root, false), null);
+            Check(!complete && run.TargetCleanup == "RemovalFailed" &&
+                run.PropertyCleanup == "NotStarted" && observerCalls == 3 &&
+                !propertiesInvoked && run.Error.Contains("target:") &&
+                !run.Error.Contains("properties:"),
+                "feeder loss leaves target uncertain, completes observer shutdown, and defers property writes");
+            var world = new World { ProcessOkay = false };
+            KitPeerAdmission.RequireCurrent(world, run, false);
+            Reject(() => KitPeerAdmission.RequireCurrent(world, run, true),
+                "ordinary peer phases still require live exact feeder");
+            world.GenerationOkay = false;
+            Reject(() => KitPeerAdmission.RequireCurrent(world, run, false),
+                "post-removal observer completion still requires exact WTS generations");
+
+            run = new X360RunRecord { Run = Guid.NewGuid().ToString("N"),
+                OwnerSid = "synthetic-owner", FeederImageSha256 = "synthetic-executable",
+                FeederPid = 42, FeederStartTicks = 1000, ParentSession = 1, ParentLogon = 10,
+                ChildSession = 2, ChildLogon = 20, Serial = 1, Slot = 1 };
+            run.Pipe = "ChildStream-X360-" + run.Run;
+            complete = KitPostChallengeCleanup.Run(run, () => { }, role => { },
+                () => { throw new InvalidOperationException("exact property readback failed"); },
+                () => X360QualificationProgram.SaveAt(run, root, false), null);
+            Check(!complete && run.TargetCleanup == "Removed" &&
+                run.ObserverTeardown.All(x => x.Status == "Exited") &&
+                run.PropertyCleanup == "RecoveryFailed" && run.Error.Contains("properties:") &&
+                !run.Error.Contains("observer "),
+                "property restoration failure remains distinct from feeder and observer completion");
+        }
+        finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
     }
     private static void NegativeFinalizationRegressions()
     {
@@ -633,6 +739,7 @@ internal static class X360QualificationTests
             "exact external assignment releases only bounded pulse");
         q.Stop();
         ConnectedFinalizationRegression();
+        PostChallengeCleanupRegressions();
         NegativeFinalizationRegressions();
         Console.WriteLine("REVIEW-ONLY SYNTHETIC X360 qualification assertions passed: " + checks);
         return checks;
