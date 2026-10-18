@@ -88,7 +88,8 @@ internal sealed class KitSequenceSampler
     private long previous = -1;
     internal bool Complete { get; private set; }
     internal KitSequenceSampler() { Complete = true; }
-    internal bool SequenceSeen { get { return Complete && next == Expected.Length; } }
+    // Preserve positive parent evidence even if later polling becomes incomplete.
+    internal bool SequenceSeen { get { return next == Expected.Length; } }
     internal void Sample(long tick, ushort buttons, uint error, long frequency)
     {
         if (frequency <= 0 || tick < 0 || (previous >= 0 &&

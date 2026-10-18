@@ -31,6 +31,8 @@ internal static class X360QualificationTests
         internal KitSequenceSampler Sampler;
         internal long StartSamplingAt = 0;
         internal int SampleEvery = 1, Steps;
+        internal CancellationTokenSource CancelAfterFirstStep;
+        internal bool Overshoot;
         public long Ticks { get { return Now; } }
         public long Frequency { get { return 1000; } }
         public void WaitUntil(long end, CancellationToken cancel)
@@ -40,9 +42,11 @@ internal static class X360QualificationTests
                 cancel.ThrowIfCancellationRequested();
                 Now = Math.Min(Now + 50, end);
                 Steps++;
+                if (CancelAfterFirstStep != null && Steps == 1) CancelAfterFirstStep.Cancel();
                 if (Sampler != null && Now >= StartSamplingAt && Steps % SampleEvery == 0)
                     Sampler.Sample(Now, Target.Current, 0, Frequency);
             }
+            if (Overshoot) Now += 200;
         }
     }
     private static Clock SampleClock(Target t)
@@ -152,8 +156,35 @@ internal static class X360QualificationTests
         q = New(out t, out w); w.After = w.Before; q.Create(); w.After = new[] { Root(), BusNode(), Pad(Node, Bus) };
         q.Assign(); q.Arm(q.Identity.Run);
         clock = SampleClock(t); clock.SampleEvery = 4; q.Pulse(clock, CancellationToken.None);
-        Check(!clock.Sampler.Complete && !clock.Sampler.SequenceSeen,
+        Check(!clock.Sampler.Complete,
             "200 ms skipped sampling is inconclusive even if values recur"); q.Stop();
+        var parentEvidence = new KitSequenceSampler();
+        parentEvidence.Sample(1000, 0x1000, 0, 1000);
+        parentEvidence.Sample(1050, 0x2000, 0, 1000);
+        parentEvidence.Sample(1100, 0x1000, 0, 1000);
+        parentEvidence.Sample(1150, 0, 0, 1000);
+        parentEvidence.Sample(1400, 0, 0, 1000);
+        Check(parentEvidence.SequenceSeen && !parentEvidence.Complete,
+            "later coverage loss cannot erase observed parent report sequence");
+
+        q = New(out t, out w); w.After = w.Before; q.Create(); w.After = new[] { Root(), BusNode(), Pad(Node, Bus) };
+        q.Assign(); q.Arm(q.Identity.Run);
+        using (var cancel = new CancellationTokenSource())
+        {
+            clock = SampleClock(t); clock.CancelAfterFirstStep = cancel;
+            bool cancelled = false;
+            try { q.Pulse(clock, cancel.Token); } catch (OperationCanceledException) { cancelled = true; }
+            Check(cancelled && t.Reports.Count == 1 && q.Evaluate(null, null, null).Verdict == KitVerdict.Inconclusive,
+                "cancelled challenge remains partial and inconclusive");
+        }
+        q.Stop();
+
+        q = New(out t, out w); w.After = w.Before; q.Create(); w.After = new[] { Root(), BusNode(), Pad(Node, Bus) };
+        q.Assign(); q.Arm(q.Identity.Run);
+        clock = SampleClock(t); clock.Overshoot = true;
+        bool timedOut = false;
+        try { q.Pulse(clock, CancellationToken.None); } catch (TimeoutException) { timedOut = true; }
+        Check(timedOut && t.Reports.Count == 1, "late phase deadline aborts after bounded first report"); q.Stop();
 
         q = New(out t, out w); w.After = w.Before; q.Create(); w.After = new[] { Root(), BusNode(), Pad(Node, Bus) };
         w.ProcessOkay = false; Reject(() => q.Assign(), "wrong feeder rejected"); Check(w.Writes == 0 && t.Reports.Count == 0, "wrong feeder zero writes/reports");
