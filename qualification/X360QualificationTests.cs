@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
 using System.Linq;
@@ -7,6 +8,8 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
+using System.Web.Script.Serialization;
 
 internal static class X360QualificationTests
 {
@@ -17,12 +20,65 @@ internal static class X360QualificationTests
         internal int Creates, Removes;
         internal bool ThrowRemove;
         internal ushort Current;
+        internal int CurrentRaw, RemovedFlag;
         public bool Attached { get; private set; }
-        public uint CreateNeutral() { Creates++; Attached = true; return Serial; }
-        public void Submit(ushort buttons) { if (!Attached) throw new Exception("removed target"); Current = buttons; Reports.Add(buttons); }
+        public uint CreateNeutral() { Creates++; Attached = true; Interlocked.Exchange(ref RemovedFlag, 0); return Serial; }
+        public void Submit(ushort buttons) { if (!Attached) throw new Exception("removed target");
+            Current = buttons; Interlocked.Exchange(ref CurrentRaw, buttons); Reports.Add(buttons); }
         public void Remove() { if (!Attached) throw new Exception("unrelated removal");
             if (ThrowRemove) throw new InvalidOperationException("native removal failed");
-            Attached = false; Removes++; }
+            Attached = false; Interlocked.Exchange(ref RemovedFlag, 1); Removes++; }
+    }
+    private sealed class TargetReader : IControllerSlotReader
+    {
+        internal Target Target;
+        internal bool ParentDisconnected;
+        private int reads;
+        public ControllerSlotState Read(uint slot)
+        {
+            int packet = Interlocked.Increment(ref reads);
+            return ParentDisconnected || Thread.VolatileRead(ref Target.RemovedFlag) != 0 ?
+                new ControllerSlotState { Error = 1167 } :
+                new ControllerSlotState { Error = 0, Packet = (uint)packet,
+                    Buttons = (ushort)Thread.VolatileRead(ref Target.CurrentRaw) };
+        }
+    }
+    private sealed class ObserverFixture : IDisposable
+    {
+        private readonly AnonymousPipeServerStream commands;
+        private readonly AnonymousPipeClientStream observerInput;
+        private readonly AnonymousPipeServerStream responses;
+        private readonly AnonymousPipeClientStream helperInput;
+        private readonly BinaryWriter writer;
+        private readonly BinaryReader reader;
+        internal readonly Task<X360ObserverOutcome> Result;
+        internal ObserverFixture(X360RunRecord run, string role, IControllerSlotReader slotReader, int seconds = 8)
+        {
+            commands = new AnonymousPipeServerStream(PipeDirection.Out, HandleInheritability.None);
+            observerInput = new AnonymousPipeClientStream(PipeDirection.In, commands.ClientSafePipeHandle);
+            responses = new AnonymousPipeServerStream(PipeDirection.Out, HandleInheritability.None);
+            helperInput = new AnonymousPipeClientStream(PipeDirection.In, responses.ClientSafePipeHandle);
+            writer = new BinaryWriter(commands, Encoding.UTF8, true);
+            reader = new BinaryReader(helperInput, Encoding.UTF8, true);
+            Result = Task.Factory.StartNew(() => X360QualificationProgram.ObserveCoordinated(
+                observerInput, responses, slotReader, run, role, seconds, null));
+        }
+        internal string Read()
+        {
+            var work = Task.Factory.StartNew(() => X360QualificationProgram.Receive(reader));
+            if (!work.Wait(TimeSpan.FromSeconds(5))) throw new TimeoutException("Synthetic observer response deadline.");
+            return work.Result;
+        }
+        internal string Command(X360RunRecord run, string role, string command)
+        {
+            X360QualificationProgram.Send(writer, command + " " + run.Run + " " + role);
+            return Read();
+        }
+        public void Dispose()
+        {
+            writer.Dispose(); reader.Dispose(); commands.Dispose(); observerInput.Dispose();
+            responses.Dispose(); helperInput.Dispose();
+        }
     }
     private sealed class Clock : IKitClock
     {
@@ -113,6 +169,259 @@ internal static class X360QualificationTests
         world.Before = new[] { Root(), BusNode() };
         world.After = new[] { Root(), BusNode(), Pad(Node, Bus) };
         return new X360Qualification(target, world, Identity());
+    }
+    private static void ConnectedFinalizationRegression()
+    {
+        Target target; World world;
+        var qualification = New(out target, out world);
+        world.After = world.Before; qualification.Create();
+        world.After = new[] { Root(), BusNode(), Pad(Node, Bus) };
+        var run = new X360RunRecord { Run = qualification.Identity.Run.ToString("N"),
+            OwnerSid = "synthetic-owner", FeederImageSha256 = "synthetic-executable",
+            FeederPid = 42, FeederStartTicks = 1000, ParentSession = 1, ParentLogon = 10,
+            ChildSession = 2, ChildLogon = 20, Serial = qualification.Identity.Serial, Slot = 1 };
+        run.Pipe = "ChildStream-X360-" + run.Run;
+        string temporary = Path.Combine(Environment.CurrentDirectory, "tests", ".artifacts",
+            "x360-qualification", "selftest-" + Guid.NewGuid().ToString("N"));
+        var json = new JavaScriptSerializer();
+        try
+        {
+            X360QualificationProgram.SaveAt(run, temporary, false);
+            X360RunRecord helper = X360QualificationProgram.ReadAt(qualification.Identity.Run, temporary);
+            using (var parentPre = new ObserverFixture(run, "parent-pre", new TargetReader
+                { Target = target, ParentDisconnected = true }))
+            {
+                KitObserverAdmission.RequireReady(json.Deserialize<X360ObserverReadyRecord>(parentPre.Read()),
+                    run.Run, "parent-pre", run.Slot, Stopwatch.GetTimestamp(), Stopwatch.Frequency);
+                Check(parentPre.Command(run, "parent-pre", "ASSIGNMENT") ==
+                    "ACK ASSIGNMENT " + run.Run + " parent-pre", "parent-pre phase acknowledged before assignment");
+                qualification.Assign();
+                using (var parentFresh = new ObserverFixture(run, "parent-fresh", new TargetReader
+                    { Target = target, ParentDisconnected = true }))
+                using (var child = new ObserverFixture(run, "child", new TargetReader { Target = target }))
+                {
+                    KitObserverAdmission.RequireReady(json.Deserialize<X360ObserverReadyRecord>(parentFresh.Read()),
+                        run.Run, "parent-fresh", run.Slot, Stopwatch.GetTimestamp(), Stopwatch.Frequency);
+                    KitObserverAdmission.RequireReady(json.Deserialize<X360ObserverReadyRecord>(child.Read()),
+                        run.Run, "child", run.Slot, Stopwatch.GetTimestamp(), Stopwatch.Frequency);
+                    qualification.Arm(qualification.Identity.Run);
+                    foreach (var observer in new[] { new { Fixture = parentPre, Role = "parent-pre" },
+                        new { Fixture = parentFresh, Role = "parent-fresh" },
+                        new { Fixture = child, Role = "child" } })
+                    {
+                        var arm = json.Deserialize<X360ObserverArmRecord>(observer.Fixture.Command(run, observer.Role, "START"));
+                        KitObserverAdmission.RequireArm(arm, run.Run, observer.Role, run.Slot,
+                            Stopwatch.GetTimestamp(), Stopwatch.Frequency);
+                    }
+                    qualification.Pulse(new MonotonicKitClock(), CancellationToken.None);
+                    run.Phases = qualification.Phases.Select(p => new X360PhaseRecord { Buttons = p.Buttons,
+                        StartTick = p.StartTick, EndTick = p.EndTick, ActualEndTick = p.ActualEndTick,
+                        Completed = p.Completed }).ToList();
+                    KitPhaseAdmission.Require(new X360PhaseEnvelope { Run = run.Run, Phases = run.Phases },
+                        run.Run, Stopwatch.Frequency);
+                    Reject(() => KitPhaseAdmission.Require(new X360PhaseEnvelope
+                        { Run = "wrong-run", Phases = run.Phases }, run.Run, Stopwatch.Frequency),
+                        "wrong-run feeder timeline cannot be finalized");
+                    X360QualificationProgram.SaveAt(run, temporary, false);
+                    helper.Observations = KitObservationFinalization.Collect(helper,
+                        (role, command) => (role == "parent-pre" ? parentPre :
+                            role == "parent-fresh" ? parentFresh : child).Command(run, role, command),
+                        json, Stopwatch.GetTimestamp,
+                        record => { helper.Observations.Add(record);
+                            X360QualificationProgram.SaveAt(helper, temporary, false); });
+                    Check(helper.Observations.Single(o => o.Role == "child").Complete &&
+                        helper.Observations.Single(o => o.Role == "child").SequenceSeen,
+                        "real IPC child observer samples completed A/B/A/neutral window");
+                    Check(helper.Observations.Where(o => o.Role != "child").All(o => o.Complete &&
+                        !o.SequenceSeen && o.NotConnected > 0),
+                        "documented parent not-connected state is scoped challenge evidence");
+                    Check(KitObservationFinalization.Classify(helper, true).Verdict == KitVerdict.SyntheticPass &&
+                        KitObservationFinalization.Classify(helper, false).Verdict == KitVerdict.Inconclusive,
+                        "attributed synthetic route is scoped; executable slot alone is never isolation pass");
+                    X360QualificationProgram.SaveAt(helper, temporary, false);
+                    qualification.Stop(); run.TargetCleanup = "Removed";
+                    X360QualificationProgram.SaveAt(run, temporary, false);
+                    helper.PropertyCleanup = "Restored";
+                    X360QualificationProgram.SaveAt(helper, temporary, false);
+                    Check(parentPre.Command(run, "parent-pre", "TEARDOWN") ==
+                        "ACK TEARDOWN " + run.Run + " parent-pre" &&
+                        parentFresh.Command(run, "parent-fresh", "TEARDOWN") ==
+                        "ACK TEARDOWN " + run.Run + " parent-fresh" &&
+                        child.Command(run, "child", "TEARDOWN") ==
+                        "ACK TEARDOWN " + run.Run + " child", "teardown is acknowledged after finalization");
+                    Check(child.Result.Wait(TimeSpan.FromSeconds(3)) &&
+                        child.Result.Result.TeardownNotConnected > 0 &&
+                        child.Result.Result.Challenge.Complete,
+                        "expected post-removal disappearance does not invalidate child challenge coverage");
+                    Check(parentPre.Result.Wait(TimeSpan.FromSeconds(3)) &&
+                        parentFresh.Result.Wait(TimeSpan.FromSeconds(3)), "both parent observers finalized and exited");
+                    var final = X360QualificationProgram.ReadAt(qualification.Identity.Run, temporary);
+                    Check(final.Phases.Count == 4 && final.Phases.All(p => p.Completed) &&
+                        final.Observations.Count == 3 && final.TargetCleanup == "Removed" &&
+                        final.PropertyCleanup == "Restored",
+                        "feeder phase evidence survives stale helper and removal/restoration saves");
+                }
+            }
+        }
+        finally
+        {
+            string expectedRoot = Path.GetFullPath(Path.Combine(Environment.CurrentDirectory,
+                "tests", ".artifacts", "x360-qualification"));
+            if (Path.GetDirectoryName(Path.GetFullPath(temporary)) != expectedRoot)
+                throw new InvalidOperationException("Self-test temporary directory escaped its owned root.");
+            if (Directory.Exists(temporary)) Directory.Delete(temporary, true);
+        }
+    }
+    private static X360ObservationRecord WindowRecord(string run, string role, uint slot,
+        long[] ticks, ushort[] buttons, uint[] errors, bool gapAfter)
+    {
+        var window = new KitObserverWindow(role == "child", false);
+        window.StartChallenge(ticks[0]);
+        for (int i = 0; i < ticks.Length; i++) window.Sample(ticks[i], buttons[i], errors[i], 1000);
+        if (gapAfter) window.Sample(ticks[ticks.Length - 1] + 250, 0, 0, 1000);
+        window.FinalizeChallenge(ticks[ticks.Length - 1] + (gapAfter ? 300 : 50));
+        var result = KitObserverAdmission.Finalize(run, role, slot, window);
+        window.Teardown(); window.Sample(result.ChallengeEnd + 50, 0, 1167, 1000);
+        return result;
+    }
+    private static void NegativeFinalizationRegressions()
+    {
+        string id = Guid.NewGuid().ToString("N");
+        var run = new X360RunRecord { Run = id, Pipe = "ChildStream-X360-" + id,
+            OwnerSid = "synthetic-owner", FeederImageSha256 = "synthetic-executable", Slot = 1,
+            FeederPid = 42, FeederStartTicks = 1000, ParentSession = 1, ParentLogon = 10,
+            ChildSession = 2, ChildLogon = 20, Serial = 1 };
+        var child = WindowRecord(id, "child", 1,
+            new long[] { 1000, 1050, 1100, 1150 },
+            new ushort[] { 0x1000, 0x2000, 0x1000, 0 }, new uint[4], false);
+        var parent = WindowRecord(id, "parent-pre", 1,
+            new long[] { 1000, 1050, 1100, 1150 }, new ushort[4],
+            new uint[] { 1167, 1167, 1167, 1167 }, false);
+        var fresh = WindowRecord(id, "parent-fresh", 1,
+            new long[] { 1000, 1050, 1100, 1150 }, new ushort[4],
+            new uint[] { 1167, 1167, 1167, 1167 }, false);
+        run.Observations = new List<X360ObservationRecord> { parent, fresh, child };
+        Check(KitObservationFinalization.Classify(run, true).Verdict == KitVerdict.SyntheticPass &&
+            KitObservationFinalization.Classify(run, false).Verdict == KitVerdict.Inconclusive,
+            "parent not-connected plus positive child is scoped, never universal or self-attributed");
+        child.Slot = 2;
+        Reject(() => KitObserverAdmission.RequireFinal(child, id, "child", 1, 2000),
+            "wrong target slot finalization rejected");
+        Check(KitObservationFinalization.Classify(run, true).Verdict == KitVerdict.Inconclusive,
+            "wrong target cannot manufacture success");
+        child.Slot = 1;
+        child.SequenceSeen = false; child.ConnectedDuringChallenge = false;
+        Check(KitObservationFinalization.Classify(run, true).Verdict == KitVerdict.Inconclusive,
+            "missing child reception remains inconclusive");
+        child.SequenceSeen = true; child.ConnectedDuringChallenge = true;
+        child.Complete = false;
+        Check(KitObservationFinalization.Classify(run, true).Verdict == KitVerdict.Inconclusive,
+            "challenge-window gap remains inconclusive");
+        child.Complete = true;
+        var parentReport = WindowRecord(id, "parent-pre", 1,
+            new long[] { 1000, 1050, 1100, 1150 },
+            new ushort[] { 0x1000, 0x2000, 0x1000, 0 }, new uint[4], true);
+        run.Observations[0] = parentReport;
+        Check(parentReport.SequenceSeen && !parentReport.Complete &&
+            KitObservationFinalization.Classify(run, true).Verdict == KitVerdict.Fail,
+            "confirmed parent report survives later gap and expected teardown disappearance");
+        bool failedObserver = false;
+        try
+        {
+            KitObservationFinalization.Collect(run, (role, command) => {
+                if (role == "child") throw new InvalidOperationException("observer exited");
+                return new JavaScriptSerializer().Serialize(role == "parent-pre" ? parentReport : fresh);
+            }, new JavaScriptSerializer(), () => 2000);
+        }
+        catch (InvalidOperationException) { failedObserver = true; }
+        Check(failedObserver, "failed required observer prevents completed finalization");
+        string incompleteRoot = Path.Combine(Environment.CurrentDirectory, "tests", ".artifacts",
+            "x360-qualification", "selftest-incomplete-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            run.Observations = new List<X360ObservationRecord>();
+            X360QualificationProgram.SaveAt(run, incompleteRoot, false);
+            failedObserver = false;
+            try
+            {
+                KitObservationFinalization.Collect(run, (role, command) => {
+                    if (role == "child") throw new InvalidOperationException("observer exited");
+                    return new JavaScriptSerializer().Serialize(role == "parent-pre" ? parentReport : fresh);
+                }, new JavaScriptSerializer(), () => 2000,
+                record => { run.Observations.Add(record);
+                    X360QualificationProgram.SaveAt(run, incompleteRoot, false); });
+            }
+            catch (InvalidOperationException) { failedObserver = true; }
+            var incomplete = X360QualificationProgram.ReadAt(Guid.ParseExact(id, "N"), incompleteRoot);
+            Check(failedObserver && incomplete.Observations.Count == 2 &&
+                incomplete.Observations[0].SequenceSeen &&
+                KitObservationFinalization.Classify(incomplete, true).Verdict == KitVerdict.Fail &&
+                KitObservationFinalization.Classify(incomplete, false).Verdict == KitVerdict.Inconclusive,
+                "failed later observer retains attributable parent failure evidence without an unverified-slot pass");
+            incomplete.Observations[0].Run = "different-run";
+            Reject(() => X360QualificationProgram.SaveAt(incomplete, incompleteRoot, false),
+                "wrong-run diagnostic observation cannot replace persisted evidence");
+        }
+        finally { if (Directory.Exists(incompleteRoot)) Directory.Delete(incompleteRoot, true); }
+        Reject(() => KitObserverAdmission.RequireLive(false, true, true), "exited observer rejected before arm");
+        Reject(() => KitObserverAdmission.RequireLive(true, false, true), "stale observer PID rejected before arm");
+        Reject(() => KitObserverAdmission.RequireLive(true, true, false), "stale observer generation rejected before arm");
+        Reject(() => KitObserverAdmission.RequireArm(null, id, "child", 1, 1100, 1000),
+            "missing child arm sample blocks reports");
+        var bad = new X360ObserverReadyRecord { Run = id, Role = "child", Slot = 1,
+            FirstTick = 1000, SecondTick = 1050, FirstError = 1167, SecondError = 1167 };
+        Reject(() => KitObserverAdmission.RequireReady(bad, id, "child", 1, 1100, 1000),
+            "not-connected child cannot arm on process presence alone");
+        var deadlineTarget = new Target(); deadlineTarget.CreateNeutral();
+        using (var neverArmed = new ObserverFixture(run, "parent-fresh", new TargetReader
+            { Target = deadlineTarget, ParentDisconnected = true }, 1))
+        {
+            KitObserverAdmission.RequireReady(new JavaScriptSerializer().Deserialize<X360ObserverReadyRecord>(
+                neverArmed.Read()), id, "parent-fresh", 1, Stopwatch.GetTimestamp(), Stopwatch.Frequency);
+            bool expired = false;
+            try { neverArmed.Result.Wait(TimeSpan.FromSeconds(3)); }
+            catch (AggregateException e)
+            { expired = e.InnerException is InvalidOperationException; }
+            Check(expired && deadlineTarget.Reports.Count == 0,
+                "missing phase command reaches bounded observer deadline with zero reports");
+        }
+        deadlineTarget.Remove();
+
+        Target target; World world; var qualification = New(out target, out world);
+        world.After = world.Before; qualification.Create();
+        world.After = new[] { Root(), BusNode(), Pad(Node, Bus) };
+        qualification.Assign(); qualification.Arm(qualification.Identity.Run);
+        using (var cancel = new CancellationTokenSource())
+        {
+            var clock = SampleClock(target); clock.CancelAfterFirstStep = cancel;
+            try { qualification.Pulse(clock, cancel.Token); } catch (OperationCanceledException) { }
+        }
+        var partial = qualification.Phases.Select(p => new X360PhaseRecord { Buttons = p.Buttons,
+            StartTick = p.StartTick, EndTick = p.EndTick, ActualEndTick = p.ActualEndTick,
+            Completed = p.Completed }).ToList();
+        qualification.Stop();
+        Check(partial.Count == 1 && !partial[0].Completed && partial[0].ActualEndTick < partial[0].EndTick,
+            "cancellation preserves partial monotonic phase boundary");
+        string temporary = Path.Combine(Environment.CurrentDirectory, "tests", ".artifacts",
+            "x360-qualification", "selftest-partial-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            run.Run = qualification.Identity.Run.ToString("N"); run.Pipe = "ChildStream-X360-" + run.Run;
+            run.Observations.Clear(); run.Phases = partial; run.TargetCleanup = "Removed";
+            X360QualificationProgram.SaveAt(run, temporary, false);
+            var stale = X360QualificationProgram.ReadAt(qualification.Identity.Run, temporary);
+            stale.Phases = new List<X360PhaseRecord>(); stale.PropertyCleanup = "RecoveryFailed";
+            X360QualificationProgram.SaveAt(stale, temporary, false);
+            var saved = X360QualificationProgram.ReadAt(qualification.Identity.Run, temporary);
+            Check(saved.Phases.Count == 1 && !saved.Phases[0].Completed &&
+                saved.TargetCleanup == "Removed" && saved.PropertyCleanup == "RecoveryFailed",
+                "partial feeder timeline and distinct property recovery status survive stale helper save");
+            var conflict = X360QualificationProgram.ReadAt(qualification.Identity.Run, temporary);
+            conflict.Phases[0].Buttons = 0x2000;
+            Reject(() => X360QualificationProgram.SaveAt(conflict, temporary, false),
+                "conflicting phase evidence rejected");
+        }
+        finally { if (Directory.Exists(temporary)) Directory.Delete(temporary, true); }
     }
     internal static int Run()
     {
@@ -279,17 +588,24 @@ internal static class X360QualificationTests
             using (var writer = new BinaryWriter(server, Encoding.UTF8, true))
             using (var reader = new BinaryReader(client, Encoding.UTF8, true))
             {
-                X360QualificationProgram.Send(writer, "READY run parent-pre"); writer.Write(1000L); writer.Flush();
-                KitObserverAdmission.RequireReady(X360QualificationProgram.Receive(reader), "run", "parent-pre",
-                    reader.ReadInt64(), 1100, 1000);
-                Check(true, "real harmless named pipe carried bounded observer readiness");
+                var json = new JavaScriptSerializer();
+                var ready = new X360ObserverReadyRecord { Run = "run", Role = "parent-pre", Slot = 1,
+                    FirstTick = 1000, SecondTick = 1050, FirstError = 1167, SecondError = 1167 };
+                X360QualificationProgram.Send(writer, json.Serialize(ready));
+                KitObserverAdmission.RequireReady(json.Deserialize<X360ObserverReadyRecord>(
+                    X360QualificationProgram.Receive(reader)), "run", "parent-pre", 1, 1100, 1000);
+                Check(true, "real harmless pipe carried bounded two-sample readiness");
             }
         }
-        Reject(() => KitObserverAdmission.RequireReady("READY other parent-pre", "run", "parent-pre", 1000, 1100, 1000),
+        var badReady = new X360ObserverReadyRecord { Run = "other", Role = "parent-pre", Slot = 1,
+            FirstTick = 1000, SecondTick = 1050, FirstError = 0, SecondError = 0 };
+        Reject(() => KitObserverAdmission.RequireReady(badReady, "run", "parent-pre", 1, 1100, 1000),
             "wrong run readiness rejected");
-        Reject(() => KitObserverAdmission.RequireReady("READY run child", "run", "parent-pre", 1000, 1100, 1000),
+        badReady.Run = "run"; badReady.Role = "child";
+        Reject(() => KitObserverAdmission.RequireReady(badReady, "run", "parent-pre", 1, 1100, 1000),
             "wrong role readiness rejected");
-        Reject(() => KitObserverAdmission.RequireReady("READY run parent-pre", "run", "parent-pre", 1000, 2500, 1000),
+        badReady.Role = "parent-pre";
+        Reject(() => KitObserverAdmission.RequireReady(badReady, "run", "parent-pre", 1, 2500, 1000),
             "late observer readiness rejected");
 
         q = New(out t, out w); w.After = w.Before; q.Create(); w.After = new[] { Root(), BusNode(), Pad(Node, Bus) };
@@ -302,6 +618,8 @@ internal static class X360QualificationTests
         Check(t.Reports.SequenceEqual(new ushort[] { 0x1000, 0x2000, 0x1000, 0 }),
             "exact external assignment releases only bounded pulse");
         q.Stop();
+        ConnectedFinalizationRegression();
+        NegativeFinalizationRegressions();
         Console.WriteLine("REVIEW-ONLY SYNTHETIC X360 qualification assertions passed: " + checks);
         return checks;
     }

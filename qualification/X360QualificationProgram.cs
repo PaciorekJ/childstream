@@ -10,6 +10,7 @@ using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
@@ -25,15 +26,50 @@ internal sealed class X360RunRecord
     public uint Serial;
     public uint Slot;
     public string State = "CreatedHeld";
+    public string TargetCleanup = "Present"; // feeder-owned
+    public string PropertyCleanup = "NotStarted"; // helper-owned
     public string[] Nodes;
     public List<X360PhaseRecord> Phases = new List<X360PhaseRecord>();
+    public List<X360ObservationRecord> Observations = new List<X360ObservationRecord>();
     public List<X360PriorRecord> Prior = new List<X360PriorRecord>();
     public string Error;
 }
 internal sealed class X360PhaseRecord
 {
     public ushort Buttons;
-    public long StartTick, EndTick;
+    public long StartTick, EndTick, ActualEndTick;
+    public bool Completed;
+}
+internal sealed class X360PhaseEnvelope
+{
+    public string Run;
+    public List<X360PhaseRecord> Phases;
+}
+internal sealed class X360ObservationRecord
+{
+    public string Run, Role;
+    public uint Slot;
+    public long ChallengeStart, ChallengeEnd;
+    public int ChallengeSamples, NotConnected, OtherErrors;
+    public bool Complete, SequenceSeen, ConnectedDuringChallenge;
+    public string Attribution = "PinnedClientSlotOnly";
+}
+internal sealed class X360ObserverReadyRecord
+{
+    public string Run, Role;
+    public uint Slot, FirstError, SecondError;
+    public long FirstTick, SecondTick;
+}
+internal sealed class X360ObserverArmRecord
+{
+    public string Run, Role;
+    public uint Slot, Error;
+    public long Tick;
+}
+internal sealed class X360ObserverOutcome
+{
+    internal X360ObservationRecord Challenge;
+    internal int TeardownNotConnected, TeardownOtherErrors;
 }
 internal sealed class X360PriorRecord
 {
@@ -78,13 +114,117 @@ internal static class KitPeerAdmission
 }
 internal static class KitObserverAdmission
 {
-    internal static void RequireReady(string message, string run, string role,
-        long firstSampleTick, long receivedTick, long frequency)
+    internal static void RequireLive(bool connected, bool processCurrent, bool generationsCurrent)
     {
-        if (message != "READY " + run + " " + role || firstSampleTick <= 0 ||
-            receivedTick < firstSampleTick || frequency <= 0 ||
-            receivedTick - firstSampleTick > frequency)
-            throw new InvalidOperationException("Observer first sample is missing, stale, or for another run/role.");
+        if (!connected || !processCurrent || !generationsCurrent)
+            throw new InvalidOperationException("Required observer exited or changed identity before arm.");
+    }
+    internal static void RequireReady(X360ObserverReadyRecord ready, string run, string role,
+        uint slot, long receivedTick, long frequency)
+    {
+        bool child = role == "child";
+        if (ready == null || ready.Run != run || ready.Role != role || ready.Slot != slot ||
+            ready.FirstTick <= 0 || ready.SecondTick <= ready.FirstTick || frequency <= 0 ||
+            ready.SecondTick - ready.FirstTick > frequency * 150 / 1000 ||
+            receivedTick < ready.SecondTick || receivedTick - ready.SecondTick > frequency ||
+            ready.FirstError != ready.SecondError ||
+            (child ? ready.SecondError != 0 : ready.SecondError != 0 && ready.SecondError != 1167))
+            throw new InvalidOperationException("Observer lacks two fresh, valid samples for its exact role and slot.");
+    }
+    internal static void RequireArm(X360ObserverArmRecord arm, string run, string role,
+        uint slot, long receivedTick, long frequency)
+    {
+        if (arm == null || arm.Run != run || arm.Role != role || arm.Slot != slot ||
+            arm.Tick <= 0 || receivedTick < arm.Tick || receivedTick - arm.Tick > frequency ||
+            (role == "child" ? arm.Error != 0 : arm.Error != 0 && arm.Error != 1167))
+            throw new InvalidOperationException("Observer was not sampling the required slot when armed.");
+    }
+    internal static X360ObservationRecord Finalize(string run, string role, uint slot, KitObserverWindow window)
+    {
+        if (window == null || window.Phase != KitMeasurementPhase.Finalization)
+            throw new InvalidOperationException("Observation was not finalized before target teardown.");
+        return new X360ObservationRecord { Run = run, Role = role, Slot = slot,
+            ChallengeStart = window.ChallengeStart, ChallengeEnd = window.ChallengeEnd,
+            ChallengeSamples = window.Challenge.Samples, NotConnected = window.Challenge.NotConnected,
+            OtherErrors = window.Challenge.OtherErrors, Complete = window.Challenge.Complete,
+            SequenceSeen = window.Challenge.SequenceSeen,
+            ConnectedDuringChallenge = window.ConnectedDuringChallenge };
+    }
+    internal static void RequireFinal(X360ObservationRecord record, string run, string role, uint slot,
+        long receivedTick)
+    {
+        if (record == null || record.Run != run || record.Role != role || record.Slot != slot ||
+            record.Attribution != "PinnedClientSlotOnly" || record.ChallengeStart <= 0 ||
+            record.ChallengeEnd <= record.ChallengeStart || record.ChallengeEnd > receivedTick ||
+            record.ChallengeSamples <= 0 || record.ChallengeSamples > 200 ||
+            record.NotConnected < 0 || record.OtherErrors < 0 ||
+            record.NotConnected + record.OtherErrors > record.ChallengeSamples)
+            throw new InvalidOperationException("Final observation identity, window, or count invalid.");
+    }
+}
+internal static class KitPhaseAdmission
+{
+    private static readonly ushort[] Expected = { 0x1000, 0x2000, 0x1000, 0 };
+    internal static void Require(X360PhaseEnvelope envelope, string run, long frequency)
+    {
+        if (envelope == null || envelope.Run != run || envelope.Phases == null ||
+            envelope.Phases.Count < 1 || envelope.Phases.Count > 4 || frequency <= 0)
+            throw new InvalidOperationException("Challenge timeline has wrong run or count.");
+        long prior = -1;
+        for (int i = 0; i < envelope.Phases.Count; i++)
+        {
+            var p = envelope.Phases[i];
+            if (p == null || p.Buttons != Expected[i] || p.StartTick <= prior ||
+                p.EndTick <= p.StartTick || p.EndTick - p.StartTick != frequency * 400 / 1000 ||
+                p.ActualEndTick < p.StartTick || p.ActualEndTick > p.EndTick + frequency * 150 / 1000 ||
+                (p.Completed && p.ActualEndTick < p.EndTick) ||
+                (!p.Completed && i != envelope.Phases.Count - 1))
+                throw new InvalidOperationException("Challenge timeline is incomplete, conflicting, or malformed.");
+            prior = p.ActualEndTick;
+        }
+    }
+}
+internal static class KitObservationFinalization
+{
+    internal static List<X360ObservationRecord> Collect(X360RunRecord run,
+        Func<string, string, string> command, JavaScriptSerializer json, Func<long> now,
+        Action<X360ObservationRecord> afterRecord = null)
+    {
+        var result = new List<X360ObservationRecord>();
+        foreach (string role in new[] { "parent-pre", "parent-fresh", "child" })
+        {
+            var record = json.Deserialize<X360ObservationRecord>(command(role, "FINALIZE"));
+            KitObserverAdmission.RequireFinal(record, run.Run, role, run.Slot, now());
+            result.Add(record);
+            if (afterRecord != null) afterRecord(record);
+        }
+        return result;
+    }
+    internal static KitResult Classify(X360RunRecord run, bool independentlyAttributed)
+    {
+        if (run == null || run.Observations == null || run.Observations.Count > 3 ||
+            run.Observations.Select(o => o == null ? null : o.Role).Distinct().Count() != run.Observations.Count ||
+            run.Observations.Any(o => o == null || o.Run != run.Run || o.Slot != run.Slot ||
+                o.Attribution != "PinnedClientSlotOnly"))
+            return KitResult.Inconclusive("Observer identity or exact slot attribution is incomplete.");
+        if (independentlyAttributed && run.Observations.Any(o => o.Role != "child" && o.SequenceSeen))
+            return new KitResult { Verdict = KitVerdict.Fail,
+                Reason = "Confirmed attributable parent XInput challenge evidence, regardless of later gaps or missing observers." };
+        if (run.Observations.Count != 3)
+            return KitResult.Inconclusive("Required observer missing.");
+        var child = run.Observations.SingleOrDefault(o => o.Role == "child");
+        var oldParent = run.Observations.SingleOrDefault(o => o.Role == "parent-pre");
+        var freshParent = run.Observations.SingleOrDefault(o => o.Role == "parent-fresh");
+        if (child == null || oldParent == null || freshParent == null)
+            return KitResult.Inconclusive("Required observer missing.");
+        if (!independentlyAttributed)
+            return KitResult.Inconclusive("Pinned-client XInput slot lacks independent target attribution; no isolation pass.");
+        if (!child.Complete || !child.SequenceSeen || !child.ConnectedDuringChallenge ||
+            !oldParent.Complete || !freshParent.Complete ||
+            child.OtherErrors != 0 || oldParent.OtherErrors != 0 || freshParent.OtherErrors != 0)
+            return KitResult.Inconclusive("Child reception or parent challenge-window coverage incomplete.");
+        return new KitResult { Verdict = KitVerdict.SyntheticPass,
+            Reason = "Scoped, modeled XInput route only; no universal controller isolation claim." };
     }
 }
 
@@ -107,7 +247,6 @@ internal static class X360QualificationProgram
     private static readonly JavaScriptSerializer Json = new JavaScriptSerializer { MaxJsonLength = 65536 };
     private static string Root { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "ChildStream", "X360Qualification"); } }
-    private static string PathFor(Guid run) { return Path.Combine(Root, run.ToString("N") + ".json"); }
     private static string CurrentSid { get { return WindowsIdentity.GetCurrent().User.Value; } }
     private static string ImageHash(string path)
     { using (var stream = File.OpenRead(path)) using (var sha = SHA256.Create())
@@ -119,51 +258,132 @@ internal static class X360QualificationProgram
         FeederStartTicks = r.FeederStartTicks, ParentSession = r.ParentSession,
         ChildSession = r.ChildSession, ParentLogon = r.ParentLogon, ChildLogon = r.ChildLogon,
         Serial = r.Serial }; }
-    private static void Save(X360RunRecord r)
+    private static void Save(X360RunRecord r) { SaveAt(r, Root, true); }
+    internal static void SaveAt(X360RunRecord r, string root, bool protectedAcl)
     {
         Guid run = Guid.ParseExact(r.Run, "N");
-        if (!Directory.Exists(Root))
+        if (!Directory.Exists(root))
         {
-            var sid = WindowsIdentity.GetCurrent().User;
-            var acl = new DirectorySecurity();
-            acl.SetAccessRuleProtection(true, false);
-            acl.SetOwner(sid);
-            acl.AddAccessRule(new FileSystemAccessRule(sid, FileSystemRights.FullControl,
-                InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
-            Directory.CreateDirectory(Root, acl);
+            if (protectedAcl)
+            {
+                var sid = WindowsIdentity.GetCurrent().User;
+                var acl = new DirectorySecurity();
+                acl.SetAccessRuleProtection(true, false);
+                acl.SetOwner(sid);
+                acl.AddAccessRule(new FileSystemAccessRule(sid, FileSystemRights.FullControl,
+                    InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
+                Directory.CreateDirectory(root, acl);
+            }
+            else Directory.CreateDirectory(root);
         }
-        string path = PathFor(run), body = Json.Serialize(r);
-        // Both sides update this one-shot record in strict handshake order.
-        // Never let a feeder status update erase the helper's durable originals.
-        if (File.Exists(path) && (r.Prior == null || r.Prior.Count == 0))
-        {
-            var previous = Load(run);
-            if (previous.Prior != null && previous.Prior.Count != 0) r.Prior = previous.Prior;
-            body = Json.Serialize(r);
-        }
+        string path = Path.Combine(root, run.ToString("N") + ".json");
+        if (File.Exists(path)) MergeRecord(r, ReadAt(run, root));
+        ValidateDiagnosticEvidence(r);
+        string body = Json.Serialize(r);
         if (Encoding.UTF8.GetByteCount(body) > 16384) throw new InvalidOperationException("Run record exceeds limit.");
-        var fileAcl = new FileSecurity();
-        var owner = WindowsIdentity.GetCurrent().User;
-        fileAcl.SetAccessRuleProtection(true, false);
-        fileAcl.SetOwner(owner);
-        fileAcl.AddAccessRule(new FileSystemAccessRule(owner, FileSystemRights.FullControl, AccessControlType.Allow));
         string temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-        using (var file = new FileStream(temporary, FileMode.CreateNew, FileSystemRights.Write, FileShare.None,
-            4096, FileOptions.WriteThrough, fileAcl))
+        FileStream file;
+        if (protectedAcl)
+        {
+            var fileAcl = new FileSecurity();
+            var owner = WindowsIdentity.GetCurrent().User;
+            fileAcl.SetAccessRuleProtection(true, false);
+            fileAcl.SetOwner(owner);
+            fileAcl.AddAccessRule(new FileSystemAccessRule(owner, FileSystemRights.FullControl, AccessControlType.Allow));
+            file = new FileStream(temporary, FileMode.CreateNew, FileSystemRights.Write, FileShare.None,
+                4096, FileOptions.WriteThrough, fileAcl);
+        }
+        else file = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+            4096, FileOptions.WriteThrough);
+        using (file)
         { var bytes = Encoding.UTF8.GetBytes(body); file.Write(bytes, 0, bytes.Length); file.Flush(true); }
         if (File.Exists(path)) File.Replace(temporary, path, null);
         else File.Move(temporary, path);
     }
-    private static X360RunRecord Load(Guid run)
+    private static void ValidateDiagnosticEvidence(X360RunRecord r)
     {
-        var file = new FileInfo(PathFor(run));
+        if (r.Phases != null)
+        {
+            ushort[] sequence = { 0x1000, 0x2000, 0x1000, 0 };
+            if (r.Phases.Count > 4) throw new InvalidOperationException("Too many challenge phases.");
+            long previous = -1;
+            for (int i = 0; i < r.Phases.Count; i++)
+            {
+                var p = r.Phases[i];
+                if (p == null || p.Buttons != sequence[i] || p.StartTick <= previous ||
+                    p.EndTick <= p.StartTick || p.ActualEndTick < p.StartTick ||
+                    (p.Completed && p.ActualEndTick < p.EndTick) ||
+                    (!p.Completed && i != r.Phases.Count - 1))
+                    throw new InvalidOperationException("Malformed challenge phase record.");
+                previous = p.ActualEndTick;
+            }
+        }
+        if (r.Observations != null && (r.Observations.Count > 3 ||
+            r.Observations.Select(o => o == null ? null : o.Role).Distinct().Count() != r.Observations.Count ||
+            r.Observations.Any(o => o == null || o.Run != r.Run || o.Slot != r.Slot ||
+                o.Attribution != "PinnedClientSlotOnly" ||
+                (o.Role != "parent-pre" && o.Role != "parent-fresh" && o.Role != "child"))))
+            throw new InvalidOperationException("Wrong-run or duplicate observer evidence.");
+        if (!(r.TargetCleanup == "Present" || r.TargetCleanup == "Removed" || r.TargetCleanup == "RemovalFailed") ||
+            !(r.PropertyCleanup == "NotStarted" || r.PropertyCleanup == "Restored" || r.PropertyCleanup == "RecoveryFailed"))
+            throw new InvalidOperationException("Unknown cleanup state.");
+    }
+    private static void MergeRecord(X360RunRecord incoming, X360RunRecord previous)
+    {
+        if (previous == null || previous.Run != incoming.Run || previous.OwnerSid != incoming.OwnerSid ||
+            previous.Pipe != incoming.Pipe || previous.Source != incoming.Source ||
+            previous.FeederImageSha256 != incoming.FeederImageSha256 ||
+            previous.FeederPid != incoming.FeederPid || previous.FeederStartTicks != incoming.FeederStartTicks ||
+            previous.ParentSession != incoming.ParentSession || previous.ChildSession != incoming.ChildSession ||
+            previous.ParentLogon != incoming.ParentLogon || previous.ChildLogon != incoming.ChildLogon ||
+            previous.Serial != incoming.Serial || previous.Slot != incoming.Slot)
+            throw new InvalidOperationException("Conflicting run record identity.");
+        if (incoming.Prior == null || incoming.Prior.Count == 0) incoming.Prior = previous.Prior;
+        else if (previous.Prior != null && previous.Prior.Count > 0 &&
+            (incoming.Prior.Count < previous.Prior.Count || previous.Prior.Where((p, i) =>
+                p.Node != incoming.Prior[i].Node || p.Kind != incoming.Prior[i].Kind || p.Value != incoming.Prior[i].Value).Any()))
+            throw new InvalidOperationException("Conflicting exact-property originals.");
+        if (incoming.Phases == null || incoming.Phases.Count == 0) incoming.Phases = previous.Phases;
+        else if (previous.Phases != null && previous.Phases.Count > 0 && !SamePhases(previous.Phases, incoming.Phases))
+            throw new InvalidOperationException("Conflicting challenge phase evidence.");
+        if (incoming.Observations == null || incoming.Observations.Count == 0) incoming.Observations = previous.Observations;
+        else if (previous.Observations != null && previous.Observations.Count > 0 &&
+            !ObservationsExtend(previous.Observations, incoming.Observations))
+            throw new InvalidOperationException("Conflicting observation evidence.");
+        if (incoming.TargetCleanup == "Present") incoming.TargetCleanup = previous.TargetCleanup;
+        else if (previous.TargetCleanup != "Present" && previous.TargetCleanup != incoming.TargetCleanup)
+            throw new InvalidOperationException("Conflicting feeder cleanup status.");
+        if (incoming.PropertyCleanup == "NotStarted") incoming.PropertyCleanup = previous.PropertyCleanup;
+        else if (previous.PropertyCleanup != "NotStarted" && previous.PropertyCleanup != incoming.PropertyCleanup)
+            throw new InvalidOperationException("Conflicting helper cleanup status.");
+    }
+    private static bool SamePhases(List<X360PhaseRecord> a, List<X360PhaseRecord> b)
+    { return a.Count == b.Count && !a.Where((p, i) => p.Buttons != b[i].Buttons ||
+        p.StartTick != b[i].StartTick || p.EndTick != b[i].EndTick ||
+        p.ActualEndTick != b[i].ActualEndTick || p.Completed != b[i].Completed).Any(); }
+    private static bool ObservationsExtend(List<X360ObservationRecord> a, List<X360ObservationRecord> b)
+    { return a.Count <= b.Count && !a.Where((p, i) => p.Run != b[i].Run || p.Role != b[i].Role ||
+        p.Slot != b[i].Slot || p.ChallengeStart != b[i].ChallengeStart || p.ChallengeEnd != b[i].ChallengeEnd ||
+        p.ChallengeSamples != b[i].ChallengeSamples || p.NotConnected != b[i].NotConnected ||
+        p.OtherErrors != b[i].OtherErrors || p.Complete != b[i].Complete ||
+        p.SequenceSeen != b[i].SequenceSeen || p.ConnectedDuringChallenge != b[i].ConnectedDuringChallenge ||
+        p.Attribution != b[i].Attribution).Any(); }
+    internal static X360RunRecord ReadAt(Guid run, string root)
+    {
+        var file = new FileInfo(Path.Combine(root, run.ToString("N") + ".json"));
         if (!file.Exists || file.Length > 16384) throw new InvalidOperationException("Bounded private run record unavailable.");
         X360RunRecord r = Json.Deserialize<X360RunRecord>(File.ReadAllText(file.FullName, Encoding.UTF8));
         if (r == null || r.Schema != "ChildStream.X360Qualification.v1" || r.Origin != "NATIVE-ORIGIN-UNQUALIFIED" ||
             r.Source != X360KitBuild.SourceSha ||
             r.ViGEmClient != "8d71f6740ffff4671cdadbca255ce528e3cd3fef" ||
-            r.Run != run.ToString("N") || r.OwnerSid != CurrentSid ||
-            r.Pipe != "ChildStream-X360-" + r.Run) throw new InvalidOperationException("Run record identity invalid.");
+            r.Run != run.ToString("N") || r.Pipe != "ChildStream-X360-" + r.Run)
+            throw new InvalidOperationException("Run record identity invalid.");
+        return r;
+    }
+    private static X360RunRecord Load(Guid run)
+    {
+        X360RunRecord r = ReadAt(run, Root);
+        if (r.OwnerSid != CurrentSid) throw new InvalidOperationException("Run record owner identity invalid.");
         return r;
     }
     internal static void Send(BinaryWriter w, string value)
@@ -257,14 +477,13 @@ internal static class X360QualificationProgram
                 throw new InvalidOperationException("Observer process identity unavailable.");
             CheckPeer(pid, r, role == "child" ? KitPeerRole.ChildObserver : KitPeerRole.ParentObserver);
             lease.Peer = SnapshotPeer(pid);
-            // The observer sends READY only after its first native sample.
+            // READY contains two bounded samples, not merely a live process.
             using (var watchdog = new System.Threading.Timer(_ => { try { lease.Pipe.Dispose(); } catch { } },
                 null, TimeSpan.FromSeconds(30), Timeout.InfiniteTimeSpan))
             using (var input = new BinaryReader(lease.Pipe, Encoding.UTF8, true))
             {
-                string message = Receive(input);
-                long firstSampleTick = input.ReadInt64();
-                KitObserverAdmission.RequireReady(message, r.Run, role, firstSampleTick,
+                var ready = Json.Deserialize<X360ObserverReadyRecord>(Receive(input));
+                KitObserverAdmission.RequireReady(ready, r.Run, role, r.Slot,
                     Stopwatch.GetTimestamp(), Stopwatch.Frequency);
             }
             lease.ReadyTick = Stopwatch.GetTimestamp();
@@ -274,10 +493,29 @@ internal static class X360QualificationProgram
     }
     private static void RequireObserverStillRunning(ObserverLease lease, X360RunRecord r, string role)
     {
-        if (lease == null || !lease.Pipe.IsConnected ||
-            !new WindowsKitWorld().ProcessMatches(lease.Peer.Pid, lease.Peer.StartTicks))
-            throw new InvalidOperationException(role + " observer no longer connected.");
+        KitObserverAdmission.RequireLive(lease != null && lease.Pipe.IsConnected,
+            lease != null && new WindowsKitWorld().ProcessMatches(lease.Peer.Pid, lease.Peer.StartTicks),
+            lease != null && new WindowsKitWorld().GenerationMatches(r.ParentSession, r.ParentLogon) &&
+                new WindowsKitWorld().GenerationMatches(r.ChildSession, r.ChildLogon));
         CheckPeer((uint)lease.Peer.Pid, r, role == "child" ? KitPeerRole.ChildObserver : KitPeerRole.ParentObserver);
+    }
+    private static string ObserverCommand(ObserverLease lease, X360RunRecord r, string role, string command)
+    {
+        RequireObserverStillRunning(lease, r, role);
+        using (var output = new BinaryWriter(lease.Pipe, Encoding.UTF8, true))
+            Send(output, command + " " + r.Run + " " + role);
+        var response = Task.Factory.StartNew(() =>
+        {
+            using (var input = new BinaryReader(lease.Pipe, Encoding.UTF8, true)) return Receive(input);
+        });
+        if (!response.Wait(TimeSpan.FromSeconds(3)))
+        { lease.Dispose(); throw new TimeoutException(role + " did not acknowledge " + command + "."); }
+        return response.Result;
+    }
+    private static void RequireObserverAck(string value, X360RunRecord r, string role, string command)
+    {
+        if (value != "ACK " + command + " " + r.Run + " " + role)
+            throw new InvalidOperationException("Observer acknowledged a different phase or run.");
     }
     private static int Feeder(string[] args)
     {
@@ -336,7 +574,8 @@ internal static class X360QualificationProgram
                             string assignedMessage = Receive(input);
                             if (assignedMessage == "ABORT")
                             {
-                                run.Stop(); r.State = "RemovedPendingPropertyRecovery"; Save(r);
+                                run.Stop(); r.TargetCleanup = "Removed";
+                                r.State = "RemovedPendingPropertyRecovery"; Save(r);
                                 Send(output, "REMOVED");
                                 return 4;
                             }
@@ -352,7 +591,8 @@ internal static class X360QualificationProgram
                             string decision = Receive(input);
                             if (decision == "ABORT")
                             {
-                                run.Stop(); r.State = "RemovedPendingPropertyRecovery"; Save(r);
+                                run.Stop(); r.TargetCleanup = "Removed";
+                                r.State = "RemovedPendingPropertyRecovery"; Save(r);
                                 Send(output, "REMOVED");
                                 return 4;
                             }
@@ -362,10 +602,16 @@ internal static class X360QualificationProgram
                                 run.PulseAfterExternalArm(Guid.ParseExact(r.Run, "N"), true,
                                     new MonotonicKitClock(), challengeDeadline.Token);
                             r.Phases = run.Phases.Select(p => new X360PhaseRecord
-                                { Buttons = p.Buttons, StartTick = p.StartTick, EndTick = p.EndTick }).ToList();
+                                { Buttons = p.Buttons, StartTick = p.StartTick, EndTick = p.EndTick,
+                                  ActualEndTick = p.ActualEndTick, Completed = p.Completed }).ToList();
                             r.State = "Pulsed"; Save(r);
                             Send(output, "PULSED");
-                            run.Stop(); r.State = "RemovedPendingPropertyRecovery"; Save(r);
+                            Send(output, Json.Serialize(new X360PhaseEnvelope { Run = r.Run, Phases = r.Phases }));
+                            var teardown = Task.Factory.StartNew(() => Receive(input));
+                            if (!teardown.Wait(TimeSpan.FromSeconds(15)) || teardown.Result != "TEARDOWN " + r.Run)
+                                throw new TimeoutException("Finalization did not release exact target teardown.");
+                            run.Stop(); r.TargetCleanup = "Removed";
+                            r.State = "RemovedPendingPropertyRecovery"; Save(r);
                             Send(output, "REMOVED");
                         }
                         }
@@ -375,10 +621,13 @@ internal static class X360QualificationProgram
                 catch (Exception ex)
                 {
                     r.Phases = run.Phases.Select(p => new X360PhaseRecord
-                        { Buttons = p.Buttons, StartTick = p.StartTick, EndTick = p.EndTick }).ToList();
+                        { Buttons = p.Buttons, StartTick = p.StartTick, EndTick = p.EndTick,
+                          ActualEndTick = p.ActualEndTick, Completed = p.Completed }).ToList();
                     r.Error = ex.GetType().Name + ": " + ex.Message;
                     r.State = "StoppedOrRecoveryRequired";
-                    try { run.Stop(); } catch (Exception cleanup) { r.Error += "; removal: " + cleanup.Message; }
+                    try { run.Stop(); r.TargetCleanup = "Removed"; }
+                    catch (Exception cleanup)
+                    { r.TargetCleanup = "RemovalFailed"; r.Error += "; removal: " + cleanup.Message; }
                     try { Save(r); } catch { }
                     Console.Error.WriteLine(r.Error);
                     return 3;
@@ -425,6 +674,8 @@ internal static class X360QualificationProgram
                 long assignmentStart = Stopwatch.GetTimestamp();
                 if (parentPre.ReadyTick >= assignmentStart)
                     throw new InvalidOperationException("Pre-assignment observation order invalid.");
+                RequireObserverAck(ObserverCommand(parentPre, r, "parent-pre", "ASSIGNMENT"),
+                    r, "parent-pre", "ASSIGNMENT");
                 string[] nodes = null;
                 bool armSent = false;
                 try
@@ -449,8 +700,8 @@ internal static class X360QualificationProgram
                 if (parentFresh.ReadyTick <= assignmentStart || childObserver.ReadyTick <= assignmentStart)
                     throw new InvalidOperationException("Post-assignment observation order invalid.");
                 Console.WriteLine("Type ARM " + r.Run + " within two minutes to submit four reports; otherwise close this window.");
-                var line = new StringBuilder(); var deadline = DateTime.UtcNow.AddMinutes(2);
-                while (DateTime.UtcNow < deadline)
+                var line = new StringBuilder(); long deadline = Stopwatch.GetTimestamp() + Stopwatch.Frequency * 120;
+                while (Stopwatch.GetTimestamp() < deadline)
                 {
                     if (Console.KeyAvailable)
                     {
@@ -478,21 +729,66 @@ internal static class X360QualificationProgram
                     if (p.Kind != PropertyKind.UInt32 || p.Value != r.ChildSession)
                         throw new InvalidOperationException("Assignment changed before arm.");
                 }
+                foreach (var observer in new[] {
+                    new { Lease = parentPre, Role = "parent-pre" },
+                    new { Lease = parentFresh, Role = "parent-fresh" },
+                    new { Lease = childObserver, Role = "child" } })
+                {
+                    var arm = Json.Deserialize<X360ObserverArmRecord>(ObserverCommand(
+                        observer.Lease, r, observer.Role, "START"));
+                    KitObserverAdmission.RequireArm(arm, r.Run, observer.Role, r.Slot,
+                        Stopwatch.GetTimestamp(), Stopwatch.Frequency);
+                }
                 Send(output, "ARM");
                 armSent = true;
-                if (Receive(input) != "PULSED" || Receive(input) != "REMOVED")
-                    throw new InvalidOperationException("Feeder did not confirm exact report and removal sequence.");
-                r.State = "RemovedPendingPropertyRecovery"; Save(r);
-                foreach (string node in nodes)
+                string observationIssue = null;
+                try
                 {
-                    DeviceProperty prior;
-                    if (!assignment.Prior.TryGetValue(node, out prior))
-                        throw new InvalidOperationException("Original property record unavailable.");
-                    world.RestoreAbsentTargetProperty(node, (uint)r.ChildSession, prior);
+                    if (Receive(input) != "PULSED")
+                        throw new InvalidOperationException("Feeder did not complete bounded challenge.");
+                    var envelope = Json.Deserialize<X360PhaseEnvelope>(Receive(input));
+                    KitPhaseAdmission.Require(envelope, r.Run, Stopwatch.Frequency);
+                    if (envelope.Phases.Count != 4 || envelope.Phases.Any(p => !p.Completed))
+                        throw new InvalidOperationException("Challenge timeline is partial.");
+                    r.Phases = envelope.Phases; r.State = "ChallengeFinalizing"; Save(r);
+                    r.Observations = KitObservationFinalization.Collect(r,
+                        (role, command) => ObserverCommand(role == "parent-pre" ? parentPre :
+                            role == "parent-fresh" ? parentFresh : childObserver, r, role, command),
+                        Json, Stopwatch.GetTimestamp,
+                        record => { r.Observations.Add(record); Save(r); });
+                    r.State = "ChallengeFinalized"; Save(r);
                 }
-                r.State = "RemovedAndPropertyRestored"; Save(r);
-                Console.WriteLine("Target removed and exact non-present property states restored. Enforcement remains unqualified.");
-                return 0;
+                catch (Exception observationFailure)
+                { observationIssue = observationFailure.GetType().Name + ": " + observationFailure.Message; }
+                try
+                {
+                    Send(output, "TEARDOWN " + r.Run);
+                    if (Receive(input) != "REMOVED") throw new InvalidOperationException("Exact target removal unconfirmed.");
+                    r.TargetCleanup = "Removed"; r.State = "RemovedPendingPropertyRecovery"; Save(r);
+                    foreach (string node in nodes)
+                    {
+                        DeviceProperty prior;
+                        if (!assignment.Prior.TryGetValue(node, out prior))
+                            throw new InvalidOperationException("Original property record unavailable.");
+                        world.RestoreAbsentTargetProperty(node, (uint)r.ChildSession, prior);
+                    }
+                    r.PropertyCleanup = "Restored";
+                    r.State = observationIssue == null ? "RemovedAndPropertyRestored" :
+                        "RemovedAndRestoredObservationIncomplete";
+                    if (observationIssue != null) r.Error = observationIssue;
+                    Save(r);
+                }
+                catch (Exception recovery)
+                {
+                    r.PropertyCleanup = "RecoveryFailed"; r.Error = "Target/property recovery incomplete: " + recovery.Message;
+                    try { Save(r); } catch { }
+                    throw;
+                }
+                var disposition = KitObservationFinalization.Classify(r, false);
+                Console.WriteLine(observationIssue == null ?
+                    "Challenge finalized; target and property states restored. " + disposition.Verdict + ": " + disposition.Reason :
+                    "Challenge observation INCONCLUSIVE; target and property states restored: " + observationIssue);
+                return observationIssue == null ? 0 : 4;
                 }
                 }
                 catch (Exception original)
@@ -509,10 +805,14 @@ internal static class X360QualificationProgram
                                 throw new InvalidOperationException("Original property unavailable after abort.");
                             world.RestoreAbsentTargetProperty(node, (uint)r.ChildSession, prior);
                         }
+                        r.TargetCleanup = "Removed"; r.PropertyCleanup = "Restored";
                         r.State = "RemovedAndPropertyRestoredAfterAbort"; Save(r);
                     }
                     catch (Exception recovery)
                     {
+                        r.PropertyCleanup = "RecoveryFailed";
+                        r.Error = "Observer/arm failed; exact property recovery incomplete: " + recovery.Message;
+                        try { Save(r); } catch { }
                         throw new InvalidOperationException("Observer/arm failed; exact property recovery is incomplete: " +
                             original.Message + "; " + recovery.Message, recovery);
                     }
@@ -538,43 +838,98 @@ internal static class X360QualificationProgram
         if (Process.GetCurrentProcess().SessionId != session || !new WindowsKitWorld().GenerationMatches(session, logon))
             throw new InvalidOperationException("Observer exact WTS generation mismatch.");
         var xinput = new WindowsXInputSlotReader();
-        string role = args[1]; var end = Stopwatch.GetTimestamp() + Stopwatch.Frequency * seconds;
+        string role = args[1];
         Console.WriteLine("NATIVE-ORIGIN-UNQUALIFIED XInput " + role + " polling owned target index " + run.Slot + ".");
         using (var readiness = new NamedPipeClientStream(".", ObserverPipe(run, role), PipeDirection.InOut, PipeOptions.None))
         {
-        readiness.Connect(120000);
-        uint helperPid;
-        if (!GetNamedPipeServerProcessId(readiness.SafePipeHandle.DangerousGetHandle(), out helperPid))
-            throw new InvalidOperationException("Observer helper identity unavailable.");
-        CheckPeer(helperPid, run, KitPeerRole.Assignment);
-        var sampler = new KitSequenceSampler();
-        long firstTick = Stopwatch.GetTimestamp();
-        ControllerSlotState first = xinput.Read(run.Slot);
-        sampler.Sample(firstTick, first.Buttons, first.Error, Stopwatch.Frequency);
-        using (var ready = new BinaryWriter(readiness, Encoding.UTF8, true))
-        { Send(ready, "READY " + run.Run + " " + role); ready.Write(firstTick); ready.Flush(); }
-        Thread.Sleep(50);
-        uint previousPacket = UInt32.MaxValue; uint previousError = UInt32.MaxValue;
-        while (Stopwatch.GetTimestamp() < end)
-        {
-            long tick = Stopwatch.GetTimestamp();
-            ControllerSlotState state = xinput.Read(run.Slot);
-            sampler.Sample(tick, state.Buttons, state.Error, Stopwatch.Frequency);
-            if (state.Packet != previousPacket || state.Error != previousError)
-            {
-                Console.WriteLine(Json.Serialize(new { schema = "ChildStream.X360Observation.v1", origin = "NATIVE-ORIGIN-UNQUALIFIED",
-                    run = run.Run, role = role, session = session, logon = logon, tick = tick, slot = run.Slot, error = state.Error,
-                    packet = state.Packet, buttonA = (state.Buttons & 0x1000) != 0,
-                    buttonB = (state.Buttons & 0x2000) != 0 }));
-            }
-            previousPacket = state.Packet; previousError = state.Error;
-            Thread.Sleep(50);
-        }
-        Console.WriteLine(Json.Serialize(new { schema = "ChildStream.X360ObservationSummary.v1",
-            origin = "NATIVE-ORIGIN-UNQUALIFIED", run = run.Run, role = role,
-            complete = sampler.Complete, sequenceSeen = sampler.SequenceSeen }));
+            readiness.Connect(120000);
+            uint helperPid;
+            if (!GetNamedPipeServerProcessId(readiness.SafePipeHandle.DangerousGetHandle(), out helperPid))
+                throw new InvalidOperationException("Observer helper identity unavailable.");
+            CheckPeer(helperPid, run, KitPeerRole.Assignment);
+            ObserveCoordinated(readiness, readiness, xinput, run, role, seconds, Console.WriteLine);
         }
         return 0;
+    }
+    internal static X360ObserverOutcome ObserveCoordinated(Stream inbound, Stream outbound,
+        IControllerSlotReader xinput, X360RunRecord run, string role, int seconds, Action<string> log)
+    {
+        if (inbound == null || outbound == null || xinput == null || run == null ||
+            (role != "parent-pre" && role != "parent-fresh" && role != "child") ||
+            run.Slot > 3 || seconds < 1 || seconds > 600)
+            throw new InvalidOperationException("Observer coordination context invalid.");
+        var window = new KitObserverWindow(role == "child", role == "parent-pre");
+        var input = new BinaryReader(inbound, Encoding.UTF8, true);
+        var output = new BinaryWriter(outbound, Encoding.UTF8, true);
+        long firstTick = Stopwatch.GetTimestamp();
+        ControllerSlotState first = xinput.Read(run.Slot);
+        window.Sample(firstTick, first.Buttons, first.Error, Stopwatch.Frequency);
+        Thread.Sleep(50);
+        long secondTick = Stopwatch.GetTimestamp();
+        ControllerSlotState second = xinput.Read(run.Slot);
+        window.Sample(secondTick, second.Buttons, second.Error, Stopwatch.Frequency);
+        var ready = new X360ObserverReadyRecord { Run = run.Run, Role = role, Slot = run.Slot,
+            FirstTick = firstTick, SecondTick = secondTick,
+            FirstError = first.Error, SecondError = second.Error };
+        Send(output, Json.Serialize(ready));
+        if (log != null) log(Json.Serialize(new { schema = "ChildStream.X360Observation.v2",
+            run = run.Run, role = role, phase = window.Phase.ToString(), tick = firstTick,
+            slot = run.Slot, error = first.Error, packet = first.Packet, buttons = first.Buttons }));
+        long deadline = Stopwatch.GetTimestamp() + Stopwatch.Frequency * seconds;
+        long teardownUntil = 0;
+        uint previousPacket = second.Packet, previousError = second.Error;
+        X360ObservationRecord frozen = null;
+        Task<string> command = Task.Factory.StartNew(() => Receive(input));
+        while (Stopwatch.GetTimestamp() < deadline)
+        {
+            string action = null;
+            if (command != null && command.IsCompleted)
+            {
+                action = command.GetAwaiter().GetResult();
+                string suffix = " " + run.Run + " " + role;
+                if (action == "ASSIGNMENT" + suffix) window.Assignment();
+                else if (action == "START" + suffix) window.StartChallenge(Stopwatch.GetTimestamp());
+                else if (action == "FINALIZE" + suffix) window.FinalizeChallenge(Stopwatch.GetTimestamp());
+                else if (action == "TEARDOWN" + suffix)
+                { window.Teardown(); teardownUntil = Stopwatch.GetTimestamp() + Stopwatch.Frequency / 2; }
+                else throw new InvalidOperationException("Observer received wrong-run or out-of-order phase command.");
+            }
+            long tick = Stopwatch.GetTimestamp();
+            ControllerSlotState state = xinput.Read(run.Slot);
+            window.Sample(tick, state.Buttons, state.Error, Stopwatch.Frequency);
+            if (log != null && (state.Packet != previousPacket || state.Error != previousError || action != null))
+                log(Json.Serialize(new { schema = "ChildStream.X360Observation.v2", run = run.Run,
+                    role = role, phase = window.Phase.ToString(), tick = tick, slot = run.Slot,
+                    error = state.Error, packet = state.Packet, buttons = state.Buttons }));
+            previousPacket = state.Packet; previousError = state.Error;
+            if (action != null)
+            {
+                if (action.StartsWith("ASSIGNMENT ", StringComparison.Ordinal) ||
+                    action.StartsWith("TEARDOWN ", StringComparison.Ordinal))
+                    Send(output, "ACK " + (action.StartsWith("ASSIGNMENT ", StringComparison.Ordinal) ?
+                        "ASSIGNMENT" : "TEARDOWN") + " " + run.Run + " " + role);
+                else if (action.StartsWith("START ", StringComparison.Ordinal))
+                    Send(output, Json.Serialize(new X360ObserverArmRecord { Run = run.Run, Role = role,
+                        Slot = run.Slot, Tick = tick, Error = state.Error }));
+                else if (action.StartsWith("FINALIZE ", StringComparison.Ordinal))
+                {
+                    frozen = KitObserverAdmission.Finalize(run.Run, role, run.Slot, window);
+                    Send(output, Json.Serialize(frozen));
+                }
+                command = action.StartsWith("TEARDOWN ", StringComparison.Ordinal) ? null :
+                    Task.Factory.StartNew(() => Receive(input));
+            }
+            if (teardownUntil > 0 && tick >= teardownUntil) break;
+            Thread.Sleep(50);
+        }
+        if (frozen == null) throw new InvalidOperationException("Observer deadline expired before challenge finalization.");
+        if (log != null) log(Json.Serialize(new { schema = "ChildStream.X360ObservationSummary.v2",
+            origin = "NATIVE-ORIGIN-UNQUALIFIED", run = run.Run, role = role,
+            challenge = frozen, teardownNotConnected = window.TeardownNotConnected,
+            teardownOtherErrors = window.TeardownErrors }));
+        return new X360ObserverOutcome { Challenge = frozen,
+            TeardownNotConnected = window.TeardownNotConnected,
+            TeardownOtherErrors = window.TeardownErrors };
     }
     private static int FocusObserve(string[] args)
     {

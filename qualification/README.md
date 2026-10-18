@@ -45,13 +45,20 @@ recovery operation can be qualified. Unresolved residue is a stop condition.
 
 `--observe` polls only the pinned client's reported X360 user index for at most
 600 seconds and labels each record `NATIVE-ORIGIN-UNQUALIFIED`. Three separate
-observer processes announce readiness over exact-run named pipes after their
-first sample. The helper requires parent-pre before assignment and parent-fresh
-plus child after assignment, then checks that all three remain present before
-the operator's explicit arm. The feeder emits A/B/A/neutral once, dwelling
-400 ms on each state (eight nominal 50 ms polls), including neutral before
-target removal. Phase boundaries use monotonic ticks and are saved to the run
-record. Missing, late, or gapped sampling is inconclusive, never success.
+observer processes announce readiness over exact-run named pipes after two
+fresh samples. The child must report a connected XInput slot; parent observers
+may report connected or the documented not-connected result. The latter is a
+scoped observation, not proof of isolation. The helper requires parent-pre
+before assignment and parent-fresh plus child after assignment. It sends an
+explicit challenge-start command to each and requires a fresh sample acknowledgment
+before the operator's arm releases any feeder report. The feeder emits
+A/B/A/neutral once, dwelling 400 ms on each state (eight nominal 50 ms polls),
+including neutral. It then **holds the exact target** while the helper collects
+bounded final observations. Only after those challenge windows are frozen does
+the helper release target teardown. Observers log subsequent raw disappearance
+and errors under a separate teardown phase; they cannot retroactively invalidate
+or improve challenge coverage. Missing, late, or gapped challenge sampling is
+inconclusive, never success.
 `--focus` opens
 a bounded kit-owned parent window and records only navigation key codes delivered
 to that window. It does not use a global hook. XInput exposes no held device handle through
@@ -69,6 +76,13 @@ properties. The feeder and helper use a same-account named pipe and exact
 process challenge, with a ten-minute watchdog. Failure can leave a recorded
 property residue; do not guess at ownership or clear a property on a present
 device.
+The feeder owns the exact completed or partial monotonic phase timeline and
+target-removal status; the helper owns original property values, observation
+summaries, and property-restoration status. The bounded atomic record writer
+preserves those fields across alternating saves and rejects conflicts or
+wrong-run summaries. Neither run-file contents nor a clean teardown confer
+property-write authority. Observer summaries identify only the pinned client's
+XInput slot; independent slot-to-PnP attribution remains a physical gate.
 
 The same-target reconnect method is exercised only by synthetic state tests;
 the executable kit has **no reconnect command or physical reconnect coverage**.

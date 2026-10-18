@@ -79,25 +79,93 @@ internal sealed class MonotonicKitClock : IKitClock
 internal sealed class KitChallengePhase
 {
     internal ushort Buttons;
-    internal long StartTick, EndTick;
+    internal long StartTick, EndTick, ActualEndTick;
+    internal bool Completed;
 }
 internal sealed class KitSequenceSampler
 {
     private static readonly ushort[] Expected = { 0x1000, 0x2000, 0x1000, 0 };
     private int next;
     private long previous = -1;
+    private readonly bool allowNotConnected;
     internal bool Complete { get; private set; }
-    internal KitSequenceSampler() { Complete = true; }
+    internal int Samples { get; private set; }
+    internal int NotConnected { get; private set; }
+    internal int OtherErrors { get; private set; }
+    internal KitSequenceSampler(bool allowNotConnected = false)
+    { Complete = true; this.allowNotConnected = allowNotConnected; }
     // Preserve positive parent evidence even if later polling becomes incomplete.
     internal bool SequenceSeen { get { return next == Expected.Length; } }
     internal void Sample(long tick, ushort buttons, uint error, long frequency)
     {
+        Samples++;
         if (frequency <= 0 || tick < 0 || (previous >= 0 &&
             (tick <= previous || tick - previous > frequency * 150 / 1000))) Complete = false;
         previous = tick;
-        if (error != 0) { Complete = false; return; }
+        if (error == 1167)
+        {
+            NotConnected++;
+            if (!allowNotConnected) Complete = false;
+            return;
+        }
+        if (error != 0) { OtherErrors++; Complete = false; return; }
         if (next < Expected.Length && buttons == Expected[next]) next++;
         else if (next > 0 && buttons != Expected[next - 1]) Complete = false;
+    }
+}
+
+internal enum KitMeasurementPhase { Preparation, Assignment, Challenge, Finalization, Teardown }
+internal sealed class KitObserverWindow
+{
+    private readonly KitSequenceSampler challenge;
+    internal KitMeasurementPhase Phase { get; private set; }
+    internal long ChallengeStart, ChallengeEnd;
+    internal int TeardownNotConnected, TeardownErrors;
+    internal int PreparationSamples, AssignmentSamples;
+    internal bool ConnectedDuringChallenge;
+    internal KitSequenceSampler Challenge { get { return challenge; } }
+    internal KitObserverWindow(bool child, bool preAssignment)
+    {
+        challenge = new KitSequenceSampler(!child);
+        Phase = preAssignment ? KitMeasurementPhase.Preparation : KitMeasurementPhase.Assignment;
+    }
+    internal void Assignment()
+    {
+        if (Phase != KitMeasurementPhase.Preparation) throw new InvalidOperationException("Assignment phase order invalid.");
+        Phase = KitMeasurementPhase.Assignment;
+    }
+    internal void StartChallenge(long tick)
+    {
+        if (Phase != KitMeasurementPhase.Assignment || tick <= 0)
+            throw new InvalidOperationException("Challenge phase order invalid.");
+        ChallengeStart = tick; Phase = KitMeasurementPhase.Challenge;
+    }
+    internal void FinalizeChallenge(long tick)
+    {
+        if (Phase != KitMeasurementPhase.Challenge || tick < ChallengeStart || challenge.Samples == 0)
+            throw new InvalidOperationException("Challenge window absent or invalid.");
+        ChallengeEnd = tick; Phase = KitMeasurementPhase.Finalization;
+    }
+    internal void Teardown()
+    {
+        if (Phase != KitMeasurementPhase.Finalization)
+            throw new InvalidOperationException("Teardown before measurement finalization.");
+        Phase = KitMeasurementPhase.Teardown;
+    }
+    internal void Sample(long tick, ushort buttons, uint error, long frequency)
+    {
+        if (Phase == KitMeasurementPhase.Challenge)
+        {
+            if (error == 0) ConnectedDuringChallenge = true;
+            challenge.Sample(tick, buttons, error, frequency);
+        }
+        else if (Phase == KitMeasurementPhase.Teardown)
+        {
+            if (error == 1167) TeardownNotConnected++;
+            else if (error != 0) TeardownErrors++;
+        }
+        else if (Phase == KitMeasurementPhase.Preparation) PreparationSamples++;
+        else if (Phase == KitMeasurementPhase.Assignment) AssignmentSamples++;
     }
 }
 
@@ -280,9 +348,11 @@ internal sealed class X360Qualification
             long end = checked(phaseStart + dwell);
             var phase = new KitChallengePhase { Buttons = buttons, StartTick = phaseStart, EndTick = end };
             Phases.Add(phase);
-            clock.WaitUntil(end, cancellation);
+            try { clock.WaitUntil(end, cancellation); }
+            finally { phase.ActualEndTick = clock.Ticks; }
             if (clock.Ticks > end + tolerance)
                 throw new TimeoutException("Challenge sampling window exceeded deadline.");
+            phase.Completed = true;
         }
     }
     internal void ReconnectSameTarget()
