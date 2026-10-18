@@ -170,6 +170,24 @@ internal static class X360QualificationTests
         world.After = new[] { Root(), BusNode(), Pad(Node, Bus) };
         return new X360Qualification(target, world, Identity());
     }
+    private static void CheckFixtureReady(string message, JavaScriptSerializer json,
+        X360RunRecord run, string role)
+    {
+        var ready = json.Deserialize<X360ObserverReadyRecord>(message);
+        // The pipe exercises the real observer/reader path. The synthetic admission
+        // clock is pinned to receipt just after the second sample so CI thread-pool
+        // scheduling cannot turn this into a nondeterministic stale-message test.
+        // Stale and wrong-role records are tested separately below.
+        KitObserverAdmission.RequireReady(ready, run.Run, role, run.Slot,
+            ready.SecondTick + Stopwatch.Frequency / 10, Stopwatch.Frequency);
+    }
+    private static void CheckFixtureArm(string message, JavaScriptSerializer json,
+        X360RunRecord run, string role)
+    {
+        var arm = json.Deserialize<X360ObserverArmRecord>(message);
+        KitObserverAdmission.RequireArm(arm, run.Run, role, run.Slot,
+            arm.Tick + Stopwatch.Frequency / 10, Stopwatch.Frequency);
+    }
     private static void ConnectedFinalizationRegression()
     {
         Target target; World world;
@@ -191,8 +209,7 @@ internal static class X360QualificationTests
             using (var parentPre = new ObserverFixture(run, "parent-pre", new TargetReader
                 { Target = target, ParentDisconnected = true }))
             {
-                KitObserverAdmission.RequireReady(json.Deserialize<X360ObserverReadyRecord>(parentPre.Read()),
-                    run.Run, "parent-pre", run.Slot, Stopwatch.GetTimestamp(), Stopwatch.Frequency);
+                CheckFixtureReady(parentPre.Read(), json, run, "parent-pre");
                 Check(parentPre.Command(run, "parent-pre", "ASSIGNMENT") ==
                     "ACK ASSIGNMENT " + run.Run + " parent-pre", "parent-pre phase acknowledged before assignment");
                 qualification.Assign();
@@ -200,18 +217,15 @@ internal static class X360QualificationTests
                     { Target = target, ParentDisconnected = true }))
                 using (var child = new ObserverFixture(run, "child", new TargetReader { Target = target }))
                 {
-                    KitObserverAdmission.RequireReady(json.Deserialize<X360ObserverReadyRecord>(parentFresh.Read()),
-                        run.Run, "parent-fresh", run.Slot, Stopwatch.GetTimestamp(), Stopwatch.Frequency);
-                    KitObserverAdmission.RequireReady(json.Deserialize<X360ObserverReadyRecord>(child.Read()),
-                        run.Run, "child", run.Slot, Stopwatch.GetTimestamp(), Stopwatch.Frequency);
+                    CheckFixtureReady(parentFresh.Read(), json, run, "parent-fresh");
+                    CheckFixtureReady(child.Read(), json, run, "child");
                     qualification.Arm(qualification.Identity.Run);
                     foreach (var observer in new[] { new { Fixture = parentPre, Role = "parent-pre" },
                         new { Fixture = parentFresh, Role = "parent-fresh" },
                         new { Fixture = child, Role = "child" } })
                     {
-                        var arm = json.Deserialize<X360ObserverArmRecord>(observer.Fixture.Command(run, observer.Role, "START"));
-                        KitObserverAdmission.RequireArm(arm, run.Run, observer.Role, run.Slot,
-                            Stopwatch.GetTimestamp(), Stopwatch.Frequency);
+                        CheckFixtureArm(observer.Fixture.Command(run, observer.Role, "START"),
+                            json, run, observer.Role);
                     }
                     qualification.Pulse(new MonotonicKitClock(), CancellationToken.None);
                     run.Phases = qualification.Phases.Select(p => new X360PhaseRecord { Buttons = p.Buttons,
