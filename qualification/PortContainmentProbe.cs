@@ -1,8 +1,10 @@
 // REVIEW-ONLY PREPARATION — LIVE EXECUTION NOT AUTHORIZED.
 // Experiment-only receiver. It is not linked into the ChildStream application.
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -32,7 +34,7 @@ internal sealed class PortProbeOptions
             o.Lan.IsIPv6Multicast || o.Lan.IsIPv6LinkLocal || o.Lan.IsIPv4MappedToIPv6 ||
             (o.Lan.AddressFamily == AddressFamily.InterNetwork && (o.Lan.GetAddressBytes()[0] >= 224 ||
              o.Lan.GetAddressBytes()[0] == 0)))
-            throw new ArgumentException("Use an exact unicast LAN address and the same-family loopback address.");
+            throw new ArgumentException("Use an exact unicast LAN address and same-family loopback address.");
         if (!Int32.TryParse(args[10], NumberStyles.None, CultureInfo.InvariantCulture, out o.Port) ||
             !Int32.TryParse(args[12], NumberStyles.None, CultureInfo.InvariantCulture, out o.Seconds) ||
             !Int32.TryParse(args[14], NumberStyles.None, CultureInfo.InvariantCulture, out o.MaxAttempts) ||
@@ -43,54 +45,161 @@ internal sealed class PortProbeOptions
     }
 }
 
+internal sealed class ProbeRunResult
+{
+    internal bool MeasurementComplete, ShutdownComplete;
+    internal string StopReason;
+    internal int Attempts;
+}
+
 internal interface IPortProbeRuntime
+{ ProbeRunResult Run(PortProbeOptions options, Action<string> emit); }
+
+internal interface IProbeTime
 {
-    void Run(PortProbeOptions options, Action<string> emit);
+    long Milliseconds { get; } // monotonic elapsed time, never wall-clock time
+    string Utc { get; }        // receipt label only
 }
 
-internal static class PortProbeVerdict
+internal sealed class StopwatchProbeTime : IProbeTime
 {
-    // This only classifies supplied observations; it never gathers host evidence.
-    internal static string ClassifyEnforcement(bool remoteSent, bool exactOwnedDrop,
-        bool remoteReceived, bool localAttempted, bool localReceived, bool evidenceComplete)
+    private readonly Stopwatch watch = Stopwatch.StartNew();
+    public long Milliseconds { get { return watch.ElapsedMilliseconds; } }
+    public string Utc { get { return DateTime.UtcNow.ToString("o"); } }
+}
+
+internal sealed class ProbeBudget
+{
+    private readonly IProbeTime time;
+    private readonly Func<bool> cancelled;
+    private readonly long deadline;
+    internal const int MaximumIoSliceMs = 50;
+    internal ProbeBudget(IProbeTime time, Func<bool> cancelled, int seconds)
     {
-        if (remoteReceived || localAttempted && !localReceived) return "REJECTS TESTED RULE OR SETUP";
-        if (!remoteSent || !evidenceComplete) return "INCONCLUSIVE";
-        if (!localAttempted || !localReceived) return "INCONCLUSIVE";
-        return exactOwnedDrop ? "SUPPORTS TESTED RULE" : "INCONCLUSIVE";
+        this.time = time; this.cancelled = cancelled;
+        deadline = checked(time.Milliseconds + seconds * 1000L);
     }
-    internal static string ClassifyCleanup(bool cleanupComplete)
-    { return cleanupComplete ? "COMPLETE" : "INCOMPLETE"; }
+    internal int Slice()
+    {
+        if (cancelled()) throw new OperationCanceledException("Probe cancellation requested.");
+        long remaining = deadline - time.Milliseconds;
+        if (remaining <= 0) throw new TimeoutException("Probe elapsed-time budget exhausted.");
+        return (int)Math.Min(MaximumIoSliceMs, remaining);
+    }
+    internal string StopCondition()
+    {
+        if (cancelled()) return "CANCELLED";
+        return time.Milliseconds >= deadline ? "DEADLINE" : null;
+    }
 }
 
-internal static class PortProbeBudget
+internal sealed class ProbeDatagram
 {
-    internal static bool Continue(DateTime nowUtc, DateTime deadlineUtc, int attempts,
-        int maximum, bool cancelled)
-    { return !cancelled && attempts < maximum && nowUtc < deadlineUtc; }
+    internal int Count;
+    internal EndPoint Remote;
+    internal bool Oversize;
+}
+
+// The seam is the socket itself: the same receive/send/lifetime loop runs in
+// production and synthetic tests. No test constructs a real Socket.
+internal interface IProbeSocket : IDisposable
+{
+    string LocalEndpoint { get; }
+    string RemoteEndpoint { get; }
+    bool PollRead(int milliseconds);
+    bool PollWrite(int milliseconds);
+    IProbeSocket Accept(); // null for a nonblocking race
+    int Receive(byte[] bytes, int offset, int count); // -1 for would-block
+    int Send(byte[] bytes, int offset, int count); // -1 for would-block
+    ProbeDatagram ReceiveDatagram(byte[] bytes); // null for would-block
+    int SendDatagram(byte[] bytes, EndPoint remote); // -1 for would-block
+}
+
+internal interface IProbeSocketFactory
+{ IProbeSocket Bind(PortProbeOptions options, IPAddress address); }
+
+internal sealed class NativeProbeSocket : IProbeSocket
+{
+    private readonly Socket socket;
+    internal NativeProbeSocket(Socket socket) { this.socket = socket; }
+    public string LocalEndpoint { get { return socket.LocalEndPoint.ToString(); } }
+    public string RemoteEndpoint { get { return socket.RemoteEndPoint.ToString(); } }
+    public bool PollRead(int milliseconds)
+    { return socket.Poll(milliseconds * 1000, SelectMode.SelectRead); }
+    public bool PollWrite(int milliseconds)
+    { return socket.Poll(milliseconds * 1000, SelectMode.SelectWrite); }
+    private static bool WouldBlock(SocketException ex)
+    { return ex.SocketErrorCode == SocketError.WouldBlock || ex.SocketErrorCode == SocketError.IOPending; }
+    public IProbeSocket Accept()
+    {
+        try {
+            Socket peer = socket.Accept();
+            try { peer.Blocking = false; return new NativeProbeSocket(peer); }
+            catch { peer.Dispose(); throw; }
+        }
+        catch (SocketException ex) { if (WouldBlock(ex)) return null; throw; }
+    }
+    public int Receive(byte[] bytes, int offset, int count)
+    {
+        try { return socket.Receive(bytes, offset, count, SocketFlags.None); }
+        catch (SocketException ex) { if (WouldBlock(ex)) return -1; throw; }
+    }
+    public int Send(byte[] bytes, int offset, int count)
+    {
+        try { return socket.Send(bytes, offset, count, SocketFlags.None); }
+        catch (SocketException ex) { if (WouldBlock(ex)) return -1; throw; }
+    }
+    public ProbeDatagram ReceiveDatagram(byte[] bytes)
+    {
+        EndPoint remote = socket.AddressFamily == AddressFamily.InterNetwork
+            ? (EndPoint)new IPEndPoint(IPAddress.Any, 0) : new IPEndPoint(IPAddress.IPv6Any, 0);
+        try { return new ProbeDatagram {
+            Count = socket.ReceiveFrom(bytes, 0, bytes.Length, SocketFlags.None, ref remote), Remote = remote }; }
+        catch (SocketException ex) {
+            if (WouldBlock(ex)) return null;
+            if (ex.SocketErrorCode == SocketError.MessageSize)
+                return new ProbeDatagram { Count = 0, Remote = null, Oversize = true };
+            throw;
+        }
+    }
+    public int SendDatagram(byte[] bytes, EndPoint remote)
+    {
+        try { return socket.SendTo(bytes, remote); }
+        catch (SocketException ex) { if (WouldBlock(ex)) return -1; throw; }
+    }
+    public void Dispose() { socket.Dispose(); }
+}
+
+internal sealed class NativeProbeSocketFactory : IProbeSocketFactory
+{
+    public IProbeSocket Bind(PortProbeOptions options, IPAddress address)
+    {
+        var socket = new Socket(address.AddressFamily,
+            options.Protocol == ProtocolType.Tcp ? SocketType.Stream : SocketType.Dgram,
+            options.Protocol);
+        try {
+            if (address.AddressFamily == AddressFamily.InterNetworkV6)
+                socket.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.IPv6Only, true);
+            socket.ExclusiveAddressUse = true;
+            socket.ReceiveBufferSize = 256;
+            socket.SendBufferSize = 256;
+            socket.Bind(new IPEndPoint(address, options.Port));
+            if (options.Protocol == ProtocolType.Tcp) socket.Listen(2);
+            socket.Blocking = false;
+            return new NativeProbeSocket(socket);
+        } catch { socket.Dispose(); throw; }
+    }
 }
 
 internal sealed class SocketPortProbeRuntime : IPortProbeRuntime
 {
     private static readonly byte[] Request = Encoding.ASCII.GetBytes("CS-PROBE-v1");
     private static readonly byte[] Ack = Encoding.ASCII.GetBytes("OK");
-    private volatile bool cancelled;
-
-    private static Socket Bound(PortProbeOptions o, IPAddress address)
-    {
-        var s = new Socket(address.AddressFamily,
-            o.Protocol == ProtocolType.Tcp ? SocketType.Stream : SocketType.Dgram, o.Protocol);
-        try {
-            if (address.AddressFamily == AddressFamily.InterNetworkV6) s.SetSocketOption(
-                SocketOptionLevel.IPv6, SocketOptionName.IPv6Only, true);
-            s.ExclusiveAddressUse = true;
-            s.ReceiveBufferSize = 256;
-            s.SendBufferSize = 256;
-            s.Bind(new IPEndPoint(address, o.Port));
-            if (o.Protocol == ProtocolType.Tcp) s.Listen(2);
-            return s;
-        } catch { s.Dispose(); throw; }
-    }
+    private readonly IProbeSocketFactory factory;
+    private readonly IProbeTime time;
+    private readonly Func<bool> cancelled;
+    internal SocketPortProbeRuntime(IProbeSocketFactory factory, IProbeTime time, Func<bool> cancelled)
+    { this.factory = factory; this.time = time; this.cancelled = cancelled; }
 
     private static bool ExactMessage(byte[] data, int count)
     {
@@ -98,99 +207,193 @@ internal sealed class SocketPortProbeRuntime : IPortProbeRuntime
         for (int i = 0; i < count; i++) if (data[i] != Request[i]) return false;
         return true;
     }
-
-    private static void Receive(Socket listener, bool lan, ProtocolType protocol, Action<string> emit)
+    private static void DisposeOwned(ref IProbeSocket owned, IList<string> errors)
+    {
+        IProbeSocket current = owned; owned = null;
+        if (current == null) return;
+        try { current.Dispose(); }
+        catch (Exception ex) { errors.Add(ex.GetType().Name); }
+    }
+    private void HandleTcp(IProbeSocket peer, bool lan, ProbeBudget budget, Action<string> emit)
+    {
+        string side = lan ? "LAN" : "LOCAL";
+        emit("RECEIVED|" + time.Utc + "|" + side + "|" + peer.RemoteEndpoint + "|TCP_CONNECTED");
+        var data = new byte[Request.Length];
+        int count = 0;
+        while (count < data.Length) {
+            if (!peer.PollRead(budget.Slice())) continue;
+            budget.Slice(); // cancellation and deadline after active wait
+            int next = peer.Receive(data, count, data.Length - count);
+            if (next < 0) continue;
+            if (next == 0) {
+                emit("MESSAGE|" + time.Utc + "|" + side + "|PREMATURE_CLOSE");
+                return;
+            }
+            count += next;
+        }
+        if (!ExactMessage(data, count)) {
+            emit("MESSAGE|" + time.Utc + "|" + side + "|INVALID_MESSAGE");
+            return;
+        }
+        int sent = 0;
+        while (sent < Ack.Length) {
+            if (!peer.PollWrite(budget.Slice())) continue;
+            budget.Slice();
+            int next = peer.Send(Ack, sent, Ack.Length - sent);
+            if (next < 0) continue;
+            if (next == 0) throw new IOException("Accepted socket closed before fixed ACK.");
+            sent += next;
+        }
+        emit("MESSAGE|" + time.Utc + "|" + side + "|FIXED_MESSAGE_ACKED");
+    }
+    private void HandleUdp(IProbeSocket listener, bool lan, ProbeBudget budget,
+        Action<string> emit, Action onReceived)
     {
         var data = new byte[32];
-        EndPoint remote = listener.AddressFamily == AddressFamily.InterNetwork
-            ? (EndPoint)new IPEndPoint(IPAddress.Any, 0) : new IPEndPoint(IPAddress.IPv6Any, 0);
-        int count = -1;
-        bool valid = false;
-        bool observed = false;
-        bool oversized = false;
-        if (protocol == ProtocolType.Tcp) {
-            using (Socket peer = listener.Accept()) {
-                observed = true;
-                peer.ReceiveTimeout = 500;
-                peer.SendTimeout = 500;
-                remote = peer.RemoteEndPoint;
-                try {
-                    count = 0;
-                    while (count < Request.Length) {
-                        int part = peer.Receive(data, count, Request.Length - count, SocketFlags.None);
-                        if (part == 0) break;
-                        count += part;
-                    }
-                    valid = ExactMessage(data, count);
-                    if (valid) peer.Send(Ack);
-                } catch (SocketException) { }
-            }
-        } else {
-            try {
-                count = listener.ReceiveFrom(data, 0, data.Length, SocketFlags.None, ref remote);
-                observed = true;
-                valid = ExactMessage(data, count);
-                if (valid) listener.SendTo(Ack, remote);
-            } catch (SocketException ex) {
-                if (ex.SocketErrorCode == SocketError.MessageSize) { observed = true; oversized = true; }
-            }
+        ProbeDatagram received = listener.ReceiveDatagram(data);
+        if (received == null) return;
+        onReceived();
+        string side = lan ? "LAN" : "LOCAL";
+        emit("RECEIVED|" + time.Utc + "|" + side + "|" +
+            (received.Remote == null ? "UNKNOWN" : received.Remote.ToString()) + "|" +
+            (received.Oversize ? "OVERSIZE" : "UDP_DATAGRAM"));
+        if (received.Oversize || !ExactMessage(data, received.Count)) {
+            emit("MESSAGE|" + time.Utc + "|" + side + "|INVALID_MESSAGE");
+            return;
         }
-        // No arbitrary payload is printed or persisted. A received remote tuple is
-        // needed to identify unintended exposure if the proposed rule fails.
-        emit((observed ? "RECEIVED|" : "OBSERVATION_ERROR|") + DateTime.UtcNow.ToString("o") + "|" + (lan ? "LAN" : "LOCAL") +
-            "|" + (oversized ? "UNKNOWN" : remote.ToString()) + "|" +
-            (oversized ? "OVERSIZE" : valid ? "FIXED_MESSAGE" : "INVALID_MESSAGE"));
+        while (true) {
+            if (!listener.PollWrite(budget.Slice())) continue;
+            budget.Slice();
+            int sent = listener.SendDatagram(Ack, received.Remote);
+            if (sent < 0) continue;
+            if (sent != Ack.Length) throw new IOException("Fixed UDP ACK was not sent completely.");
+            break;
+        }
+        emit("MESSAGE|" + time.Utc + "|" + side + "|FIXED_MESSAGE_ACKED");
     }
 
-    public void Run(PortProbeOptions o, Action<string> emit)
+    public ProbeRunResult Run(PortProbeOptions options, Action<string> emit)
     {
-        ConsoleCancelEventHandler cancel = (sender, e) => { e.Cancel = true; cancelled = true; };
-        Console.CancelKeyPress += cancel;
+        var result = new ProbeRunResult { MeasurementComplete = true };
+        var cleanupErrors = new List<string>();
+        IProbeSocket local = null, lan = null, peer = null;
+        var budget = new ProbeBudget(time, cancelled, options.Seconds);
         try {
-            using (Socket local = Bound(o, o.Local))
-            using (Socket lan = Bound(o, o.Lan)) {
-                emit("READY|" + DateTime.UtcNow.ToString("o") + "|PID=" +
-                    Process.GetCurrentProcess().Id + "|" + o.Protocol + "|" +
-                    local.LocalEndPoint + "|" + lan.LocalEndPoint);
-                DateTime deadline = DateTime.UtcNow.AddSeconds(o.Seconds);
-                int attempts = 0;
-                while (PortProbeBudget.Continue(DateTime.UtcNow, deadline, attempts,
-                    o.MaxAttempts, cancelled)) {
-                    Socket selected = null;
-                    bool fromLan = false;
-                    if (local.Poll(100000, SelectMode.SelectRead)) selected = local;
-                    else if (lan.Poll(100000, SelectMode.SelectRead)) { selected = lan; fromLan = true; }
-                    if (selected == null) continue;
-                    Receive(selected, fromLan, o.Protocol, emit);
-                    attempts++;
+            local = factory.Bind(options, options.Local);
+            budget.Slice();
+            lan = factory.Bind(options, options.Lan);
+            budget.Slice();
+            emit("READY|" + time.Utc + "|PID=" + Process.GetCurrentProcess().Id +
+                "|" + options.Protocol + "|" + local.LocalEndpoint + "|" + lan.LocalEndpoint);
+            while (result.Attempts < options.MaxAttempts) {
+                string stop = budget.StopCondition();
+                if (stop != null) {
+                    result.StopReason = stop;
+                    if (stop == "CANCELLED") {
+                        result.MeasurementComplete = false;
+                        emit("MEASUREMENT_INCOMPLETE|" + time.Utc + "|CANCELLED");
+                    }
+                    break;
                 }
-                emit("STOPPED|" + DateTime.UtcNow.ToString("o") + "|ATTEMPTS=" + attempts);
+                IProbeSocket selected = null;
+                bool fromLan = false;
+                if (local.PollRead(budget.Slice())) selected = local;
+                else if (lan.PollRead(budget.Slice())) { selected = lan; fromLan = true; }
+                if (selected == null) continue;
+                budget.Slice(); // do not accept or read after cancellation/deadline
+                if (options.Protocol == ProtocolType.Tcp) {
+                    peer = selected.Accept();
+                    if (peer == null) continue;
+                    result.Attempts++;
+                    try { HandleTcp(peer, fromLan, budget, emit); }
+                    finally { DisposeOwned(ref peer, cleanupErrors); }
+                } else {
+                    HandleUdp(selected, fromLan, budget, emit, () => result.Attempts++);
+                }
+                if (cleanupErrors.Count != 0) throw new IOException("Accepted socket disposal failed.");
             }
-        } finally { Console.CancelKeyPress -= cancel; }
+            if (result.StopReason == null) result.StopReason = "ATTEMPT_CAP";
+        } catch (OperationCanceledException) {
+            result.StopReason = "CANCELLED_ACTIVE_IO";
+            result.MeasurementComplete = false;
+            emit("MEASUREMENT_INCOMPLETE|" + time.Utc + "|CANCELLED_ACTIVE_IO");
+        } catch (TimeoutException) {
+            result.StopReason = "DEADLINE_ACTIVE_IO";
+            result.MeasurementComplete = false;
+            emit("MEASUREMENT_INCOMPLETE|" + time.Utc + "|DEADLINE_ACTIVE_IO");
+        } catch (Exception ex) {
+            result.StopReason = "IO_ERROR";
+            result.MeasurementComplete = false;
+            emit("MEASUREMENT_ERROR|" + time.Utc + "|" + ex.GetType().Name);
+        } finally {
+            emit("STOP_REQUESTED|" + time.Utc + "|" + result.StopReason);
+            DisposeOwned(ref peer, cleanupErrors);
+            DisposeOwned(ref lan, cleanupErrors);
+            DisposeOwned(ref local, cleanupErrors);
+            result.ShutdownComplete = cleanupErrors.Count == 0;
+            emit((result.ShutdownComplete ? "STOPPED|" : "SHUTDOWN_FAILED|") + time.Utc +
+                "|REASON=" + result.StopReason + "|ATTEMPTS=" + result.Attempts +
+                "|MEASUREMENT=" + (result.MeasurementComplete ? "COMPLETE" : "INCOMPLETE") +
+                (result.ShutdownComplete ? "" : "|DISPOSE_ERRORS=" + String.Join(",", cleanupErrors)));
+        }
+        return result;
     }
+}
+
+internal static class PortProbeVerdict
+{
+    // Classifies supplied evidence only. Cleanup remains a separate result.
+    internal static string ClassifyEnforcement(bool remoteSent, bool exactOwnedDrop,
+        bool remoteReceived, bool localAttempted, bool localReceived, bool evidenceComplete)
+    {
+        if (remoteReceived || localAttempted && !localReceived) return "REJECTS TESTED RULE OR SETUP";
+        if (!remoteSent || !evidenceComplete || !localAttempted || !localReceived) return "INCONCLUSIVE";
+        return exactOwnedDrop ? "SUPPORTS TESTED RULE" : "INCONCLUSIVE";
+    }
+    internal static string ClassifyCleanup(bool cleanupComplete)
+    { return cleanupComplete ? "COMPLETE" : "INCOMPLETE"; }
 }
 
 internal static class PortContainmentProbeProgram
 {
     internal const string Label = "REVIEW-ONLY PREPARATION — LIVE EXECUTION NOT AUTHORIZED";
-    internal static int Run(string[] args, IPortProbeRuntime runtime, Action<string> emit)
+    internal static int Run(string[] args, IPortProbeRuntime runtime,
+        ILocalTcpControlRuntime control, Action<string> emit)
     {
         if (args.Length == 0 || args.Length == 1 && args[0] == "--help") {
             emit(Label);
-            emit("Separate explicit authorization is required before receive. No default socket operation.");
+            emit("Separate explicit authorization is required before any socket operation.");
             emit("receive --reviewed-live-approval YES --protocol TCP|UDP --local 127.0.0.1|::1 --lan ADDRESS --port PORT --seconds 1..120 --max-attempts 1..8");
+            emit("control-tcp --reviewed-live-approval YES --local 127.0.0.1|::1 --port PORT --seconds 1..5");
             return 0;
         }
         try {
-            PortProbeOptions options = PortProbeOptions.Parse(args);
             emit(Label);
-            runtime.Run(options, emit);
-            return 0;
+            if (args[0] == "control-tcp") {
+                LocalTcpControlOptions controlOptions = LocalTcpControlOptions.Parse(args);
+                LocalControlResult controlResult = control.Run(controlOptions, emit);
+                return controlResult.AckValid && controlResult.ShutdownComplete ? 0 : 2;
+            }
+            PortProbeOptions options = PortProbeOptions.Parse(args);
+            ProbeRunResult result = runtime.Run(options, emit);
+            return result.MeasurementComplete && result.ShutdownComplete ? 0 : 2;
         } catch (Exception ex) {
-            emit("STOPPED|" + ex.GetType().Name + "|" + ex.Message);
+            emit("FAILED|" + ex.GetType().Name + "|" + ex.Message);
             return 2;
         }
     }
+    private sealed class CancelFlag { internal volatile bool Requested; }
     private static int Main(string[] args)
-    { return Run(args, new SocketPortProbeRuntime(), Console.WriteLine); }
+    {
+        var cancel = new CancelFlag();
+        ConsoleCancelEventHandler handler = (sender, e) => { e.Cancel = true; cancel.Requested = true; };
+        Console.CancelKeyPress += handler;
+        try {
+            return Run(args,
+                new SocketPortProbeRuntime(new NativeProbeSocketFactory(), new StopwatchProbeTime(),
+                    () => cancel.Requested),
+                new LocalTcpControlRuntime(new NativeLocalTcpFactory(), new StopwatchProbeTime(),
+                    () => cancel.Requested), Console.WriteLine);
+        } finally { Console.CancelKeyPress -= handler; }
+    }
 }

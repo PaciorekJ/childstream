@@ -9,12 +9,13 @@ New-Item -ItemType Directory -Path $package -Force | Out-Null
 $csc = Join-Path $env:SystemRoot 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
 if (-not (Test-Path -LiteralPath $csc)) { throw 'Framework x64 C# compiler unavailable.' }
 $source = Join-Path $root 'qualification/PortContainmentProbe.cs'
+$control = Join-Path $root 'qualification/PortContainmentControl.cs'
 $tests = Join-Path $root 'qualification/PortContainmentProbeTests.cs'
 $exe = Join-Path $package 'ChildStreamPortProbe.exe'
 $testExe = Join-Path $out 'PortContainmentProbeTests.exe'
-& $csc /nologo /target:exe /platform:x64 /main:PortContainmentProbeProgram "/out:$exe" $source
+& $csc /nologo /target:exe /platform:x64 /main:PortContainmentProbeProgram "/out:$exe" $source $control
 if ($LASTEXITCODE -ne 0) { throw 'Review-only receiver compilation failed.' }
-& $csc /nologo /target:exe /platform:x64 /main:PortContainmentProbeTests "/out:$testExe" $source $tests
+& $csc /nologo /target:exe /platform:x64 /main:PortContainmentProbeTests "/out:$testExe" $source $control $tests
 if ($LASTEXITCODE -ne 0) { throw 'Substituted test compilation failed.' }
 & $exe --help
 if ($LASTEXITCODE -ne 0) { throw 'No-socket help path failed.' }
@@ -22,6 +23,7 @@ if ($LASTEXITCODE -ne 0) { throw 'No-socket help path failed.' }
 if ($LASTEXITCODE -ne 0) { throw 'Substituted probe tests failed.' }
 $included = @(
     @{ source = $source; target = 'source/PortContainmentProbe.cs' },
+    @{ source = $control; target = 'source/PortContainmentControl.cs' },
     @{ source = $tests; target = 'source/PortContainmentProbeTests.cs' },
     @{ source = (Join-Path $root 'scripts/build-port-containment-preparation.ps1'); target = 'source/build-port-containment-preparation.ps1' },
     @{ source = (Join-Path $root 'qualification/PORT-CONTAINMENT-EXPERIMENT.md'); target = 'START-HERE.md' },
