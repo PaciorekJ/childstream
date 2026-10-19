@@ -45,6 +45,15 @@ jobs:
           name: childstream-x360-qualification-review-only
           path: tests/.artifacts/x360-qualification/ChildStream-X360-qualification-review-only-*.zip
           if-no-files-found: error
+      - name: Build review-only port experiment preparation with substituted checks
+        shell: pwsh
+        run: .\scripts\build-port-containment-preparation.ps1
+      - name: Retain review-only port experiment preparation
+        uses: actions/upload-artifact@v4
+        with:
+          name: childstream-port-experiment-review-only
+          path: tests/.artifacts/port-containment/ChildStream-port-containment-review-only-*.zip
+          if-no-files-found: error
       - name: Build unsigned candidate package
         shell: pwsh
         run: .\scripts\build-candidate.ps1
