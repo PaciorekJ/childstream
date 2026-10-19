@@ -214,6 +214,22 @@ internal sealed class SocketPortProbeRuntime : IPortProbeRuntime
         try { current.Dispose(); }
         catch (Exception ex) { errors.Add(ex.GetType().Name); }
     }
+    private void StopIdle(ProbeRunResult result, string condition, string pendingSide,
+        Action<string> emit)
+    {
+        if (pendingSide != null) {
+            result.StopReason = condition + "_PENDING_IO";
+            result.MeasurementComplete = false;
+            emit("PENDING_READABLE|" + time.Utc + "|" + pendingSide + "|NOT_ACCEPTED");
+            emit("MEASUREMENT_INCOMPLETE|" + time.Utc + "|" + result.StopReason);
+        } else {
+            result.StopReason = condition;
+            if (condition == "CANCELLED") {
+                result.MeasurementComplete = false;
+                emit("MEASUREMENT_INCOMPLETE|" + time.Utc + "|CANCELLED");
+            }
+        }
+    }
     private void HandleTcp(IProbeSocket peer, bool lan, ProbeBudget budget, Action<string> emit)
     {
         string side = lan ? "LAN" : "LOCAL";
@@ -288,27 +304,70 @@ internal sealed class SocketPortProbeRuntime : IPortProbeRuntime
             while (result.Attempts < options.MaxAttempts) {
                 string stop = budget.StopCondition();
                 if (stop != null) {
-                    result.StopReason = stop;
-                    if (stop == "CANCELLED") {
-                        result.MeasurementComplete = false;
-                        emit("MEASUREMENT_INCOMPLETE|" + time.Utc + "|CANCELLED");
-                    }
+                    StopIdle(result, stop, null, emit);
                     break;
                 }
                 IProbeSocket selected = null;
                 bool fromLan = false;
-                if (local.PollRead(budget.Slice())) selected = local;
-                else if (lan.PollRead(budget.Slice())) { selected = lan; fromLan = true; }
+                string pendingSide = null;
+                try {
+                    bool localReady = local.PollRead(budget.Slice());
+                    stop = budget.StopCondition();
+                    if (stop != null) {
+                        StopIdle(result, stop, localReady ? "LOCAL" : null, emit);
+                        break;
+                    }
+                    if (localReady) {
+                        selected = local;
+                        pendingSide = "LOCAL";
+                    } else {
+                        bool lanReady = lan.PollRead(budget.Slice());
+                        stop = budget.StopCondition();
+                        if (stop != null) {
+                            StopIdle(result, stop, lanReady ? "LAN" : null, emit);
+                            break;
+                        }
+                        if (lanReady) {
+                            selected = lan;
+                            fromLan = true;
+                            pendingSide = "LAN";
+                        }
+                    }
+                    if (selected != null) budget.Slice(); // final pre-admission check
+                } catch (TimeoutException) {
+                    StopIdle(result, "DEADLINE", pendingSide, emit);
+                    break;
+                } catch (OperationCanceledException) {
+                    StopIdle(result, "CANCELLED", pendingSide, emit);
+                    break;
+                }
                 if (selected == null) continue;
-                budget.Slice(); // do not accept or read after cancellation/deadline
                 if (options.Protocol == ProtocolType.Tcp) {
                     peer = selected.Accept();
-                    if (peer == null) continue;
+                    if (peer == null) {
+                        stop = budget.StopCondition();
+                        if (stop != null) {
+                            StopIdle(result, stop, pendingSide, emit);
+                            break;
+                        }
+                        continue;
+                    }
                     result.Attempts++;
                     try { HandleTcp(peer, fromLan, budget, emit); }
                     finally { DisposeOwned(ref peer, cleanupErrors); }
                 } else {
-                    HandleUdp(selected, fromLan, budget, emit, () => result.Attempts++);
+                    bool received = false;
+                    HandleUdp(selected, fromLan, budget, emit, () => {
+                        result.Attempts++;
+                        received = true;
+                    });
+                    if (!received) {
+                        stop = budget.StopCondition();
+                        if (stop != null) {
+                            StopIdle(result, stop, pendingSide, emit);
+                            break;
+                        }
+                    }
                 }
                 if (cleanupErrors.Count != 0) throw new IOException("Accepted socket disposal failed.");
             }

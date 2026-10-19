@@ -225,6 +225,102 @@ internal static class PortContainmentProbeTests
         Check(!result.MeasurementComplete && result.ShutdownComplete &&
             result.StopReason == "DEADLINE_ACTIVE_IO" && sockets[2].Written.Count == 0 &&
             Has(lines, "RECEIVED|"), "slow fragments share one elapsed budget and never get an ACK");
+
+        clock = new FakeProbeTime(); factory = new FakeProbeFactory();
+        current = clock;
+        sockets = ReceiverSockets(factory, current, ms => true);
+        sockets[2].WritePoll = ms => { current.Advance(1000); return false; };
+        lines = new List<string>();
+        result = new SocketPortProbeRuntime(factory, current, () => false)
+            .Run(Options(1, 2), lines.Add);
+        Check(!result.MeasurementComplete && result.ShutdownComplete &&
+            result.StopReason == "DEADLINE_ACTIVE_IO" && sockets[2].Written.Count == 0 &&
+            Has(lines, "RECEIVED|"), "TCP response transmission expiry remains incomplete");
+    }
+    private static void IdleDeadlineCases()
+    {
+        var clock = new FakeProbeTime(); var factory = new FakeProbeFactory();
+        var local = new FakeProbeSocket(); var lan = new FakeProbeSocket();
+        int lanPolls = 0;
+        local.ReadPoll = ms => { clock.Advance(1000); return false; };
+        lan.ReadPoll = ms => { lanPolls++; throw new Exception("LAN poll after deadline"); };
+        factory.Sockets.Enqueue(local); factory.Sockets.Enqueue(lan);
+        var lines = new List<string>();
+        var result = new SocketPortProbeRuntime(factory, clock, () => false)
+            .Run(Options(1, 2), line => {
+                lines.Add(line);
+                if (line.StartsWith("STOPPED|"))
+                    Check(local.Disposed && lan.Disposed, "idle STOPPED follows exact disposal");
+            });
+        Check(result.MeasurementComplete && result.ShutdownComplete &&
+            result.StopReason == "DEADLINE" && result.Attempts == 0 &&
+            lanPolls == 0 && !Has(lines, "MEASUREMENT_INCOMPLETE|") &&
+            Has(lines, "STOPPED|"), "local false poll consumes budget; no LAN poll or active failure");
+
+        clock = new FakeProbeTime(); factory = new FakeProbeFactory();
+        local = new FakeProbeSocket(); lan = new FakeProbeSocket();
+        FakeProbeTime current = clock;
+        local.ReadPoll = ms => false;
+        lan.ReadPoll = ms => { current.Advance(1000); return false; };
+        factory.Sockets.Enqueue(local); factory.Sockets.Enqueue(lan);
+        lines = new List<string>();
+        result = new SocketPortProbeRuntime(factory, current, () => false)
+            .Run(Options(1, 2), lines.Add);
+        Check(result.MeasurementComplete && result.ShutdownComplete &&
+            result.StopReason == "DEADLINE" && result.Attempts == 0 &&
+            !Has(lines, "MEASUREMENT_INCOMPLETE|"),
+            "LAN false poll consumes budget; normal quiet observation expiry");
+
+        clock = new FakeProbeTime(); factory = new FakeProbeFactory();
+        current = clock;
+        var sockets = ReceiverSockets(factory, current, ms => true);
+        int localPolls = 0;
+        sockets[0].ReadPoll = ms => {
+            localPolls++;
+            if (localPolls == 1) return true;
+            current.Advance(1000); return false;
+        };
+        sockets[1].ReadPoll = ms => { throw new Exception("LAN poll after deadline"); };
+        lines = new List<string>();
+        result = new SocketPortProbeRuntime(factory, current, () => false)
+            .Run(Options(1, 2), lines.Add);
+        Check(result.MeasurementComplete && result.ShutdownComplete &&
+            result.StopReason == "DEADLINE" && result.Attempts == 1 &&
+            Has(lines, "MESSAGE|2026-10-18T00:00:00Z|LOCAL|FIXED_MESSAGE_ACKED") &&
+            !Has(lines, "RECEIVED|2026-10-18T00:00:00Z|LAN|") &&
+            !Has(lines, "MEASUREMENT_INCOMPLETE|"),
+            "completed local request followed by remote silence expires normally");
+
+        clock = new FakeProbeTime(); factory = new FakeProbeFactory();
+        current = clock;
+        local = new FakeProbeSocket(); lan = new FakeProbeSocket();
+        bool accepted = false;
+        local.ReadPoll = ms => { current.Advance(1000); return true; };
+        local.AcceptNext = () => { accepted = true; throw new Exception("Accepted after deadline"); };
+        factory.Sockets.Enqueue(local); factory.Sockets.Enqueue(lan);
+        lines = new List<string>();
+        result = new SocketPortProbeRuntime(factory, current, () => false)
+            .Run(Options(1, 2), lines.Add);
+        Check(!result.MeasurementComplete && result.ShutdownComplete &&
+            result.StopReason == "DEADLINE_PENDING_IO" && !accepted &&
+            Has(lines, "PENDING_READABLE|") && !Has(lines, "RECEIVED|"),
+            "readable-at-deadline is retained without accepting new work");
+
+        clock = new FakeProbeTime(); factory = new FakeProbeFactory();
+        current = clock;
+        local = new FakeProbeSocket(); lan = new FakeProbeSocket();
+        accepted = false;
+        local.ReadPoll = ms => false;
+        lan.ReadPoll = ms => { current.Advance(1000); return true; };
+        lan.AcceptNext = () => { accepted = true; throw new Exception("LAN accepted after deadline"); };
+        factory.Sockets.Enqueue(local); factory.Sockets.Enqueue(lan);
+        lines = new List<string>();
+        result = new SocketPortProbeRuntime(factory, current, () => false)
+            .Run(Options(1, 2), lines.Add);
+        Check(!result.MeasurementComplete && result.ShutdownComplete &&
+            result.StopReason == "DEADLINE_PENDING_IO" && !accepted &&
+            Contains(lines, "|LAN|NOT_ACCEPTED") && !Has(lines, "RECEIVED|"),
+            "LAN readability at deadline is recorded without accepting new work");
     }
     private static void CancellationAndFailures()
     {
@@ -425,7 +521,8 @@ internal static class PortContainmentProbeTests
         Rejected(ReceiveCommand("UDP", "127.0.0.1", "192.0.2.10", "3389", "30", "9"), "attempt bound");
         Rejected(ControlCommand("192.0.2.10", "3389", "3"), "remote TCP control refused");
         Rejected(ControlCommand("127.0.0.1", "3389", "6"), "control duration bound");
-        ReceiverLifecycle(); NearDeadlineAndSlowFragments(); CancellationAndFailures();
+        ReceiverLifecycle(); NearDeadlineAndSlowFragments(); IdleDeadlineCases();
+        CancellationAndFailures();
         UdpLifecycle(); IdleCancellation(); LocalControlCases();
         Check(PortProbeVerdict.ClassifyEnforcement(true, true, false, true, true, true) ==
             "SUPPORTS TESTED RULE", "complete matching drop and local control");
