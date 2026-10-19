@@ -346,7 +346,7 @@ internal static class PortProbeVerdict
     internal static string ClassifyEnforcement(bool remoteSent, bool exactOwnedDrop,
         bool remoteReceived, bool localAttempted, bool localReceived, bool evidenceComplete)
     {
-        if (remoteReceived || localAttempted && !localReceived) return "REJECTS TESTED RULE OR SETUP";
+        if (remoteReceived) return "REJECTS TESTED RULE OR SETUP";
         if (!remoteSent || !evidenceComplete || !localAttempted || !localReceived) return "INCONCLUSIVE";
         return exactOwnedDrop ? "SUPPORTS TESTED RULE" : "INCONCLUSIVE";
     }

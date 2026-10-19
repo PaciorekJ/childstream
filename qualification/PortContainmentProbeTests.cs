@@ -433,6 +433,8 @@ internal static class PortContainmentProbeTests
             "REJECTS TESTED RULE OR SETUP", "unexpected remote reception");
         Check(PortProbeVerdict.ClassifyEnforcement(true, true, false, false, false, false) ==
             "INCONCLUSIVE", "no attempted local measurement is not rejection");
+        Check(PortProbeVerdict.ClassifyEnforcement(true, true, false, true, false, true) ==
+            "INCONCLUSIVE", "failed local client is not proof of firewall rejection");
         Check(PortProbeVerdict.ClassifyCleanup(false) == "INCOMPLETE",
             "cleanup independent from enforcement");
         Console.WriteLine("Port containment synthetic checks passed: " + checks);
