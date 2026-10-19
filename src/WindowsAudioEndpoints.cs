@@ -7,7 +7,9 @@ internal sealed class ChildAudioEndpointInventory
 {
     internal int SessionId;
     internal bool Complete;
+    internal string DefaultRenderId;
     internal readonly HashSet<string> ActiveRenderIds = new HashSet<string>(StringComparer.Ordinal);
+    internal readonly Dictionary<string, string> FriendlyNames = new Dictionary<string, string>(StringComparer.Ordinal);
 }
 
 // Read-only Core Audio endpoint enumeration. Run in the verified child process;
@@ -22,6 +24,7 @@ internal static class WindowsAudioEndpoints
     private interface IMMDeviceEnumerator
     {
         void EnumAudioEndpoints(int dataFlow, uint stateMask, out IMMDeviceCollection devices);
+        void GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice device);
     }
 
     [ComImport, Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E"),
@@ -37,9 +40,51 @@ internal static class WindowsAudioEndpoints
     private interface IMMDevice
     {
         void Activate(ref Guid iid, uint context, IntPtr parameters, out IntPtr result);
-        void OpenPropertyStore(uint access, out IntPtr properties);
+        void OpenPropertyStore(uint access, out IPropertyStore properties);
         void GetId(out IntPtr id);
         void GetState(out uint state);
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PropertyKey { internal Guid Format; internal uint Id; }
+
+    [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IPropertyStore
+    {
+        void GetCount(out uint count);
+        void GetAt(uint index, out PropertyKey key);
+        void GetValue(ref PropertyKey key, IntPtr value);
+        void SetValue(ref PropertyKey key, IntPtr value);
+        void Commit();
+    }
+
+    [DllImport("ole32.dll")]
+    private static extern int PropVariantClear(IntPtr value);
+
+    private static string TryFriendlyName(IMMDevice device)
+    {
+        IPropertyStore store = null;
+        IntPtr value = IntPtr.Zero;
+        try
+        {
+            device.OpenPropertyStore(0, out store); // STGM_READ, no preference write.
+            value = Marshal.AllocCoTaskMem(IntPtr.Size == 8 ? 24 : 16);
+            for (int offset = 0; offset < (IntPtr.Size == 8 ? 24 : 16); offset += 4)
+                Marshal.WriteInt32(value, offset, 0);
+            var key = new PropertyKey { Format = new Guid("a45c254e-df1c-4efd-8020-67d146a850e0"), Id = 14 };
+            store.GetValue(ref key, value);
+            if (Marshal.ReadInt16(value) != 31) return null; // VT_LPWSTR
+            string name = Marshal.PtrToStringUni(Marshal.ReadIntPtr(value, 8));
+            return String.IsNullOrWhiteSpace(name) || name.Length > 128 ||
+                name.IndexOfAny(new[] { '\r', '\n', '\0' }) >= 0 ? null : name;
+        }
+        catch { return null; } // The stable endpoint ID remains authoritative.
+        finally
+        {
+            if (value != IntPtr.Zero) { PropVariantClear(value); Marshal.FreeCoTaskMem(value); }
+            if (store != null) Marshal.ReleaseComObject(store);
+        }
     }
 
     internal static ChildAudioEndpointInventory ReadActiveRender(int expectedChildSessionId)
@@ -69,6 +114,8 @@ internal static class WindowsAudioEndpoints
                     string id = Marshal.PtrToStringUni(raw);
                     if (String.IsNullOrEmpty(id) || !result.ActiveRenderIds.Add(id))
                         throw new InvalidOperationException("Audio endpoint identity is missing or duplicated.");
+                    string friendly = TryFriendlyName(device);
+                    if (friendly != null) result.FriendlyNames[id] = friendly;
                 }
                 finally
                 {
@@ -76,9 +123,25 @@ internal static class WindowsAudioEndpoints
                     if (device != null) Marshal.ReleaseComObject(device);
                 }
             }
+            IMMDevice defaultDevice = null;
+            IntPtr defaultRaw = IntPtr.Zero;
+            try
+            {
+                enumerator.GetDefaultAudioEndpoint(0, 1, out defaultDevice); // eRender, eMultimedia
+                defaultDevice.GetId(out defaultRaw);
+                result.DefaultRenderId = Marshal.PtrToStringUni(defaultRaw);
+                if (String.IsNullOrEmpty(result.DefaultRenderId) ||
+                    !result.ActiveRenderIds.Contains(result.DefaultRenderId))
+                    throw new InvalidOperationException("Child default render endpoint is absent or inactive.");
+            }
+            finally
+            {
+                if (defaultRaw != IntPtr.Zero) Marshal.FreeCoTaskMem(defaultRaw);
+                if (defaultDevice != null) Marshal.ReleaseComObject(defaultDevice);
+            }
             result.Complete = true;
         }
-        catch { result.ActiveRenderIds.Clear(); result.Complete = false; }
+        catch { result.ActiveRenderIds.Clear(); result.FriendlyNames.Clear(); result.DefaultRenderId = null; result.Complete = false; }
         finally
         {
             if (devices != null) Marshal.ReleaseComObject(devices);

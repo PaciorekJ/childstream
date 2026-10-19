@@ -2,7 +2,7 @@ name: Windows offline checks
 
 on:
   pull_request:
-    branches: [master, codex/hardened-foundation, codex/transactional-installer]
+    branches: [master, codex/hardened-foundation, codex/transactional-installer, codex/child-session-feasibility]
 
 permissions:
   contents: read
@@ -10,7 +10,7 @@ permissions:
 jobs:
   launcher:
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
@@ -19,12 +19,62 @@ jobs:
       - name: Compile and run offline launcher, installer, and feasibility tests
         shell: pwsh
         run: .\tests\offline.ps1
+      - name: Compile representation-preserving exclusion helper and run synthetic variants
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $vs) { throw 'MSVC toolchain unavailable.' }
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          $command = 'call "' + $vcvars + '" >nul && cl /nologo /EHsc /W4 /std:c++17 /Fotests\.artifacts\ChildStreamExclusionShape.obj /Fetests\.artifacts\ChildStreamExclusionShape.exe scripts\exclusion-variant-shape.cpp ole32.lib oleaut32.lib && tests\.artifacts\ChildStreamExclusionShape.exe --synthetic'
+          & cmd.exe /d /c $command
+          if ($LASTEXITCODE -ne 0) { throw 'Native exclusion-shape synthetic checks failed.' }
+          Write-Output "Exclusion helper SHA256: $((Get-FileHash -LiteralPath 'tests\.artifacts\ChildStreamExclusionShape.exe' -Algorithm SHA256).Hash.ToLowerInvariant())"
+      - name: Retain exclusion helper for separate read-only review
+        uses: actions/upload-artifact@v4
+        with:
+          name: childstream-exclusion-helper-review-only
+          path: tests/.artifacts/ChildStreamExclusionShape.exe
+          if-no-files-found: error
+      - name: Build separate review-only X360 qualification kit and run substituted tests
+        shell: pwsh
+        run: .\scripts\build-x360-qualification-kit.ps1 -BuildNative
+      - name: Retain review-only X360 qualification kit
+        uses: actions/upload-artifact@v4
+        with:
+          name: childstream-x360-qualification-review-only
+          path: tests/.artifacts/x360-qualification/ChildStream-X360-qualification-review-only-*.zip
+          if-no-files-found: error
+      - name: Build review-only port experiment preparation with substituted checks
+        shell: pwsh
+        run: .\scripts\build-port-containment-preparation.ps1
+      - name: Retain review-only port experiment preparation
+        uses: actions/upload-artifact@v4
+        with:
+          name: childstream-port-experiment-review-only
+          path: tests/.artifacts/port-containment/ChildStream-port-containment-review-only-*.zip
+          if-no-files-found: error
       - name: Build unsigned candidate package
         shell: pwsh
         run: .\scripts\build-candidate.ps1
+      - name: Build bundled unsigned Windows user distribution
+        shell: pwsh
+        run: .\scripts\build-user-package.ps1
+      - name: Retain installable user distribution for review
+        uses: actions/upload-artifact@v4
+        with:
+          name: childstream-windows-x64-unsigned-audio-candidate
+          path: tests/.artifacts/distribution/ChildStream-Windows-x64-*.zip
+          if-no-files-found: error
       - name: Retain candidate package for review
         uses: actions/upload-artifact@v4
         with:
           name: childstream-unsigned-candidate
           path: tests/.artifacts/candidate/ChildStream-candidate-*.zip
+          if-no-files-found: error
+      - name: Retain simulated rendered UI evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: childstream-rendered-ui-simulated
+          path: tests/.artifacts/screenshots/*.png
           if-no-files-found: error
